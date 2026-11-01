@@ -107,8 +107,9 @@ pub struct Cascade {
     /// Initial values of custom properties registered with `@property`.
     initial_vars: BTreeMap<String, String>,
     buckets: HashMap<Key, Vec<u32>>,
-    /// Whether any rule depends on :hover/:active/:focus.
-    pub dynamic: bool,
+    /// The state-dependent compounds of all rules (see
+    /// [`Selector::dynamic_parts`]).
+    pub dynamic: Vec<selector::DynPart>,
 }
 
 impl Cascade {
@@ -120,7 +121,7 @@ impl Cascade {
             layers: HashMap::new(),
             initial_vars: BTreeMap::new(),
             buckets: HashMap::new(),
-            dynamic: false,
+            dynamic: Vec::new(),
         };
         let ua = ua_sheet();
         c.add(&ua.rules, 0, env, "");
@@ -156,6 +157,7 @@ impl Cascade {
             match r {
                 Rule::Style { selectors, decls } => {
                     for sel in selectors.iter() {
+                        self.dynamic.extend(sel.dynamic_parts());
                         let order = self.rules.len() as u32;
                         self.buckets.entry(sel.key()).or_default().push(order);
                         self.rules.push(Indexed {
@@ -274,96 +276,253 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
         pseudo: HashMap::new(),
         generated: Vec::new(),
     };
-    let mut counters: HashMap<String, i32> = HashMap::new();
-    let mut gen_styles: Vec<Style> = Vec::new();
-    let mut venv = ValueEnv {
-        root_font: 16.0,
-        vw: env.width,
-        vh: env.height,
-    };
-    let mut candidates = Vec::new();
+    let mut w = Walker::new(dom, cascade, cx, env, 16.0);
     let root_style = Style {
         vars: Rc::new(cascade.initial_vars.clone()),
         ..Style::default()
     };
-    // Document order, parents before children.
-    let mut stack: Vec<(NodeId, Rc<Style>)> = vec![(Dom::ROOT, Rc::new(root_style))];
-    while let Some((id, parent)) = stack.pop() {
-        let mut style = if dom.element(id).is_some() {
-            cascade.candidates(dom, id, &mut candidates);
-            let s = cascade_element(dom, id, cascade, &candidates, cx, &parent, &venv, None);
-            if dom.tag(id) == Some("html") {
-                venv.root_font = s.font_size;
-            }
-            if s.display != style::Display::None {
-                update_counters(&s, &mut counters);
-            }
-            for pe in [
-                PseudoElement::Before,
-                PseudoElement::After,
-                PseudoElement::Marker,
-            ] {
-                let p = cascade_element(dom, id, cascade, &candidates, cx, &s, &venv, Some(pe));
-                if !p.has_rules {
-                    continue;
-                }
-                if pe != PseudoElement::Marker && s.display != style::Display::None {
-                    update_counters(&p, &mut counters);
-                    let text = p
-                        .content
-                        .as_deref()
-                        .and_then(|c| generated_text(c, dom, id, &counters));
-                    if let Some(text) = text.filter(|_| p.display != style::Display::None) {
-                        out.generated.push(Generated {
-                            owner: id,
-                            after: pe == PseudoElement::After,
-                            text,
-                        });
-                        gen_styles.push(p.clone());
-                    }
-                }
-                out.pseudo.insert((id, pe), p);
-            }
-            s
-        } else if dom.text(id).is_some() || id == Dom::ROOT {
-            (*parent).clone()
-        } else {
-            continue;
-        };
-        style.has_rules = false;
-        // <details>: only the summary shows until it is opened.
-        if let Some(p) = dom.parent(id).filter(|&p| dom.tag(p) == Some("details")) {
-            let open = dom.attr(p, "open").is_some();
-            if dom.tag(id) == Some("summary") {
-                style.list_style = if open {
-                    style::ListStyle::DisclosureOpen
-                } else {
-                    style::ListStyle::DisclosureClosed
-                };
-            } else if !open && dom.element(id).is_some() {
-                style.display = style::Display::None;
-            } else if !open && dom.text(id).is_some_and(|t| !t.trim().is_empty()) {
-                continue;
-            }
-        }
-        if style.display == style::Display::None {
-            continue;
-        }
-        let shared = Rc::new(style);
-        for &c in dom.children(id).iter().rev() {
-            stack.push((c, shared.clone()));
-        }
-        out.nodes[id] = Some((*shared).clone());
-    }
-    for (g, st) in out.generated.iter().zip(gen_styles) {
+    let mut gens = Vec::new();
+    let mut visited = Vec::new();
+    w.walk(
+        Dom::ROOT,
+        Rc::new(root_style),
+        &mut out.nodes,
+        &mut out.pseudo,
+        &mut gens,
+        None,
+        &mut visited,
+    );
+    for (g, st) in gens {
         // Drop boxes whose owner is not rendered (or has no box to hold them).
         let shown = out.nodes[g.owner].is_some();
         let mut text = st.clone();
         text.display = style::Display::Inline;
         out.nodes.push(shown.then_some(st));
         out.nodes.push(shown.then_some(text));
+        out.generated.push(g);
     }
     out
+}
+
+/// Result of [`restyle_subtree`].
+#[derive(Debug, PartialEq)]
+pub enum Restyle {
+    Unchanged,
+    Changed,
+    /// The subtree's generated content changed: compute everything.
+    NeedsFull,
+}
+
+/// Recomputes the styles of `root` and its descendants in `styles` (after
+/// an element-state change such as hover), reusing its parent's style.
+pub fn restyle_subtree(
+    dom: &Dom,
+    cascade: &Cascade,
+    cx: &Matcher,
+    env: &MediaEnv,
+    root: NodeId,
+    styles: &mut Styles,
+) -> Restyle {
+    let Some(parent) = dom.parent(root) else {
+        return Restyle::NeedsFull;
+    };
+    let Some(parent_style) = styles.nodes.get(parent).cloned().flatten() else {
+        return Restyle::NeedsFull;
+    };
+    let root_font = dom
+        .html()
+        .and_then(|h| styles.nodes.get(h).cloned().flatten())
+        .map_or(16.0, |s| s.font_size);
+    let mut nodes: Vec<Option<Style>> = vec![None; dom.len()];
+    let mut pseudo = HashMap::new();
+    let mut gens = Vec::new();
+    let mut subtree = Vec::new();
+    let mut w = Walker::new(dom, cascade, cx, env, root_font);
+    let prev = Some(&styles.nodes[..]);
+    w.walk(
+        root,
+        Rc::new(parent_style),
+        &mut nodes,
+        &mut pseudo,
+        &mut gens,
+        prev,
+        &mut subtree,
+    );
+    // Generated boxes must stay the same (they have fixed node ids).
+    let in_tree: std::collections::HashSet<NodeId> = subtree.iter().copied().collect();
+    let old: Vec<(usize, &Generated)> = styles
+        .generated
+        .iter()
+        .enumerate()
+        .filter(|(_, g)| in_tree.contains(&g.owner))
+        .collect();
+    if old.len() != gens.len() || old.iter().zip(&gens).any(|((_, a), (b, _))| *a != b) {
+        return Restyle::NeedsFull;
+    }
+    let mut changed = false;
+    for &n in &subtree {
+        if styles.nodes[n] != nodes[n] {
+            changed = true;
+            styles.nodes[n] = nodes[n].take();
+        }
+        for pe in [
+            PseudoElement::Before,
+            PseudoElement::After,
+            PseudoElement::Marker,
+        ] {
+            let new = pseudo.remove(&(n, pe));
+            if styles.pseudo.get(&(n, pe)) != new.as_ref() {
+                changed = true;
+                match new {
+                    Some(p) => styles.pseudo.insert((n, pe), p),
+                    None => styles.pseudo.remove(&(n, pe)),
+                };
+            }
+        }
+    }
+    let base = dom.len();
+    for ((i, g), (_, st)) in old.iter().zip(gens) {
+        let shown = styles.nodes[g.owner].is_some();
+        let mut text = st.clone();
+        text.display = style::Display::Inline;
+        let (bi, ti) = (base + 2 * i, base + 2 * i + 1);
+        let (b, t) = (shown.then_some(st), shown.then_some(text));
+        if styles.nodes[bi] != b || styles.nodes[ti] != t {
+            changed = true;
+            styles.nodes[bi] = b;
+            styles.nodes[ti] = t;
+        }
+    }
+    if changed {
+        Restyle::Changed
+    } else {
+        Restyle::Unchanged
+    }
+}
+
+/// Walks a subtree in document order computing styles.
+struct Walker<'a> {
+    dom: &'a Dom,
+    cascade: &'a Cascade,
+    cx: &'a Matcher<'a>,
+    venv: ValueEnv,
+    counters: HashMap<String, i32>,
+    candidates: Vec<u32>,
+}
+
+impl<'a> Walker<'a> {
+    fn new(
+        dom: &'a Dom,
+        cascade: &'a Cascade,
+        cx: &'a Matcher<'a>,
+        env: &MediaEnv,
+        root_font: f32,
+    ) -> Self {
+        Walker {
+            dom,
+            cascade,
+            cx,
+            venv: ValueEnv {
+                root_font,
+                vw: env.width,
+                vh: env.height,
+            },
+            counters: HashMap::new(),
+            candidates: Vec::new(),
+        }
+    }
+
+    /// Styles `start` (whose parent's style is `parent`) and everything
+    /// under it into `nodes` / `pseudo`; generated boxes go to `gens`.
+    #[allow(clippy::too_many_arguments)]
+    fn walk(
+        &mut self,
+        start: NodeId,
+        parent: Rc<Style>,
+        nodes: &mut [Option<Style>],
+        pseudo: &mut HashMap<(NodeId, PseudoElement), Style>,
+        gens: &mut Vec<(Generated, Style)>,
+        prev: Option<&[Option<Style>]>,
+        visited: &mut Vec<NodeId>,
+    ) {
+        let (dom, cascade, cx) = (self.dom, self.cascade, self.cx);
+        // Document order, parents before children.
+        let mut stack: Vec<(NodeId, Rc<Style>)> = vec![(start, parent)];
+        while let Some((id, parent)) = stack.pop() {
+            visited.push(id);
+            let mut style = if dom.element(id).is_some() {
+                cascade.candidates(dom, id, &mut self.candidates);
+                let cands = &self.candidates;
+                let s = cascade_element(dom, id, cascade, cands, cx, &parent, &self.venv, None);
+                if dom.tag(id) == Some("html") {
+                    self.venv.root_font = s.font_size;
+                }
+                if s.display != style::Display::None {
+                    update_counters(&s, &mut self.counters);
+                }
+                for pe in [
+                    PseudoElement::Before,
+                    PseudoElement::After,
+                    PseudoElement::Marker,
+                ] {
+                    let p = cascade_element(dom, id, cascade, cands, cx, &s, &self.venv, Some(pe));
+                    if !p.has_rules {
+                        continue;
+                    }
+                    if pe != PseudoElement::Marker && s.display != style::Display::None {
+                        update_counters(&p, &mut self.counters);
+                        let text = p
+                            .content
+                            .as_deref()
+                            .and_then(|c| generated_text(c, dom, id, &self.counters));
+                        if let Some(text) = text.filter(|_| p.display != style::Display::None) {
+                            let g = Generated {
+                                owner: id,
+                                after: pe == PseudoElement::After,
+                                text,
+                            };
+                            gens.push((g, p.clone()));
+                        }
+                    }
+                    pseudo.insert((id, pe), p);
+                }
+                s
+            } else if dom.text(id).is_some() || id == Dom::ROOT {
+                (*parent).clone()
+            } else {
+                continue;
+            };
+            style.has_rules = false;
+            // <details>: only the summary shows until it is opened.
+            if let Some(p) = dom.parent(id).filter(|&p| dom.tag(p) == Some("details")) {
+                let open = dom.attr(p, "open").is_some();
+                if dom.tag(id) == Some("summary") {
+                    style.list_style = if open {
+                        style::ListStyle::DisclosureOpen
+                    } else {
+                        style::ListStyle::DisclosureClosed
+                    };
+                } else if !open && dom.element(id).is_some() {
+                    style.display = style::Display::None;
+                } else if !open && dom.text(id).is_some_and(|t| !t.trim().is_empty()) {
+                    continue;
+                }
+            }
+            if style.display == style::Display::None {
+                continue;
+            }
+            // Restyling after a state change: an unchanged style leaves the
+            // descendants as they were.
+            let same = id != start && prev.is_some_and(|p| p[id].as_ref() == Some(&style));
+            let shared = Rc::new(style);
+            if !same {
+                for &c in dom.children(id).iter().rev() {
+                    stack.push((c, shared.clone()));
+                }
+            }
+            nodes[id] = Some((*shared).clone());
+        }
+    }
 }
 
 /// Applies `counter-reset` then `counter-increment` (document order;

@@ -280,6 +280,14 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     if let Ok(sel) = std::env::var("RUBROWSER_DUMP") {
         eprint!("{}", browser.dump_layout(&sel, 12));
     }
+    if std::env::var_os("RUBROWSER_PROFILE").is_some() {
+        // Time hover restyles: move the mouse over a few points.
+        for (x, y) in [(400, 400), (420, 410), (700, 300), (100, 300)] {
+            eprintln!("[profile] mouse move to {x},{y}");
+            browser.event(Event::MouseMove { x, y }, now(&start), &mut host);
+            browser.render(now(&start), &mut host);
+        }
+    }
     let canvas = browser.render(now(&start), &mut host);
     let rgba: Vec<u8> = canvas
         .pixels()

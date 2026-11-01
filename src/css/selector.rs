@@ -788,6 +788,119 @@ fn has<C: Context>(cx: &C, comb: Combinator, sel: &Selector, n: NodeId) -> bool 
     }
 }
 
+/// What a change of hover/active/focus on an element can restyle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DynScope {
+    /// The element and its descendants.
+    Subtree,
+    /// Its parent's subtree (sibling combinators follow).
+    Parent,
+}
+
+/// State bits for [`Selector::dynamic_parts`].
+pub const HOVER: u8 = 1;
+pub const ACTIVE: u8 = 2;
+pub const FOCUS: u8 = 4;
+
+/// Which element states (`HOVER` | `ACTIVE` | `FOCUS`) `p` depends on.
+fn state_bits(p: &Pseudo) -> u8 {
+    let sel_bits = |s: &Selector| {
+        s.parts
+            .iter()
+            .flat_map(|(c, _)| c.pseudos.iter())
+            .fold(0, |m, p| m | state_bits(p))
+    };
+    match p {
+        Pseudo::Hover => HOVER,
+        Pseudo::Active => ACTIVE,
+        Pseudo::Focus | Pseudo::FocusWithin => FOCUS,
+        Pseudo::Not(l) | Pseudo::Is(l) | Pseudo::Where(l) => {
+            l.iter().fold(0, |m, s| m | sel_bits(s))
+        }
+        Pseudo::Has(l) => l.iter().fold(0, |m, (_, s)| m | sel_bits(s)),
+        _ => 0,
+    }
+}
+
+fn is_dynamic(p: &Pseudo) -> bool {
+    state_bits(p) != 0
+}
+
+/// A state-dependent compound of a selector (see
+/// [`Selector::dynamic_parts`]).
+#[derive(Clone, Debug)]
+pub struct DynPart {
+    /// The compound and its left context, state conditions removed: an
+    /// element whose state changed matters only if this matches it.
+    pub context: Selector,
+    /// For a compound left of the subject: the whole selector without
+    /// state conditions, to find the elements that may restyle.
+    pub subject: Option<Selector>,
+    pub scope: DynScope,
+    /// `HOVER` | `ACTIVE` | `FOCUS`.
+    pub bits: u8,
+}
+
+impl Selector {
+    /// For each compound that depends on element state: that compound
+    /// without the state conditions (to test which elements' state changes
+    /// matter) and how far the effect reaches.
+    pub fn dynamic_parts(&self) -> Vec<DynPart> {
+        let mut out = Vec::new();
+        for (i, (c, _)) in self.parts.iter().enumerate() {
+            let bits = c.pseudos.iter().fold(0, |m, p| m | state_bits(p));
+            if bits == 0 {
+                continue;
+            }
+            let strip = |c: &Compound| Compound {
+                pseudos: c
+                    .pseudos
+                    .iter()
+                    .filter(|p| !is_dynamic(p))
+                    .cloned()
+                    .collect(),
+                ..c.clone()
+            };
+            // The compound with its context to the left (its ancestors and
+            // preceding siblings), every state condition removed.
+            let context: Vec<(Compound, Option<Combinator>)> = self.parts[i..]
+                .iter()
+                .map(|(c, comb)| (strip(c), *comb))
+                .collect();
+            // Combinators between this compound and the subject.
+            let siblings = self.parts[..i]
+                .iter()
+                .any(|(_, comb)| matches!(comb, Some(Combinator::Next | Combinator::Subsequent)));
+            let has = c.pseudos.iter().any(|p| matches!(p, Pseudo::Has(_)));
+            let scope = if siblings || has {
+                DynScope::Parent
+            } else {
+                DynScope::Subtree
+            };
+            let subject = (i > 0).then(|| Selector {
+                parts: self
+                    .parts
+                    .iter()
+                    .map(|(c, comb)| (strip(c), *comb))
+                    .collect(),
+                pseudo_element: None,
+                specificity: [0; 3],
+            });
+            out.push(DynPart {
+                context: Selector {
+                    parts: context,
+                    pseudo_element: None,
+                    specificity: [0; 3],
+                },
+                subject,
+                scope,
+                bits,
+            });
+        }
+        out
+    }
+}
+
 /// Whether `sel` matches element `n` (ignoring any pseudo-element part).
 pub fn matches<C: Context>(cx: &C, sel: &Selector, n: NodeId) -> bool {
     match_from(cx, &sel.parts, 0, n)

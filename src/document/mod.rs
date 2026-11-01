@@ -1,7 +1,9 @@
 //! A live document: DOM + styles + layout, with hover, scrolling and
 //! hit-testing. Used for both web pages and the browser's own chrome.
 
+use crate::css::Restyle;
 use crate::css::media::{MediaEnv, MediaList};
+use crate::css::selector::DynScope;
 use crate::css::selector::PseudoElement;
 use crate::css::style::Cursor as CssCursor;
 use crate::css::syntax::{Rule, Sheet, parse_stylesheet};
@@ -61,6 +63,8 @@ pub struct Document {
     fragment: Option<String>,
     size: (f32, f32),
     needs_style: bool,
+    /// After element-state changes only: the subtrees to restyle.
+    restyle_roots: Vec<NodeId>,
     needs_layout: bool,
     /// Editing state of `<input>` elements, created on first use.
     inputs: HashMap<NodeId, TextField>,
@@ -94,6 +98,7 @@ impl Document {
                 .filter(|f| !f.is_empty()),
             size: (0.0, 0.0),
             needs_style: true,
+            restyle_roots: Vec::new(),
             needs_layout: true,
             inputs: HashMap::new(),
             caret_on: true,
@@ -122,7 +127,7 @@ impl Document {
     }
 
     pub fn needs_update(&self) -> bool {
-        self.needs_style || self.needs_layout
+        self.needs_style || self.needs_layout || !self.restyle_roots.is_empty()
     }
 
     /// Viewport size in logical pixels.
@@ -248,7 +253,7 @@ impl Document {
     pub fn update(&mut self, fonts: &Fonts) {
         let profile = profiling();
         let t0 = profile.then(std::time::Instant::now);
-        if self.needs_style {
+        if self.needs_style || !self.restyle_roots.is_empty() {
             let sheets = self.author_sheets();
             let env = MediaEnv {
                 width: self.size.0,
@@ -273,15 +278,42 @@ impl Document {
                 state: self.state,
                 checked: &checked,
             };
-            let styles = compute(dom, &cascade, &cx, &env);
-            if styles.nodes != self.styles
-                || styles.pseudo != self.pseudo
-                || styles.generated != self.generated
-            {
-                self.styles = styles.nodes;
-                self.pseudo = styles.pseudo;
-                self.generated = styles.generated;
-                self.needs_layout = true;
+            let roots = std::mem::take(&mut self.restyle_roots);
+            let mut done = !self.needs_style;
+            if done && !roots.is_empty() {
+                let mut st = crate::css::Styles {
+                    nodes: std::mem::take(&mut self.styles),
+                    pseudo: std::mem::take(&mut self.pseudo),
+                    generated: std::mem::take(&mut self.generated),
+                };
+                for &root in &roots {
+                    match crate::css::restyle_subtree(dom, &cascade, &cx, &env, root, &mut st) {
+                        Restyle::Changed => self.needs_layout = true,
+                        Restyle::Unchanged => {}
+                        Restyle::NeedsFull => {
+                            if profiling() {
+                                eprintln!("[profile] generated content changed: full restyle");
+                            }
+                            done = false;
+                            break;
+                        }
+                    }
+                }
+                self.styles = st.nodes;
+                self.pseudo = st.pseudo;
+                self.generated = st.generated;
+            }
+            if !done {
+                let styles = compute(dom, &cascade, &cx, &env);
+                if styles.nodes != self.styles
+                    || styles.pseudo != self.pseudo
+                    || styles.generated != self.generated
+                {
+                    self.styles = styles.nodes;
+                    self.pseudo = styles.pseudo;
+                    self.generated = styles.generated;
+                    self.needs_layout = true;
+                }
             }
             self.needs_style = false;
             self.sync_inline_svgs();
@@ -883,8 +915,87 @@ impl Document {
         if state == self.state {
             return false;
         }
-        self.state = state;
-        self.needs_style = true;
+        let old = std::mem::replace(&mut self.state, state);
+        let Some((_, _, cascade)) = self.cascade.clone().filter(|_| !self.needs_style) else {
+            if profiling() {
+                eprintln!("[profile] full restyle: no cascade yet or style pending");
+            }
+            self.needs_style = true;
+            return true;
+        };
+        // Elements whose state changed: the symmetric difference of the
+        // old and new ancestor chains.
+        let chain = |n: Option<NodeId>| {
+            let mut v = Vec::new();
+            let mut cur = n;
+            while let Some(c) = cur {
+                v.push(c);
+                cur = self.dom.parent(c);
+            }
+            v
+        };
+        use crate::css::selector::{ACTIVE, FOCUS, HOVER};
+        let mut changed: Vec<(NodeId, u8)> = Vec::new();
+        for (a, b, bit) in [
+            (old.hover, state.hover, HOVER),
+            (old.active, state.active, ACTIVE),
+            (old.focus, state.focus, FOCUS),
+        ] {
+            let (ca, cb) = (chain(a), chain(b));
+            changed.extend(ca.iter().filter(|n| !cb.contains(n)).map(|&n| (n, bit)));
+            changed.extend(cb.iter().filter(|n| !ca.contains(n)).map(|&n| (n, bit)));
+        }
+        // Only where a state-dependent compound matches does anything
+        // restyle (the state conditions themselves are left out).
+        let forms = &self.forms;
+        let dom = &self.dom;
+        let checked = |n: NodeId| forms.checked(dom, n);
+        let cx = Matcher {
+            dom,
+            state,
+            checked: &checked,
+        };
+        let mut roots = Vec::new();
+        for &(n, bit) in &changed {
+            if self.dom.element(n).is_none() {
+                continue;
+            }
+            for part in cascade.dynamic.iter().filter(|p| p.bits & bit != 0) {
+                if !crate::css::selector::matches(&cx, &part.context, n) {
+                    continue;
+                }
+                let within = match part.scope {
+                    DynScope::Subtree => n,
+                    DynScope::Parent => self.dom.parent(n).unwrap_or(n),
+                };
+                match &part.subject {
+                    // The changed element is the subject: it (and what
+                    // inherits from it) restyles.
+                    None => roots.push(n),
+                    // Find the subjects it can affect.
+                    Some(subject) => {
+                        roots.extend(self.dom.descendants(within).into_iter().filter(|&d| {
+                            self.dom.element(d).is_some()
+                                && crate::css::selector::matches(&cx, subject, d)
+                        }))
+                    }
+                }
+            }
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        if profiling() {
+            let sizes: Vec<usize> = roots
+                .iter()
+                .map(|&r| self.dom.descendants(r).len())
+                .collect();
+            eprintln!(
+                "[profile] {} restyle roots, sizes {:?}",
+                roots.len(),
+                &sizes[..sizes.len().min(12)]
+            );
+        }
+        self.restyle_roots.extend(roots);
         true
     }
 
@@ -1178,6 +1289,47 @@ mod tests {
         d.set_viewport(w, h);
         d.update(&fonts);
         (d, fonts)
+    }
+
+    #[test]
+    fn partial_restyle_matches_full_restyle() {
+        let html = r#"<style>
+            .a:hover .b { color: red }
+            .a:hover + .c { color: blue }
+            .a:hover::after { content: "!" }
+            .d:hover { padding: 3px; color: green }
+            :hover > .f { margin: 1px }
+            :focus { outline: 1px solid }
+            </style><div><p class=a>x <span class=b>y</span></p><p class=c>z</p>
+            <p class=d>w <i>inherits</i> <span class=f>f</span></p></div>"#;
+        let (mut d, fonts) = doc(html, 400.0, 300.0);
+        let a = d
+            .dom
+            .descendants(Dom::ROOT)
+            .into_iter()
+            .find(|&n| d.dom.attr(n, "class") == Some("a"))
+            .unwrap();
+        let dd = d
+            .dom
+            .descendants(Dom::ROOT)
+            .into_iter()
+            .find(|&n| d.dom.attr(n, "class") == Some("d"))
+            .unwrap();
+        for hover in [Some(a), Some(dd), None, Some(a)] {
+            d.set_state(ElementState {
+                hover,
+                ..Default::default()
+            });
+            d.update(&fonts);
+            let partial = (d.styles.clone(), d.generated.clone());
+            d.needs_style = true;
+            d.update(&fonts);
+            assert_eq!(
+                partial,
+                (d.styles.clone(), d.generated.clone()),
+                "hover {hover:?}"
+            );
+        }
     }
 
     #[test]
