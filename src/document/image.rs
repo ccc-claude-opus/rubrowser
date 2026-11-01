@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use resvg::{tiny_skia, usvg};
 
+use crate::css::media::{MediaEnv, MediaList};
 use crate::css::values::Rgba;
 use crate::dom::{Dom, NodeId};
 
@@ -181,6 +182,9 @@ pub struct Images {
     scaled_urls: RefCell<HashMap<String, Scaled>>,
     /// node → (width, height, pixels) at the last painted size.
     scaled: RefCell<HashMap<NodeId, Scaled>>,
+    /// Pixel density of the source chosen from `srcset` (natural size is
+    /// the bitmap size divided by it).
+    pub density: HashMap<NodeId, f32>,
 }
 
 impl Images {
@@ -225,6 +229,144 @@ impl Images {
         self.scaled.borrow_mut().remove(&node);
         self.states.insert(node, state);
     }
+}
+
+/// One `srcset` candidate: URL with a width (`480w`) or density (`2x`).
+#[derive(Clone, Debug, PartialEq)]
+struct Candidate {
+    url: String,
+    w: Option<f32>,
+    x: f32,
+}
+
+/// Parses a `srcset` value (URLs may contain commas; descriptors follow
+/// whitespace).
+fn parse_srcset(s: &str) -> Vec<Candidate> {
+    let mut out = Vec::new();
+    let mut rest = s.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let mut url = &rest[..end];
+        rest = &rest[end..];
+        let mut descriptors = "";
+        if let Some(u) = url.strip_suffix(',') {
+            url = u;
+        } else {
+            let end = rest.find(',').unwrap_or(rest.len());
+            descriptors = &rest[..end];
+            rest = &rest[end..];
+        }
+        let mut c = Candidate {
+            url: url.to_string(),
+            w: None,
+            x: 1.0,
+        };
+        for d in descriptors.split_whitespace() {
+            if let Some(w) = d.strip_suffix('w').and_then(|n| n.parse::<f32>().ok()) {
+                c.w = Some(w);
+            } else if let Some(x) = d.strip_suffix('x').and_then(|n| n.parse::<f32>().ok()) {
+                c.x = x;
+            }
+        }
+        if !c.url.is_empty() {
+            out.push(c);
+        }
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == ',');
+    }
+    out
+}
+
+/// The slot width in CSS px from a `sizes` attribute (default `100vw`).
+fn slot_width(sizes: Option<&str>, env: &MediaEnv) -> f32 {
+    let fc = crate::css::values::FontContext {
+        em: 16.0,
+        rem: 16.0,
+        vw: env.width,
+        vh: env.height,
+    };
+    for entry in sizes.unwrap_or("").split(',') {
+        let entry = entry.trim();
+        // `(media) length` or a final `length`.
+        let (media, len) = match entry.rfind(|c: char| c == ')' || c.is_whitespace()) {
+            Some(i) if entry.starts_with('(') || entry.contains(' ') => {
+                (Some(&entry[..=i]), entry[i + 1..].trim())
+            }
+            _ => (None, entry),
+        };
+        let matches = media.is_none_or(|m| MediaList::parse(m).matches(env));
+        if matches && let Some(px) = crate::css::values::px(len, fc) {
+            return px.max(1.0);
+        }
+    }
+    env.width
+}
+
+/// Image types this browser decodes.
+fn supported_type(t: &str) -> bool {
+    matches!(
+        t.trim().to_ascii_lowercase().as_str(),
+        "" | "image/png"
+            | "image/jpeg"
+            | "image/jpg"
+            | "image/gif"
+            | "image/webp"
+            | "image/bmp"
+            | "image/svg+xml"
+    )
+}
+
+/// The URL `<img>` element `img` should show and its pixel density:
+/// a matching `<picture>` `<source>`, else the best `srcset` candidate,
+/// else `src`.
+pub fn current_source(dom: &Dom, img: NodeId, env: &MediaEnv) -> (String, f32) {
+    let choose = |srcset: &str, sizes: Option<&str>| -> Option<(String, f32)> {
+        let cands = parse_srcset(srcset);
+        if cands.is_empty() {
+            return None;
+        }
+        let slot = slot_width(sizes, env);
+        let density = |c: &Candidate| c.w.map_or(c.x, |w| w / slot);
+        let want = env.scale.max(1.0);
+        let best = cands
+            .iter()
+            .filter(|c| density(c) >= want)
+            .min_by(|a, b| density(a).total_cmp(&density(b)))
+            .or_else(|| {
+                cands
+                    .iter()
+                    .max_by(|a, b| density(a).total_cmp(&density(b)))
+            })?;
+        Some((best.url.clone(), density(best).max(0.01)))
+    };
+    if let Some(p) = dom.parent(img).filter(|&p| dom.tag(p) == Some("picture")) {
+        for &s in dom.children(p) {
+            if s == img {
+                break;
+            }
+            if dom.tag(s) != Some("source") {
+                continue;
+            }
+            let media_ok = dom
+                .attr(s, "media")
+                .is_none_or(|m| MediaList::parse(m).matches(env));
+            if !media_ok || !supported_type(dom.attr(s, "type").unwrap_or("")) {
+                continue;
+            }
+            if let Some(found) = dom
+                .attr(s, "srcset")
+                .and_then(|set| choose(set, dom.attr(s, "sizes")))
+            {
+                return found;
+            }
+        }
+    }
+    if let Some(found) = dom
+        .attr(img, "srcset")
+        .and_then(|set| choose(set, dom.attr(img, "sizes")))
+    {
+        return found;
+    }
+    (dom.attr(img, "src").unwrap_or("").trim().to_string(), 1.0)
 }
 
 /// SVG element names that HTML parsing lowercased.
@@ -330,6 +472,29 @@ mod tests {
         assert_eq!(b.pixels, vec![0xff_ff0000, 0x80_0000ff]);
         assert_eq!(b.resized(4, 2).len(), 8);
         assert!(Bitmap::decode(b"not an image").is_err());
+    }
+
+    #[test]
+    fn srcset_selection() {
+        let c = parse_srcset("a.jpg 240w, b,c.jpg 480w,d.jpg 960w");
+        assert_eq!(c.len(), 3);
+        assert_eq!(c[1].url, "b,c.jpg");
+        let dom = crate::dom::parse_html(
+            r#"<img id=i sizes="(min-width: 768px) 50vw, 100vw" srcset="s.jpg 240w, m.jpg 480w, l.jpg 960w" src=x.jpg>
+            <picture><source media="(max-width: 600px)" srcset="small.webp"><source type="image/avif" srcset="a.avif"><img id=p src=fallback.jpg></picture>"#,
+        );
+        let env = |w: f32| MediaEnv {
+            width: w,
+            height: 800.0,
+            scale: 1.0,
+            dark: false,
+        };
+        let i = dom.element_by_id("i").unwrap();
+        assert_eq!(current_source(&dom, i, &env(1280.0)), ("l.jpg".into(), 1.5));
+        assert_eq!(current_source(&dom, i, &env(400.0)), ("m.jpg".into(), 1.2));
+        let p = dom.element_by_id("p").unwrap();
+        assert_eq!(current_source(&dom, p, &env(500.0)).0, "small.webp");
+        assert_eq!(current_source(&dom, p, &env(1000.0)).0, "fallback.jpg");
     }
 
     #[test]

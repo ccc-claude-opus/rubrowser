@@ -465,7 +465,10 @@ impl Document {
                 continue;
             }
             let size = match self.images.get(n) {
-                Some(ImageState::Ready(_, b)) => (b.width as f32, b.height as f32),
+                Some(ImageState::Ready(_, b)) => {
+                    let d = self.images.density.get(&n).copied().unwrap_or(1.0);
+                    (b.width as f32 / d, b.height as f32 / d)
+                }
                 Some(ImageState::Loading(_)) => (0.0, 0.0),
                 _ => match (self.dom.attr(n, "alt"), self.style(n)) {
                     (Some(alt), Some(st)) if !alt.is_empty() => (
@@ -600,13 +603,26 @@ impl Document {
                 }
             }
         }
+        let env = MediaEnv {
+            width: self.size.0,
+            height: self.size.1,
+            scale: 1.0,
+            dark: false,
+        };
         for n in self.dom.descendants(Dom::ROOT) {
             if self.dom.tag(n) != Some("img") {
                 continue;
             }
-            let src = self.dom.attr(n, "src").unwrap_or("").trim().to_string();
+            let (src, density) = image::current_source(&self.dom, n, &env);
             if self.images.get(n).is_some_and(|s| s.src() == src) {
                 continue;
+            }
+            self.images.density.insert(n, density);
+            if profiling() {
+                eprintln!(
+                    "[profile] img {src} (density {density}, viewport {:?})",
+                    self.size
+                );
             }
             if src.is_empty() {
                 self.images.set(n, ImageState::Failed(src));
@@ -627,7 +643,14 @@ impl Document {
         src: &str,
         result: Result<Vec<u8>, String>,
     ) {
-        let state = match result.and_then(|b| Bitmap::decode(&b)) {
+        let result = result.and_then(|b| Bitmap::decode(&b));
+        if profiling() {
+            eprintln!(
+                "[profile] image {src}: {:?}",
+                result.as_ref().map(|b| (b.width, b.height))
+            );
+        }
+        let state = match result {
             Ok(b) => ImageState::Ready(src.to_string(), std::rc::Rc::new(b)),
             Err(_) => ImageState::Failed(src.to_string()),
         };

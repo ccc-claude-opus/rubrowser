@@ -12,7 +12,17 @@ use super::{Dom, Element, NodeId};
 
 /// Parses an HTML document. Never fails: html5ever recovers from any input.
 pub fn parse_html(html: &str) -> Dom {
-    parse_document(Sink::default(), Default::default()).one(html)
+    // <noscript> content is parsed as markup: it stays hidden (UA CSS), but
+    // its fallback stylesheets apply, since many sites' scripts are too
+    // large for this browser to run.
+    let opts = html5ever::ParseOpts {
+        tree_builder: html5ever::tree_builder::TreeBuilderOpts {
+            scripting_enabled: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    parse_document(Sink::default(), opts).one(html)
 }
 
 /// Parses `html` as the contents of a `<context>` element (for

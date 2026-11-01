@@ -1690,9 +1690,10 @@ impl Browser {
         self.chrome.set_viewport(w, h);
         self.chrome.update(&self.fonts);
         let vp = self.viewport_rect();
+        // The viewport size first: `srcset` / `sizes` depend on it.
+        self.tabs[self.active].doc.set_viewport(vp.w, vp.h);
         self.request_images(host);
         let doc = &mut self.tabs[self.active].doc;
-        doc.set_viewport(vp.w, vp.h);
         doc.update(&self.fonts);
     }
 

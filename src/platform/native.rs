@@ -154,7 +154,11 @@ fn accept_language() -> String {
     let lang = std::env::var("LC_ALL")
         .or_else(|_| std::env::var("LANG"))
         .unwrap_or_default();
-    let tag = lang.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+    let tag = lang
+        .split(['.', '@'])
+        .next()
+        .unwrap_or("")
+        .replace('_', "-");
     let primary = tag.split('-').next().unwrap_or("").to_string();
     match (tag.as_str(), primary.as_str()) {
         ("" | "C" | "POSIX", _) | (_, "en") => "en-US,en;q=0.9".into(),
