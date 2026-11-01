@@ -20,7 +20,7 @@ use crate::dom::{Dom, Element, NodeId};
 pub const FUEL_PER_CALL: u64 = 30_000_000;
 /// Budget for language runtimes such as `js.wasm`, which interpret the
 /// page's source and so need many more wasm instructions per call.
-pub const RUNTIME_FUEL_PER_CALL: u64 = 2_000_000_000;
+pub const RUNTIME_FUEL_PER_CALL: u64 = 10_000_000_000;
 /// Maximum linear memory of a script.
 pub const MAX_MEMORY: usize = 64 << 20;
 /// Longest string a script may pass to the browser.
@@ -397,6 +397,64 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             Ok(found.len() as i32)
         },
     )?;
+    l.func_wrap(
+        "rb",
+        "query_within",
+        |mut c: C, root: i32, p: i32, n: i32, out: i32, max: i32| -> Result<i32, Error> {
+            let sel = read_str(&c, p, n)?;
+            let doc = &c.data().doc;
+            let state = doc.state();
+            let found: Vec<NodeId> = match node(doc, root) {
+                Some(r) => doc
+                    .dom
+                    .descendants(r)
+                    .into_iter()
+                    .filter(|&d| d != r && css::matches(&doc.dom, d, &sel, &state))
+                    .collect(),
+                None => Vec::new(),
+            };
+            let count = found.len().min(max.max(0) as usize);
+            let bytes: Vec<u8> = found[..count]
+                .iter()
+                .flat_map(|&n| (n as i32).to_le_bytes())
+                .collect();
+            let mem = memory(&c)?;
+            let data = mem.data_mut(&mut c);
+            let r = range(data, out, bytes.len())?;
+            data[r].copy_from_slice(&bytes);
+            Ok(found.len() as i32)
+        },
+    )?;
+    l.func_wrap("rb", "rect", |c: C, h: i32, which: i32| -> f64 {
+        // Layout geometry from the last layout (logical px, viewport
+        // coordinates): 0 x, 1 y, 2 width, 3 height of the border box;
+        // 4 width, 5 height of the padding box. Node 0: the viewport.
+        let doc = &c.data().doc;
+        let Some(n) = node(doc, h) else { return 0.0 };
+        if n == Dom::ROOT {
+            let (w, h) = doc.viewport_size();
+            return match which {
+                2 | 4 => w as f64,
+                3 | 5 => h as f64,
+                _ => 0.0,
+            };
+        }
+        let Some((b, content)) = doc.box_rects(n) else {
+            return 0.0;
+        };
+        let pad = doc.style(n).map_or([0.0; 4], |s| {
+            [0, 1, 2, 3].map(|i| s.padding[i].px_or_zero(b.w))
+        });
+        (match which {
+            0 => b.x,
+            1 => b.y,
+            2 => b.w,
+            3 => b.h,
+            4 => content.w + pad[1] + pad[3],
+            5 => content.h + pad[0] + pad[2],
+            _ => 0.0,
+        }) as f64
+    })?;
     l.func_wrap("rb", "parent", |c: C, h: i32| -> i32 {
         let doc = &c.data().doc;
         node(doc, h)

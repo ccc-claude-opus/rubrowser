@@ -133,6 +133,11 @@ impl Document {
         self.needs_style || self.needs_layout || !self.restyle_roots.is_empty()
     }
 
+    /// The viewport size in logical pixels.
+    pub fn viewport_size(&self) -> (f32, f32) {
+        self.size
+    }
+
     /// Viewport size in logical pixels.
     pub fn set_viewport(&mut self, w: f32, h: f32) {
         if self.size != (w, h) {

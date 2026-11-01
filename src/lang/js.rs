@@ -132,6 +132,31 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             }
             Ok(JsArray::from_iter(out.into_iter().map(JsValue::from), c).into())
         }),
+        ("queryWithin", 2, |_, a, c| {
+            let root = int(a, 0, c)?;
+            let s = text(a, 1, c)?;
+            let mut out = vec![0i32; 64];
+            loop {
+                let n = unsafe {
+                    ffi::query_within(
+                        root,
+                        s.as_ptr(),
+                        s.len(),
+                        out.as_mut_ptr(),
+                        out.len() as i32,
+                    )
+                } as usize;
+                if n <= out.len() {
+                    out.truncate(n);
+                    break;
+                }
+                out.resize(n, 0);
+            }
+            Ok(JsArray::from_iter(out.into_iter().map(JsValue::from), c).into())
+        }),
+        ("rect", 2, |_, a, c| {
+            Ok(unsafe { ffi::rect(int(a, 0, c)?, int(a, 1, c)?) }.into())
+        }),
         ("nodeType", 1, |_, a, c| {
             Ok(unsafe { ffi::node_type(int(a, 0, c)?) }.into())
         }),

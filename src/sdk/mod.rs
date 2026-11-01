@@ -56,6 +56,8 @@ macro_rules! imports {
 imports! {
     fn query(p: *const u8, n: usize) -> i32;
     fn query_all(p: *const u8, n: usize, out: *mut i32, max: i32) -> i32;
+    fn query_within(root: i32, p: *const u8, n: usize, out: *mut i32, max: i32) -> i32;
+    fn rect(h: i32, which: i32) -> f64;
     fn parent(h: i32) -> i32;
     fn get_text(h: i32, p: *mut u8, cap: usize) -> i32;
     fn set_text(h: i32, p: *const u8, n: usize);

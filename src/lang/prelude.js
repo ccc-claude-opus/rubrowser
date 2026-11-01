@@ -109,28 +109,45 @@
       for (let n = other; n; n = n.parentNode) if (n === this) return true;
       return false;
     }
-    appendChild(child) { rb.insert(this.__h, handle(child), -1); return child; }
-    append(...nodes) { for (const n of nodes) rb.insert(this.__h, handle(n), -1); }
+    appendChild(child) { insert(this.__h, child, -1); return child; }
+    append(...nodes) { for (const n of nodes) insert(this.__h, n, -1); }
     prepend(...nodes) {
       const first = rb.relative(this.__h, 1);
-      for (const n of nodes) rb.insert(this.__h, handle(n), first);
+      for (const n of nodes) insert(this.__h, n, first);
     }
-    insertBefore(child, ref) { rb.insert(this.__h, handle(child), ref ? handle(ref) : -1); return child; }
+    insertBefore(child, ref) { insert(this.__h, child, ref ? handle(ref) : -1); return child; }
     removeChild(child) { rb.remove(handle(child)); return child; }
-    replaceChild(child, old) { rb.insert(this.__h, handle(child), handle(old)); rb.remove(handle(old)); return old; }
+    replaceChild(child, old) { insert(this.__h, child, handle(old)); rb.remove(handle(old)); return old; }
     remove() { rb.remove(this.__h); }
     replaceWith(...nodes) {
       const p = this.parentNode;
       if (!p) return;
-      for (const n of nodes) rb.insert(p.__h, handle(n), this.__h);
+      for (const n of nodes) insert(p.__h, n, this.__h);
       this.remove();
     }
-    before(...nodes) { const p = this.parentNode; if (p) for (const n of nodes) rb.insert(p.__h, handle(n), this.__h); }
+    before(...nodes) { const p = this.parentNode; if (p) for (const n of nodes) insert(p.__h, n, this.__h); }
     after(...nodes) {
       const p = this.parentNode;
       if (!p) return;
       const next = rb.relative(this.__h, 3);
-      for (const n of nodes) rb.insert(p.__h, handle(n), next);
+      for (const n of nodes) insert(p.__h, n, next);
+    }
+    get ownerDocument() { return this.nodeType === 9 ? null : wrap(0); }
+    compareDocumentPosition(other) {
+      if (other === this) return 0;
+      const chain = (n) => { const c = []; for (; n; n = n.parentNode) c.unshift(n); return c; };
+      const a = chain(this), b = chain(other);
+      if (a[0] !== b[0]) return 1 | 32 | (this.__h < other.__h ? 4 : 2);
+      if (b.includes(this)) return 16 | 4;
+      if (a.includes(other)) return 8 | 2;
+      let i = 0;
+      while (a[i] === b[i]) i++;
+      const kids = a[i - 1].childNodes;
+      return kids.indexOf(b[i]) > kids.indexOf(a[i]) ? 4 : 2;
+    }
+    dispatchEvent(event) {
+      dispatchSynthetic(this, event.type, event);
+      return !event.defaultPrevented;
     }
     cloneNode(deep) {
       if (this.nodeType === 3) return wrap(rb.createText(this.textContent));
@@ -140,8 +157,7 @@
     }
     querySelector(sel) { return this.querySelectorAll(sel)[0] || null; }
     querySelectorAll(sel) {
-      const all = list(rb.queryAll(String(sel)));
-      return this.nodeType === 9 ? all : all.filter((n) => n !== this && this.contains(n));
+      return this.nodeType === 9 ? list(rb.queryAll(String(sel))) : list(rb.queryWithin(this.__h, String(sel)));
     }
     getElementsByTagName(tag) { return this.querySelectorAll(tag === '*' ? '*' : String(tag).toLowerCase()); }
     getElementsByClassName(names) {
@@ -226,6 +242,31 @@
     get classList() { return new DOMTokenList(this); }
     get style() { return styleProxy(this); }
     get dataset() { return datasetProxy(this); }
+    // Geometry from the last layout.
+    getBoundingClientRect() {
+      const x = rb.rect(this.__h, 0), y = rb.rect(this.__h, 1);
+      const width = rb.rect(this.__h, 2), height = rb.rect(this.__h, 3);
+      return { x, y, left: x, top: y, width, height, right: x + width, bottom: y + height, toJSON() { return this; } };
+    }
+    getClientRects() { return [this.getBoundingClientRect()]; }
+    get offsetWidth() { return Math.round(rb.rect(this.__h, 2)); }
+    get offsetHeight() { return Math.round(rb.rect(this.__h, 3)); }
+    get offsetLeft() { return Math.round(rb.rect(this.__h, 0)); }
+    get offsetTop() { return Math.round(rb.rect(this.__h, 1)); }
+    get offsetParent() { return this.parentElement; }
+    get clientWidth() { return Math.round(rb.rect(this.__h, 4)); }
+    get clientHeight() { return Math.round(rb.rect(this.__h, 5)); }
+    get clientTop() { return 0; }
+    get clientLeft() { return 0; }
+    get scrollWidth() { return this.clientWidth; }
+    get scrollHeight() { return this.clientHeight; }
+    get scrollTop() { return 0; }
+    set scrollTop(v) {}
+    get scrollLeft() { return 0; }
+    set scrollLeft(v) {}
+    scrollIntoView() {}
+    focus() {}
+    blur() {}
     get innerHTML() { return rb.getHtml(this.__h, 0); }
     set innerHTML(v) { rb.setHtml(this.__h, String(v)); }
     get outerHTML() { return rb.getHtml(this.__h, 1); }
@@ -296,6 +337,22 @@
     blur() {}
   }
 
+  // A fragment is a detached <template> element whose children move when it
+  // is inserted.
+  class DocumentFragment extends Element {
+    get nodeType() { return 11; }
+    get nodeName() { return '#document-fragment'; }
+    getElementById(id) { return this.querySelectorAll('[id]').find((e) => e.id === String(id)) || null; }
+  }
+
+  function insert(parent, child, ref) {
+    if (child instanceof DocumentFragment) {
+      for (const c of child.childNodes) rb.insert(parent, c.__h, ref);
+    } else {
+      rb.insert(parent, handle(child), ref);
+    }
+  }
+
   class Document extends Node {
     get documentElement() { return wrap(rb.special(1)); }
     get head() { return wrap(rb.special(2)); }
@@ -315,15 +372,29 @@
     get location() { return location; }
     get readyState() { return 'complete'; }
     getElementById(id) {
-      return this.querySelectorAll('[id]').find((e) => e.id === String(id)) || null;
+      const v = String(id).replace(/["\\]/g, '\\$&');
+      return wrap(rb.query('[id="' + v + '"]'));
     }
+    get forms() { return this.querySelectorAll('form'); }
+    get images() { return this.querySelectorAll('img'); }
+    get links() { return this.querySelectorAll('a[href], area[href]'); }
+    get scripts() { return this.querySelectorAll('script'); }
+    get activeElement() { return this.body; }
+    hasFocus() { return true; }
+    createEvent(kind) { return new (/custom/i.test(kind) ? CustomEvent : Event)(''); }
+    createComment(text) { return this.createTextNode(''); }
     createElement(tag) {
       const h = rb.createElement(String(tag).toLowerCase());
       if (h < 0) throw new Error('InvalidCharacterError: ' + tag);
       return wrap(h);
     }
     createTextNode(text) { return wrap(rb.createText(String(text))); }
-    createDocumentFragment() { return this.createElement('template'); }
+    createDocumentFragment() {
+      const h = rb.createElement('template');
+      const f = new DocumentFragment(h);
+      wrappers.set(h, f);
+      return f;
+    }
   }
 
   // ----- events --------------------------------------------------------------
@@ -332,10 +403,12 @@
     constructor(type, init) {
       this.type = type;
       this.bubbles = !!(init && init.bubbles);
+      this.cancelable = !!(init && init.cancelable);
       this.defaultPrevented = false;
       this.timeStamp = rb.now();
     }
     preventDefault() { this.defaultPrevented = true; rb.preventDefault(); }
+    initEvent(type, bubbles, cancelable) { this.type = type; this.bubbles = !!bubbles; this.cancelable = !!cancelable; }
     stopPropagation() { rb.stopPropagation(); }
     stopImmediatePropagation() { rb.stopPropagation(); }
   }
@@ -402,6 +475,8 @@
   function handlerProperty(target, name) {
     let current = null;
     Object.defineProperty(target, 'on' + name, {
+      configurable: true,
+      enumerable: true,
       get: () => current,
       set: (fn) => {
         if (current) document.removeEventListener(name, current);
@@ -412,12 +487,14 @@
   }
 
   // element.click() from script: run click listeners up the tree in JS.
-  function dispatchSynthetic(target, type) {
+  function dispatchSynthetic(target, type, event) {
     let stopped = false;
-    const e = new Event(type, { bubbles: true });
+    const e = event || new Event(type, { bubbles: true });
     e.target = target;
     e.stopPropagation = () => { stopped = true; };
-    for (let n = target; n && !stopped; n = n.parentNode) {
+    e.stopImmediatePropagation = () => { stopped = true; };
+    e.preventDefault = () => { e.defaultPrevented = true; };
+    for (let n = target; n && !stopped; n = e.bubbles ? n.parentNode : null) {
       e.currentTarget = n;
       for (const l of [...listeners.values()]) {
         if (l.node === n && l.type === type) call(l.fn, n, [e]);
@@ -540,10 +617,106 @@
     go(n) { rb.historyGo(Number(n) || 0); },
   };
 
+  // ----- web platform stand-ins ---------------------------------------------
+
+  // Storage lasts for the page (nothing is written to disk).
+  class Storage {
+    constructor() { Object.defineProperty(this, '_m', { value: new Map() }); }
+    get length() { return this._m.size; }
+    key(i) { return [...this._m.keys()][i] ?? null; }
+    getItem(k) { return this._m.has(String(k)) ? this._m.get(String(k)) : null; }
+    setItem(k, v) { this._m.set(String(k), String(v)); }
+    removeItem(k) { this._m.delete(String(k)); }
+    clear() { this._m.clear(); }
+  }
+
+  class CustomEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      this.detail = init && 'detail' in init ? init.detail : null;
+    }
+  }
+
+  // Observers: nothing changes size or mutates behind scripts' backs here,
+  // and everything counts as visible (so lazy loaders load at once).
+  class MutationObserver {
+    constructor(cb) { this.cb = cb; }
+    observe() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  }
+  class ResizeObserver {
+    constructor(cb) { this.cb = cb; }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  class IntersectionObserver {
+    constructor(cb, options) { this.cb = cb; this.root = (options && options.root) || null; }
+    observe(target) {
+      const entry = {
+        target,
+        isIntersecting: true,
+        intersectionRatio: 1,
+        time: rb.now(),
+        boundingClientRect: {},
+        intersectionRect: {},
+        rootBounds: null,
+      };
+      addTimer(() => this.cb([entry], this), 0, [], false);
+    }
+    unobserve() {}
+    disconnect() {}
+    takeRecords() { return []; }
+  }
+
+  function matchMedia(query) {
+    return {
+      matches: false,
+      media: String(query),
+      onchange: null,
+      addListener() {},
+      removeListener() {},
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  }
+
+  const navigator = {
+    userAgent: 'Mozilla/5.0 rubrowser',
+    language: 'en-US',
+    languages: ['en-US', 'en'],
+    platform: '',
+    cookieEnabled: false,
+    onLine: true,
+    hardwareConcurrency: 1,
+    maxTouchPoints: 0,
+    sendBeacon: () => true,
+  };
+
   const document = wrap(0);
   wrappers.set(0, document);
+  Object.defineProperty(document, 'defaultView', { configurable: true, get: () => global });
+  if (!('readyState' in document)) {
+    Object.defineProperty(document, 'readyState', { configurable: true, get: () => 'complete' });
+  }
+  // Cookies set by scripts last for the page.
+  let cookieJar = '';
+  Object.defineProperty(document, 'cookie', {
+    configurable: true,
+    get: () => cookieJar,
+    set: (v) => {
+      const pair = String(v).split(';')[0];
+      const name = pair.split('=')[0].trim();
+      const rest = cookieJar.split('; ').filter((c) => c && c.split('=')[0] !== name);
+      cookieJar = [...rest, pair.trim()].join('; ');
+    },
+  });
   for (const name of ['load', 'domcontentloaded', 'keydown', 'click']) handlerProperty(global, name);
 
+  for (const [name, which] of [['innerWidth', 2], ['innerHeight', 3], ['outerWidth', 2], ['outerHeight', 3]]) {
+    Object.defineProperty(global, name, { configurable: true, get: () => rb.rect(0, which) });
+  }
   Object.assign(global, {
     window: global,
     self: global,
@@ -559,6 +732,26 @@
     Event,
     EventTarget,
     URLSearchParams,
+    Storage,
+    localStorage: new Storage(),
+    sessionStorage: new Storage(),
+    CustomEvent,
+    DocumentFragment,
+    MutationObserver,
+    ResizeObserver,
+    IntersectionObserver,
+    matchMedia,
+    navigator,
+    devicePixelRatio: 1,
+    scrollX: 0,
+    scrollY: 0,
+    pageXOffset: 0,
+    pageYOffset: 0,
+    screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1080, colorDepth: 24 },
+    scrollTo() {},
+    scrollBy() {},
+    scroll() {},
+    getComputedStyle: (el) => (el && el.style) || {},
     setTimeout: (fn, ms, ...args) => addTimer(fn, ms, args, false),
     setInterval: (fn, ms, ...args) => addTimer(fn, ms, args, true),
     clearTimeout: clearTimer,
