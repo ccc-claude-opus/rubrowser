@@ -1145,12 +1145,9 @@ fn logical(name: &str, value: &str) -> Option<Vec<(String, String)>> {
         .iter()
         .find_map(|p| name.strip_prefix(p).map(|r| (*p, r)))?;
     let rest = rest.strip_prefix('-')?;
-    let (axis, rest) = if let Some(r) = rest.strip_prefix("inline") {
-        ("inline", r)
-    } else if let Some(r) = rest.strip_prefix("block") {
-        ("block", r)
-    } else {
-        return None;
+    let (axis, rest) = match rest.strip_prefix("inline") {
+        Some(r) => ("inline", r),
+        None => ("block", rest.strip_prefix("block")?),
     };
     let (start, end) = if axis == "inline" {
         ("left", "right")
