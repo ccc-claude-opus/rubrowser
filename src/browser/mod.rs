@@ -455,6 +455,8 @@ struct Tab {
     /// `doc.dom.version()` when scripts last finished, to restyle only
     /// after real changes.
     dom_version: u64,
+    /// Method and body for the next page load (a form POST).
+    post: Option<crate::input::HttpRequest>,
 }
 
 impl Tab {
@@ -573,6 +575,7 @@ impl Browser {
             import_map: Vec::new(),
             import_map_sent: false,
             dom_version: 0,
+            post: None,
             runtimes: HashMap::new(),
             script_count: 0,
             loaded: false,
@@ -619,7 +622,9 @@ impl Browser {
         tab.history.truncate(tab.index + 1);
         tab.history.push(url.to_string());
         tab.index += 1;
-        if !self.same_document(self.active) {
+        if self.same_document(self.active) {
+            self.tabs[self.active].post = None;
+        } else {
             self.load(self.active, host);
         }
         self.keyboard = Target::Page;
@@ -671,12 +676,21 @@ impl Browser {
             return;
         }
         tab.loading = true;
+        let post = tab.post.take();
         let req = Request::Page {
             tab: tab.id,
             serial: tab.serial,
             url: url.clone(),
         };
-        self.fetch(req, &url, host);
+        match post {
+            Some(p) if url.starts_with("http") => {
+                let id = self.next_id;
+                self.next_id += 1;
+                self.requests.insert(id, req);
+                host.fetch_with(id, &url, &p);
+            }
+            _ => self.fetch(req, &url, host),
+        }
     }
 
     /// Starts loading `url` for `req`; built-in `about:` files complete on
@@ -1868,6 +1882,14 @@ impl Browser {
             }
             if let Some(href) = doc.link(id) {
                 let target = url::resolve(&doc.base_url(), &href);
+                // target=_blank (and named targets) open a new tab.
+                let new_tab = doc
+                    .dom
+                    .attr(id, "target")
+                    .is_some_and(|t| !t.is_empty() && !matches!(t, "_self" | "_top" | "_parent"));
+                if new_tab {
+                    return self.new_tab(&target, host);
+                }
                 return self.navigate(&target, host);
             }
             n = doc.dom.parent(id);
@@ -1956,14 +1978,22 @@ impl Browser {
             .attr(form, "method")
             .unwrap_or("get")
             .to_ascii_lowercase();
-        if method == "post" {
-            host.log("form method=post is not supported; submitting with GET");
-        }
         let base = if action.is_empty() {
             doc.url.clone()
         } else {
             url::resolve(&doc.base_url(), &action)
         };
+        if method == "post" {
+            // The body is sent once; going back to this entry reloads it
+            // with GET.
+            let target = base.split('#').next().unwrap_or("").to_string();
+            self.tabs[self.active].post = Some(crate::input::HttpRequest {
+                method: "POST".into(),
+                body: crate::document::urlencode(&data).into_bytes(),
+                content_type: "application/x-www-form-urlencoded".into(),
+            });
+            return self.navigate(&target, host);
+        }
         let base = base.split(['?', '#']).next().unwrap_or("").to_string();
         let target = format!("{base}?{}", crate::document::urlencode(&data));
         self.navigate(&target, host);
@@ -2441,6 +2471,8 @@ mod tests {
     #[derive(Default)]
     struct TestHost {
         fetched: Vec<(u32, String)>,
+        /// (url, method, body) of requests with a method.
+        requests: Vec<(String, String, String)>,
         title: String,
         clipboard: Option<String>,
     }
@@ -2448,6 +2480,12 @@ mod tests {
     impl Host for TestHost {
         fn fetch(&mut self, id: u32, url: &str) {
             self.fetched.push((id, url.to_string()));
+        }
+        fn fetch_with(&mut self, id: u32, url: &str, r: &crate::input::HttpRequest) {
+            self.fetched.push((id, url.to_string()));
+            let body = String::from_utf8_lossy(&r.body).into_owned();
+            self.requests
+                .push((url.to_string(), r.method.clone(), body));
         }
         fn clipboard_get(&mut self) -> Option<String> {
             self.clipboard.clone()
@@ -2627,6 +2665,34 @@ mod tests {
             module_imports(src),
             ["./a.js", "./b.js", "./c.js", "./d.js", "./e.js", "./f.js"]
         );
+    }
+
+    #[test]
+    fn post_forms_and_blank_targets() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://w.org/form", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = br#"<form method=post action="/save?x=1"><input name=q value="a b">
+            <button id=go>Go</button></form>
+            <a id=out href="/other" target=_blank style="display:block">out</a>"#;
+        b.fetch_done(id, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        click_page(&mut b, &mut h, "go");
+        assert_eq!(
+            h.requests.last().unwrap(),
+            &(
+                "https://w.org/save?x=1".to_string(),
+                "POST".to_string(),
+                "q=a+b".to_string()
+            )
+        );
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let tabs = b.tabs.len();
+        click_page(&mut b, &mut h, "out");
+        assert_eq!(b.tabs.len(), tabs + 1, "target=_blank opens a tab");
+        assert_eq!(b.tabs[b.active].url(), "https://w.org/other");
     }
 
     #[test]
