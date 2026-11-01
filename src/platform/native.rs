@@ -105,6 +105,10 @@ impl Host for NativeHost {
             self.window.set_title(title);
         }
     }
+
+    fn log(&mut self, message: &str) {
+        eprintln!("[console] {message}");
+    }
 }
 
 /// Loads `url` over HTTP(S) or from the file system.

@@ -61,6 +61,11 @@ function service() {
     const url = getString(rb.rb_web_buffer_len());
     load(id, url);
   }
+  for (;;) {
+    const len = rb.rb_web_next_log();
+    if (len < 0) break;
+    console.log('[rubrowser]', getString(len));
+  }
   canvas.style.cursor = CURSORS[rb.rb_web_cursor()] || 'default';
   const title = getString(rb.rb_web_title());
   if (title !== lastTitle) {

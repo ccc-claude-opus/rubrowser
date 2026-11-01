@@ -15,6 +15,7 @@ use crate::gfx::Canvas;
 use crate::input::{Cursor, Event, Host, Modifiers};
 use crate::layout::RectF;
 use crate::net::url;
+use crate::script::Script;
 use crate::text::Fonts;
 use crate::ui::textfield::Action;
 
@@ -22,6 +23,21 @@ const CHROME_HTML: &str = include_str!("chrome.html");
 const HOME_HTML: &str = include_str!("pages/home.html");
 const CARET_BLINK_MS: f64 = 530.0;
 const WHEEL_LINE: f32 = 40.0;
+
+/// Pages and files built into the browser, served as `about:NAME`.
+fn builtin(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "home" => HOME_HTML.as_bytes(),
+        "blank" => b"",
+        "counter" => include_bytes!("pages/counter.html"),
+        "counter.wasm" => include_bytes!("pages/counter.wasm"),
+        "todo" => include_bytes!("pages/todo.html"),
+        "todo.wasm" => include_bytes!("pages/todo.wasm"),
+        "stopwatch" => include_bytes!("pages/stopwatch.html"),
+        "stopwatch.wasm" => include_bytes!("pages/stopwatch.wasm"),
+        _ => return None,
+    })
+}
 
 /// Which document an event goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +60,15 @@ struct Press {
 enum Request {
     Page { tab: u64, serial: u64, url: String },
     Stylesheet { tab: u64, serial: u64, link: NodeId },
+    Script { tab: u64, serial: u64, url: String },
+}
+
+/// A pending `set_timeout` of a script.
+#[derive(Clone, Copy, Debug)]
+struct Timer {
+    due: f64,
+    script: usize,
+    id: i32,
 }
 
 struct Tab {
@@ -54,6 +79,9 @@ struct Tab {
     /// Increases with every navigation, to drop stale fetch results.
     serial: u64,
     loading: bool,
+    /// The page's wasm scripts (`None` once a script has crashed).
+    scripts: Vec<Option<Script>>,
+    timers: Vec<Timer>,
 }
 
 impl Tab {
@@ -91,6 +119,8 @@ pub struct Browser {
     dirty: bool,
     /// Tab strip as last written to the chrome DOM (title, active).
     shown_tabs: Vec<(String, bool)>,
+    /// Built-in resources fetched, delivered on the next update.
+    local: Vec<(u32, Result<Vec<u8>, String>)>,
 }
 
 impl Browser {
@@ -115,6 +145,7 @@ impl Browser {
             now: 0.0,
             dirty: true,
             shown_tabs: Vec::new(),
+            local: Vec::new(),
         };
         b.push_tab("about:home");
         b.tabs[0].doc = Document::from_html(HOME_HTML, "about:home");
@@ -146,6 +177,8 @@ impl Browser {
             doc: Document::from_html("", url),
             serial: 0,
             loading: false,
+            scripts: Vec::new(),
+            timers: Vec::new(),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -210,45 +243,65 @@ impl Browser {
         let url = tab.url().to_string();
         self.dirty = true;
         if let Some(name) = url.strip_prefix("about:") {
-            let html = match name {
-                "home" => HOME_HTML.to_string(),
-                "blank" => String::new(),
-                _ => error_page(&url, "This about: page does not exist."),
+            let html = match builtin(name) {
+                Some(bytes) => as_html(&url, bytes),
+                None => error_page(&url, "This about: page does not exist."),
             };
             self.set_page(i, &html, &url, host);
             return;
         }
+        tab.loading = true;
+        let req = Request::Page {
+            tab: tab.id,
+            serial: tab.serial,
+            url: url.clone(),
+        };
+        self.fetch(req, &url, host);
+    }
+
+    /// Starts loading `url` for `req`; built-in `about:` files complete on
+    /// the next update.
+    fn fetch(&mut self, req: Request, url: &str, host: &mut dyn Host) {
         let id = self.next_id;
         self.next_id += 1;
-        tab.loading = true;
-        self.requests.insert(
-            id,
-            Request::Page {
-                tab: tab.id,
-                serial: tab.serial,
-                url: url.clone(),
-            },
-        );
-        host.fetch(id, &url);
+        self.requests.insert(id, req);
+        if let Some(name) = url.strip_prefix("about:") {
+            let result = builtin(name)
+                .map(<[u8]>::to_vec)
+                .ok_or_else(|| format!("{url} does not exist"));
+            self.local.push((id, result));
+        } else {
+            host.fetch(id, url);
+        }
     }
 
     fn set_page(&mut self, i: usize, html: &str, url: &str, host: &mut dyn Host) {
         let tab = &mut self.tabs[i];
         tab.loading = false;
         tab.doc = Document::from_html(html, url);
-        // Fetch linked stylesheets.
-        for (link, href) in tab.doc.stylesheet_links() {
-            let id = self.next_id;
-            self.next_id += 1;
-            self.requests.insert(
-                id,
-                Request::Stylesheet {
-                    tab: tab.id,
-                    serial: tab.serial,
-                    link,
-                },
-            );
-            host.fetch(id, &url::resolve(url, &href));
+        tab.scripts.clear();
+        tab.timers.clear();
+        let (id, serial) = (tab.id, tab.serial);
+        let links = tab.doc.stylesheet_links();
+        let scripts = wasm_scripts(&tab.doc);
+        for (link, href) in links {
+            let req = Request::Stylesheet {
+                tab: id,
+                serial,
+                link,
+            };
+            self.fetch(req, &url::resolve(url, &href), host);
+        }
+        // Scripts run in document order: they are fetched in order and
+        // each is started when it arrives (in order for local files).
+        for src in scripts {
+            let target = url::resolve(url, &src);
+            let req = Request::Script {
+                tab: id,
+                serial,
+                url: target.clone(),
+            };
+            self.fetch(req, &target, host);
         }
         self.dirty = true;
     }
@@ -285,7 +338,141 @@ impl Browser {
                     self.dirty = true;
                 }
             }
+            Request::Script { tab, serial, url } => {
+                let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                else {
+                    return;
+                };
+                let bytes = match result {
+                    Ok(b) => b,
+                    Err(e) => return host.log(&format!("{url}: {e}")),
+                };
+                let now = self.now;
+                let t = &mut self.tabs[i];
+                match Script::load(&bytes, &mut t.doc, now) {
+                    Ok(script) => {
+                        t.scripts.push(Some(script));
+                        let si = t.scripts.len() - 1;
+                        self.after_script(i, si, host);
+                    }
+                    Err(e) => host.log(&format!("{url}: {e}")),
+                }
+                self.dirty = true;
+            }
         }
+    }
+
+    // ----- scripts -----------------------------------------------------------
+
+    /// Acts on what script `si` of tab `i` asked for; returns whether it
+    /// prevented the default action.
+    fn after_script(&mut self, i: usize, si: usize, host: &mut dyn Host) -> bool {
+        let now = self.now;
+        let Some(Some(script)) = self.tabs[i].scripts.get_mut(si) else {
+            return false;
+        };
+        let out = script.take_output();
+        for msg in &out.logs {
+            host.log(msg);
+        }
+        let tab = &mut self.tabs[i];
+        for (delay, id) in out.timers {
+            tab.timers.push(Timer {
+                due: now + delay,
+                script: si,
+                id,
+            });
+        }
+        tab.doc.dom_changed();
+        self.dirty = true;
+        if let Some(target) = out.navigate
+            && i == self.active
+        {
+            let target = url::resolve(&self.tabs[i].doc.url, &target);
+            self.navigate(&target, host);
+        }
+        out.prevent_default
+    }
+
+    /// Reports a script failure and stops that script.
+    fn script_failed(&mut self, i: usize, si: usize, err: &str, host: &mut dyn Host) {
+        host.log(&format!("script error in {}: {err}", self.tabs[i].doc.url));
+        self.tabs[i].scripts[si] = None;
+        self.tabs[i].timers.retain(|t| t.script != si);
+    }
+
+    /// Dispatches `event` at `node` of the active page, bubbling up to the
+    /// root. Returns whether a listener prevented the default action.
+    fn dispatch(
+        &mut self,
+        node: NodeId,
+        event: &str,
+        key: i32,
+        mods: i32,
+        host: &mut dyn Host,
+    ) -> bool {
+        let i = self.active;
+        let tab = &self.tabs[i];
+        let mut calls = Vec::new();
+        let mut n = Some(node);
+        while let Some(id) = n {
+            for (si, s) in tab.scripts.iter().enumerate() {
+                for l in s.iter().flat_map(|s| s.listeners()) {
+                    if l.node == id && l.event == event {
+                        calls.push((si, l.id));
+                    }
+                }
+            }
+            n = tab.doc.dom.parent(id);
+        }
+        let mut prevented = false;
+        for (si, lid) in calls {
+            let now = self.now;
+            let t = &mut self.tabs[i];
+            let Some(Some(script)) = t.scripts.get_mut(si) else {
+                continue;
+            };
+            match script.dispatch(&mut t.doc, lid, node, key, mods, now) {
+                Ok(()) => prevented |= self.after_script(i, si, host),
+                Err(e) => self.script_failed(i, si, &e, host),
+            }
+            if self.active != i || self.tabs.len() <= i {
+                break; // the script navigated away or closed the tab
+            }
+        }
+        prevented
+    }
+
+    /// Fires timers that are due in every tab.
+    fn run_timers(&mut self, host: &mut dyn Host) {
+        let now = self.now;
+        for i in 0..self.tabs.len() {
+            while let Some(k) = self.tabs[i].timers.iter().position(|t| t.due <= now) {
+                let timer = self.tabs[i].timers.remove(k);
+                let t = &mut self.tabs[i];
+                let Some(Some(script)) = t.scripts.get_mut(timer.script) else {
+                    continue;
+                };
+                match script.timer(&mut t.doc, timer.id, now) {
+                    Ok(()) => {
+                        self.after_script(i, timer.script, host);
+                    }
+                    Err(e) => self.script_failed(i, timer.script, &e, host),
+                }
+                if i >= self.tabs.len() {
+                    return;
+                }
+            }
+        }
+    }
+
+    fn next_timer(&self) -> Option<f64> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.timers.iter().map(|t| t.due))
+            .reduce(f64::min)
     }
 
     // ----- chrome document -------------------------------------------------
@@ -456,6 +643,9 @@ impl Browser {
                     self.doc_mut(t).input(n).insert(&text);
                     self.caret_epoch = now;
                     self.dirty = true;
+                    if t == Target::Page {
+                        self.dispatch(n, "input", 0, 0, host);
+                    }
                 }
             }
         }
@@ -613,6 +803,9 @@ impl Browser {
                 }
             }
             Target::Page => {
+                if self.dispatch(node, "click", 0, 0, host) {
+                    return;
+                }
                 let doc = &self.tabs[self.active].doc;
                 if let Some(href) = doc.link(node) {
                     let target = url::resolve(&doc.url, &href);
@@ -673,9 +866,21 @@ impl Browser {
             }
             return;
         }
+        if t == Target::Page {
+            let target = focus
+                .or_else(|| self.doc(t).dom.body())
+                .unwrap_or(crate::dom::Dom::ROOT);
+            if self.dispatch(target, "keydown", code, mods.bits(), host) {
+                return;
+            }
+        }
         if let Some(n) = focus {
             if self.doc(t).is_text_input(n) {
+                let before = self.doc(t).input_value(n);
                 let action = self.doc_mut(t).input(n).key(code, mods, host);
+                if t == Target::Page && self.doc(t).input_value(n) != before {
+                    self.dispatch(n, "input", 0, 0, host);
+                }
                 self.input_action(t, n, action, host);
                 return;
             }
@@ -701,6 +906,9 @@ impl Browser {
                 let typed = self.chrome.input_value(n);
                 let target = url::from_input(&typed);
                 self.navigate(&target, host);
+            }
+            Action::Submit if t == Target::Page => {
+                self.dispatch(n, "change", key::ENTER, 0, host);
             }
             Action::Cancel if is_address => {
                 let current = self.tabs[self.active].url().to_string();
@@ -740,6 +948,13 @@ impl Browser {
 
     /// Restyles and lays out the chrome and the active page if needed.
     fn update_layout(&mut self, host: &mut dyn Host) {
+        // Deliver built-in files (they may queue more, e.g. scripts).
+        while !self.local.is_empty() {
+            for (id, result) in std::mem::take(&mut self.local) {
+                self.fetch_done(id, result, host);
+            }
+        }
+        self.run_timers(host);
         if self.dirty {
             self.sync_chrome(host);
         }
@@ -755,6 +970,8 @@ impl Browser {
     /// Whether a new frame should be drawn at time `now`.
     pub fn needs_redraw(&self, now: f64) -> bool {
         self.dirty
+            || !self.local.is_empty()
+            || self.next_timer().is_some_and(|t| t <= now)
             || self.chrome.needs_update()
             || self.tabs[self.active].doc.needs_update()
             || (self.focused_text_input().is_some() && self.caret_on() != self.caret_at(now))
@@ -770,9 +987,14 @@ impl Browser {
         if self.needs_redraw(now) {
             return Some(now);
         }
-        self.focused_text_input()?;
-        let phase = (now - self.caret_epoch) / CARET_BLINK_MS;
-        Some(self.caret_epoch + (phase.floor() + 1.0) * CARET_BLINK_MS)
+        let caret = self.focused_text_input().map(|_| {
+            let phase = (now - self.caret_epoch) / CARET_BLINK_MS;
+            self.caret_epoch + (phase.floor() + 1.0) * CARET_BLINK_MS
+        });
+        match (caret, self.next_timer()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
     }
 
     /// Draws the whole browser and returns the result.
@@ -815,6 +1037,21 @@ impl Browser {
         self.dirty = false;
         &self.canvas
     }
+}
+
+/// `src` of every `<script>` that is WebAssembly (JavaScript is not run).
+fn wasm_scripts(doc: &Document) -> Vec<String> {
+    let dom = &doc.dom;
+    dom.descendants(crate::dom::Dom::ROOT)
+        .into_iter()
+        .filter(|&n| dom.tag(n) == Some("script"))
+        .filter_map(|n| {
+            let src = dom.attr(n, "src")?;
+            let ty = dom.attr(n, "type").unwrap_or("").to_ascii_lowercase();
+            (ty == "application/wasm" || ty == "wasm" || src.ends_with(".wasm"))
+                .then(|| src.to_string())
+        })
+        .collect()
 }
 
 fn sanitize_scale(scale: f32) -> f32 {
@@ -1028,6 +1265,88 @@ mod tests {
         assert_eq!(b.chrome.input_value(a), "garbage");
         press(&mut b, &mut h, key::ESCAPE, Modifiers::default());
         assert_eq!(b.chrome.input_value(a), "about:home");
+    }
+
+    fn page_el(b: &Browser, id: &str) -> NodeId {
+        b.tabs[b.active].doc.dom.element_by_id(id).unwrap()
+    }
+
+    /// Clicks the center of page element `id`.
+    fn click_page(b: &mut Browser, h: &mut TestHost, id: &str) {
+        let n = page_el(b, id);
+        let r = b.tabs[b.active].doc.content_box(n).unwrap();
+        let vp = b.viewport_rect();
+        click_at(
+            b,
+            h,
+            RectF {
+                x: r.x + vp.x,
+                y: r.y + vp.y,
+                ..r
+            },
+        );
+    }
+
+    #[test]
+    fn wasm_counter_page() {
+        let (mut b, mut h) = browser();
+        b.navigate("about:counter", &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].scripts.len(), 1, "counter.wasm loaded");
+        let text = |b: &Browser| b.tabs[b.active].doc.dom.text_content(page_el(b, "count"));
+        click_page(&mut b, &mut h, "inc");
+        click_page(&mut b, &mut h, "inc");
+        assert_eq!(text(&b), "2");
+        click_page(&mut b, &mut h, "dec");
+        click_page(&mut b, &mut h, "dec");
+        click_page(&mut b, &mut h, "dec");
+        assert_eq!(text(&b), "-1");
+        let count = page_el(&b, "count");
+        let style = b.tabs[b.active].doc.style(count).unwrap();
+        assert_eq!(
+            style.color.rgb(),
+            0xc5221f,
+            "inline style set by the script"
+        );
+    }
+
+    #[test]
+    fn wasm_todo_page() {
+        let (mut b, mut h) = browser();
+        b.navigate("about:todo", &mut h);
+        b.render(0.0, &mut h);
+        let items = |b: &Browser| {
+            let doc = &b.tabs[b.active].doc;
+            doc.dom.children(page_el(b, "list")).len()
+        };
+        assert_eq!(items(&b), 3, "initial items added by the script");
+        click_page(&mut b, &mut h, "new");
+        type_text(&mut b, &mut h, "Write docs");
+        press(&mut b, &mut h, key::ENTER, Modifiers::default());
+        b.render(0.0, &mut h);
+        assert_eq!(items(&b), 4);
+        let doc = &b.tabs[b.active].doc;
+        assert!(
+            doc.dom
+                .text_content(page_el(&b, "list"))
+                .contains("Write docs")
+        );
+        assert_eq!(doc.input_value(page_el(&b, "new")), "", "input cleared");
+        assert!(doc.dom.text_content(page_el(&b, "left")).contains("4 of 4"));
+    }
+
+    #[test]
+    fn wasm_timers_drive_the_stopwatch() {
+        let (mut b, mut h) = browser();
+        b.navigate("about:stopwatch", &mut h);
+        b.render(0.0, &mut h);
+        click_page(&mut b, &mut h, "toggle");
+        let next = b.next_wakeup(0.0).unwrap();
+        assert!(next > 0.0 && next <= 100.0);
+        b.render(1250.0, &mut h);
+        b.render(1300.0, &mut h);
+        let time = b.tabs[b.active].doc.dom.text_content(page_el(&b, "time"));
+        assert!(time.starts_with("00:01."), "{time}");
     }
 
     #[test]

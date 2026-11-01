@@ -14,11 +14,13 @@ use crate::text::Fonts;
 pub enum Item {
     /// Text of DOM text node `node` (styled by `styles[node]`).
     Text { node: NodeId, text: String },
-    /// An atomic inline (layout box index) with its margin-box size.
+    /// An atomic inline (layout box index) with its margin-box size and the
+    /// distance from its top to its baseline.
     Atomic {
         index: usize,
         width: f32,
         height: f32,
+        baseline: f32,
     },
     /// A forced line break (`<br>`).
     Break { node: NodeId },
@@ -90,6 +92,7 @@ enum Piece {
         index: usize,
         width: f32,
         height: f32,
+        baseline: f32,
     },
     Break,
 }
@@ -117,11 +120,13 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                 index,
                 width,
                 height,
+                baseline,
             } => {
                 out.push(Piece::Atomic {
                     index: *index,
                     width: *width,
                     height: *height,
+                    baseline: *baseline,
                 });
                 after_space = false;
             }
@@ -304,18 +309,19 @@ pub fn layout(
                 index,
                 width,
                 height,
+                baseline,
             } => {
                 if !line.items.is_empty() && x + width > max_width {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                 }
                 trailing = 0.0;
                 breakable = true;
-                // The box's bottom sits on the baseline.
-                ext.0 = ext.0.max(height);
+                // The box's baseline sits on the line's baseline.
+                ext = (ext.0.max(baseline), ext.1.max(height - baseline));
                 line.items.push(Placed::Atomic {
                     index,
                     x,
-                    y: height,
+                    y: baseline,
                 });
                 x += width;
             }
@@ -324,7 +330,7 @@ pub fn layout(
     if !line.items.is_empty() {
         finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
     }
-    // Now that baselines are known, turn atomic heights into top offsets.
+    // Now that baselines are known, turn atomic baselines into top offsets.
     for l in &mut lines {
         for item in &mut l.items {
             if let Placed::Atomic { y, .. } = item {
@@ -482,6 +488,7 @@ mod tests {
             index: 7,
             width: 50.0,
             height: 40.0,
+            baseline: 40.0,
         });
         let l = layout(&c, f32::INFINITY, &s, &f);
         assert_eq!(texts(&l), vec!["a []"]);

@@ -1,0 +1,30 @@
+<!doctype html>
+<html>
+<head>
+<title>Counter</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 48px; background: #f6f7f9; color: #202124; }
+  .card { width: 320px; padding: 24px; background: #fff; border: 1px solid #dadce0; border-radius: 12px; }
+  h1 { font-size: 22px; margin: 0 0 4px 0; }
+  p { margin: 0 0 16px 0; color: #5f6368; }
+  #count { font-size: 64px; font-weight: bold; text-align: center; margin: 8px 0 16px 0; }
+  .row { display: flex; gap: 8px; }
+  button { flex: 1; font-size: 18px; padding: 8px; border-radius: 8px; border: 1px solid #c4c7cc; background: #fff; }
+  button:hover { background: #eef3fd; }
+  button:active { background: #d2e3fc; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Counter</h1>
+    <p>The buttons are handled by <code>counter.wasm</code>, written in Rust.</p>
+    <div id="count">0</div>
+    <div class="row">
+      <button id="dec">&minus;</button>
+      <button id="reset">Reset</button>
+      <button id="inc">+</button>
+    </div>
+  </div>
+  <script type="application/wasm" src="counter.wasm"></script>
+</body>
+</html>

@@ -43,6 +43,9 @@
   }
   ul { line-height: 1.6; }
   a:hover { color: #c5221f; }
+  a.demo { display: block; color: #202124; text-decoration: none; }
+  a.demo h2 { color: #1a56c4; }
+  a.demo:hover { border-color: #1a56c4; background: #f8fbff; }
 </style>
 </head>
 <body>
@@ -64,6 +67,12 @@
         <h2>Text</h2>
         <p>DejaVu fonts rasterized by <code>fontdue</code>, wrapped by our inline layout.</p>
       </div>
+    </div>
+    <h2>Try it</h2>
+    <div class="cards">
+      <a class="card demo" href="about:counter"><h2>Counter</h2><p>Buttons handled by Rust compiled to wasm.</p></a>
+      <a class="card demo" href="about:todo"><h2>Todo list</h2><p>Create and remove elements, read an input.</p></a>
+      <a class="card demo" href="about:stopwatch"><h2>Stopwatch</h2><p>Timers updating the page.</p></a>
     </div>
     <h2>Features <span class="tag">v0.1</span></h2>
     <ul>

@@ -316,13 +316,14 @@ impl Builder<'_> {
                 self.collect_children(tree, c, false, parts);
             } else {
                 // inline-block / inline-flex: an atomic inline box.
-                let (index, width, height) = self.atomic(c);
+                let (index, width, height, baseline) = self.atomic(c);
                 push_inline(
                     parts,
                     Item::Atomic {
                         index,
                         width,
                         height,
+                        baseline,
                     },
                 );
             }
@@ -331,7 +332,7 @@ impl Builder<'_> {
 
     /// Lays out an inline-block element on its own and returns its box
     /// index and margin-box size.
-    fn atomic(&mut self, id: NodeId) -> (usize, f32, f32) {
+    fn atomic(&mut self, id: NodeId) -> (usize, f32, f32, f32) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
         let node = self.build(&mut tree, id);
         // Shrink-to-fit: lay out at max-content, capped by the viewport.
@@ -364,7 +365,32 @@ impl Builder<'_> {
         let b = &mut self.boxes[index];
         b.rect.x = ml;
         b.rect.y = mt;
-        (index, l.size.width + ml + mr, l.size.height + mt + mb)
+        let height = l.size.height + mt + mb;
+        // CSS: an inline-block's baseline is that of its last line box (or
+        // its bottom margin edge if it has none).
+        let baseline = self.last_baseline(index).map_or(height, |bl| mt + bl);
+        (index, l.size.width + ml + mr, height, baseline)
+    }
+
+    /// Distance from the top of box `i` to its last line's baseline.
+    fn last_baseline(&self, i: usize) -> Option<f32> {
+        let b = &self.boxes[i];
+        let (_, cy) = b.content_offset();
+        if let Some(line) = b.inline.as_ref().and_then(|il| il.lines.last()) {
+            return Some(cy + line.top + line.baseline);
+        }
+        if let Some(n) = b.node.filter(|&n| self.dom.tag(n) == Some("input")) {
+            // Single-line text centered in the content box, as painted.
+            let st = self.style(n)?;
+            let m = self.fonts.line_metrics(st.font(), st.font_size);
+            let content_h = b.rect.h - cy - b.border[cs::BOTTOM] - b.padding[cs::BOTTOM];
+            return Some(cy + (content_h - (m.ascent + m.descent)) / 2.0 + m.ascent);
+        }
+        b.children
+            .iter()
+            .rev()
+            .filter(|&&c| !self.boxes[c].absolute)
+            .find_map(|&c| Some(self.boxes[c].rect.y + self.last_baseline(c)?))
     }
 
     /// Copies taffy results into [`LBox`]es, returning the box index of `node`.

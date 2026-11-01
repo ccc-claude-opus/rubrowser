@@ -100,6 +100,8 @@ pub trait Host {
     fn clipboard_set(&mut self, text: &str);
     fn set_cursor(&mut self, cursor: Cursor);
     fn set_title(&mut self, title: &str);
+    /// A console message from a page script or the browser.
+    fn log(&mut self, _message: &str) {}
 }
 
 #[cfg(test)]

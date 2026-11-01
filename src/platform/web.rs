@@ -19,6 +19,7 @@ struct WebHost {
     title: String,
     /// Text the browser copied, handed to the next `copy` event.
     clipboard: String,
+    logs: VecDeque<String>,
 }
 
 impl Host for WebHost {
@@ -37,6 +38,11 @@ impl Host for WebHost {
     }
     fn set_title(&mut self, title: &str) {
         self.title = title.to_string();
+    }
+    fn log(&mut self, message: &str) {
+        if self.logs.len() < 1000 {
+            self.logs.push_back(message.to_string());
+        }
     }
 }
 
@@ -195,6 +201,18 @@ pub extern "C" fn rb_web_fetch_done(id: u32, len: usize, ok: i32) {
         };
         w.browser.fetch_done(id, result, &mut w.host);
     });
+}
+
+/// Next console message into the shared buffer; returns its length or -1.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_web_next_log() -> i32 {
+    with(|w| match w.host.logs.pop_front() {
+        Some(m) => {
+            w.buf = m.into_bytes();
+            w.buf.len() as i32
+        }
+        None => -1,
+    })
 }
 
 /// 0 default, 1 pointer, 2 text.

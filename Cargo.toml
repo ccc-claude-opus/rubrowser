@@ -9,7 +9,7 @@ repository = "https://github.com/ccc-claude-opus/rubrowser"
 readme = "README.md"
 keywords = ["browser", "wasm", "webassembly", "gui", "canvas"]
 categories = ["gui", "wasm", "web-programming"]
-include = ["/src", "/web/index.html", "/web/glue.js", "/doc", "/scripts", "/README.md", "/LICENSE", "/Cargo.toml"]
+include = ["/src", "/examples", "/web/index.html", "/web/glue.js", "/doc", "/scripts", "/README.md", "/LICENSE", "/Cargo.toml"]
 
 [features]
 default = ["native"]
@@ -17,7 +17,6 @@ default = ["native"]
 sdk = []
 # Platform-independent browser core: graphics, UI, page runtime.
 core = [
-    "dep:font8x8",
     "dep:wasmi",
     "dep:fontdue",
     "dep:dejavu",
@@ -34,7 +33,6 @@ web = ["core"]
 [dependencies]
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
-font8x8 = { version = "0.3", default-features = false, optional = true }
 wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"], optional = true }
 ureq = { version = "3", optional = true }
 arboard = { version = "3", default-features = false, optional = true }
@@ -63,3 +61,19 @@ opt-level = "s"
 panic = "abort"
 strip = true
 codegen-units = 1
+
+# Page scripts (built for wasm32 by scripts/build.sh).
+[[example]]
+name = "counter"
+crate-type = ["cdylib"]
+required-features = ["sdk"]
+
+[[example]]
+name = "todo"
+crate-type = ["cdylib"]
+required-features = ["sdk"]
+
+[[example]]
+name = "stopwatch"
+crate-type = ["cdylib"]
+required-features = ["sdk"]

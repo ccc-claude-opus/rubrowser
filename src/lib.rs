@@ -30,7 +30,7 @@ pub mod paint;
 #[cfg(any(feature = "native", feature = "web"))]
 pub mod platform;
 #[cfg(feature = "core")]
-pub mod runtime;
+pub mod script;
 #[cfg(feature = "sdk")]
 pub mod sdk;
 #[cfg(feature = "core")]

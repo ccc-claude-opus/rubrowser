@@ -47,7 +47,8 @@ pub fn resolve(base: &str, link: &str) -> String {
         return link.to_string();
     }
     match scheme(base) {
-        Some("about") => link.to_string(),
+        // Files next to a built-in page are built in too.
+        Some("about") => format!("about:{}", link.trim_start_matches("./")),
         Some(_) => {
             // "scheme://authority" + path
             let after = base.find("//").map_or(0, |i| i + 2);
@@ -167,7 +168,10 @@ mod tests {
         assert_eq!(resolve("pages/a.wasm", "../b.wasm"), "b.wasm");
         assert_eq!(resolve("a.wasm", "b.wasm"), "b.wasm");
         assert_eq!(resolve("/x/y/a.wasm", "./b.wasm"), "/x/y/b.wasm");
-        assert_eq!(resolve("about:home", "pages/b.wasm"), "pages/b.wasm");
+        assert_eq!(
+            resolve("about:counter", "counter.wasm"),
+            "about:counter.wasm"
+        );
     }
 
     #[test]

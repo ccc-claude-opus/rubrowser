@@ -1,9 +1,7 @@
 //! Software rendering into a `u32` pixel buffer.
 //!
-//! [`Canvas`] works in physical pixels. [`Painter`] wraps a canvas with a
-//! scale factor and an origin, so callers can draw in logical pixels.
-
-pub mod font;
+//! [`Canvas`] works in physical pixels; callers convert from logical
+//! pixels with the display scale.
 
 /// A color in `0x00RRGGBB` format.
 pub type Color = u32;
@@ -155,23 +153,6 @@ impl Canvas {
         }
     }
 
-    /// Draws one glyph with its top-left corner at `(x, y)`, each font pixel
-    /// becoming a `k × k` block.
-    pub fn draw_char(&mut self, x: i32, y: i32, ch: char, k: i32, color: Color) {
-        let cell = font::CELL * k;
-        let visible = Rect::new(x, y, cell, cell).intersect(&self.clip);
-        if visible.w == 0 || visible.h == 0 {
-            return;
-        }
-        for (row, bits) in font::glyph(ch).iter().enumerate() {
-            for col in 0..8 {
-                if bits & (1 << col) != 0 {
-                    self.fill_rect(x + col * k, y + row as i32 * k, k, k, color);
-                }
-            }
-        }
-    }
-
     /// Copies `src` (`w × h` pixels) to `(x, y)`, clipped.
     pub fn blit(&mut self, x: i32, y: i32, w: usize, h: usize, src: &[Color]) {
         let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
@@ -307,126 +288,6 @@ impl Canvas {
     }
 }
 
-/// Draws on a [`Canvas`] in logical pixels, relative to an origin.
-pub struct Painter<'a> {
-    canvas: &'a mut Canvas,
-    scale: f32,
-    origin: (i32, i32),
-}
-
-impl<'a> Painter<'a> {
-    pub fn new(canvas: &'a mut Canvas, scale: f32) -> Self {
-        Painter {
-            canvas,
-            scale,
-            origin: (0, 0),
-        }
-    }
-
-    pub fn scale(&self) -> f32 {
-        self.scale
-    }
-
-    pub fn canvas(&mut self) -> &mut Canvas {
-        self.canvas
-    }
-
-    /// Converts a logical coordinate (relative to the origin) to physical.
-    fn px(&self, v: i32) -> i32 {
-        (v as f32 * self.scale).round() as i32
-    }
-
-    /// Converts a logical rectangle to physical pixels.
-    pub fn to_physical(&self, r: Rect) -> Rect {
-        let x0 = self.px(self.origin.0 + r.x);
-        let y0 = self.px(self.origin.1 + r.y);
-        let x1 = self.px(self.origin.0 + r.right());
-        let y1 = self.px(self.origin.1 + r.bottom());
-        Rect::new(x0, y0, x1 - x0, y1 - y0)
-    }
-
-    /// Moves the origin by `(dx, dy)` logical pixels.
-    pub fn translate(&mut self, dx: i32, dy: i32) {
-        self.origin.0 += dx;
-        self.origin.1 += dy;
-    }
-
-    pub fn origin(&self) -> (i32, i32) {
-        self.origin
-    }
-
-    pub fn set_origin(&mut self, origin: (i32, i32)) {
-        self.origin = origin;
-    }
-
-    /// Restricts drawing to the logical rectangle `r`.
-    pub fn set_clip(&mut self, r: Rect) {
-        let p = self.to_physical(r);
-        self.canvas.set_clip(p);
-    }
-
-    pub fn reset_clip(&mut self) {
-        self.canvas.reset_clip();
-    }
-
-    pub fn fill_rect(&mut self, r: Rect, color: Color) {
-        let p = self.to_physical(r);
-        self.canvas.fill_rect(p.x, p.y, p.w, p.h, color);
-    }
-
-    /// Draws a rectangle outline one logical pixel wide.
-    pub fn stroke_rect(&mut self, r: Rect, color: Color) {
-        self.fill_rect(Rect::new(r.x, r.y, r.w, 1), color);
-        self.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), color);
-        self.fill_rect(Rect::new(r.x, r.y, 1, r.h), color);
-        self.fill_rect(Rect::new(r.right() - 1, r.y, 1, r.h), color);
-    }
-
-    /// Draws a line `thick` logical pixels wide.
-    pub fn line(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, thick: i32, color: Color) {
-        let (ox, oy) = self.origin;
-        let t = self.px(thick).max(1);
-        let (a, b) = (self.px(ox + x0), self.px(oy + y0));
-        let (c, d) = (self.px(ox + x1), self.px(oy + y1));
-        self.canvas.line(a, b, c, d, t, color);
-    }
-
-    /// Draws `text` with its top-left corner at `(x, y)`, `size` logical
-    /// pixels tall. Returns the logical width drawn.
-    pub fn text(&mut self, x: i32, y: i32, size: i32, text: &str, color: Color) -> i32 {
-        let k = font::pixel_scale(size as f32, self.scale);
-        let cell = font::CELL * k;
-        let mut px = self.px(self.origin.0 + x);
-        // Center the glyph cell vertically in the requested height.
-        let py = self.px(self.origin.1 + y) + (self.px(size) - cell) / 2;
-        for ch in text.chars() {
-            self.canvas.draw_char(px, py, ch, k, color);
-            px += cell;
-        }
-        self.text_width(size, text)
-    }
-
-    /// Logical width of `text` drawn at `size`.
-    pub fn text_width(&self, size: i32, text: &str) -> i32 {
-        text_width(size, self.scale, text)
-    }
-
-    /// Logical width of one character drawn at `size`.
-    pub fn char_width(&self, size: i32) -> f32 {
-        char_width(size, self.scale)
-    }
-}
-
-/// Logical width of one character drawn at `size` with display `scale`.
-pub fn char_width(size: i32, scale: f32) -> f32 {
-    (font::CELL * font::pixel_scale(size as f32, scale)) as f32 / scale
-}
-
-/// Logical width of `text` drawn at `size` with display `scale`.
-pub fn text_width(size: i32, scale: f32, text: &str) -> i32 {
-    (text.chars().count() as f32 * char_width(size, scale)).round() as i32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,25 +371,5 @@ mod tests {
         let mut c = Canvas::new(4, 2);
         c.blit_scaled(Rect::new(0, 0, 4, 2), 2, 1, &[1, 2]);
         assert_eq!(c.pixels(), &[1, 1, 2, 2, 1, 1, 2, 2]);
-    }
-
-    #[test]
-    fn painter_scales_rects() {
-        let mut c = Canvas::new(4, 4);
-        let mut p = Painter::new(&mut c, 2.0);
-        p.translate(1, 0);
-        p.fill_rect(Rect::new(0, 1, 1, 1), 5);
-        assert_eq!(&c.pixels()[8..12], &[0, 0, 5, 5]);
-        assert_eq!(&c.pixels()[12..16], &[0, 0, 5, 5]);
-    }
-
-    #[test]
-    fn text_draws_pixels_and_measures() {
-        let mut c = Canvas::new(32, 16);
-        let mut p = Painter::new(&mut c, 1.0);
-        let w = p.text(0, 0, 16, "A", 1);
-        assert_eq!(w, 16);
-        assert!(c.pixels().contains(&1));
-        assert_eq!(text_width(16, 2.0, "abc"), 48);
     }
 }
