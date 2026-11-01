@@ -14,6 +14,7 @@ use crate::gfx::{Canvas, Rect};
 use crate::layout::inline::Placed;
 use crate::layout::{LBox, LayoutTree, RectF};
 use crate::text::Fonts;
+use crate::ui::TextField;
 
 /// Vertical scroll offsets: `None` is the viewport, `Some(id)` an element.
 pub type ScrollOffsets = HashMap<Option<NodeId>, f32>;
@@ -25,7 +26,15 @@ pub struct Painter<'a> {
     pub tree: &'a LayoutTree,
     pub scroll: &'a ScrollOffsets,
     pub scale: f32,
+    /// Editing state of `<input>` elements.
+    pub inputs: &'a HashMap<NodeId, TextField>,
+    pub focus: Option<NodeId>,
+    /// Whether the blinking caret is currently shown.
+    pub caret: bool,
 }
+
+const SELECTION: Rgba = Rgba::new(51, 132, 255, 90);
+const PLACEHOLDER: Rgba = Rgba::new(117, 117, 117, 255);
 
 const SCROLLBAR: Rgba = Rgba::new(0, 0, 0, 90);
 
@@ -152,8 +161,80 @@ impl Painter<'_> {
                 }
             }
         }
+        if let Some(node) = b.node
+            && self.dom.tag(node) == Some("input")
+        {
+            self.input(c, b, node, style, r);
+        }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);
+        }
+        c.set_clip(saved);
+    }
+
+    /// Draws an input's value (or placeholder), selection and caret.
+    fn input(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
+        let (cx, cy) = b.content_offset();
+        let area = RectF {
+            x: r.x + cx,
+            y: r.y + cy,
+            w: (r.w - cx - b.border[cs::RIGHT] - b.padding[cs::RIGHT]).max(0.0),
+            h: (r.h - cy - b.border[cs::BOTTOM] - b.padding[cs::BOTTOM]).max(0.0),
+        };
+        let field = self.inputs.get(&node);
+        let focused = self.focus == Some(node);
+        let value = field.map_or_else(
+            || self.dom.attr(node, "value").unwrap_or("").to_string(),
+            TextField::text,
+        );
+        let shown = display_value(self.dom, node, &value);
+        let m = self.fonts.line_metrics(style.font(), style.font_size);
+        let baseline = area.y + (area.h - (m.ascent + m.descent)) / 2.0 + m.ascent;
+        let saved = c.clip();
+        // Let the caret show at the very edges.
+        let clip = self.phys(RectF {
+            x: area.x - 1.0,
+            w: area.w + 2.0,
+            ..area
+        });
+        c.set_clip(clip.intersect(&saved));
+        if shown.is_empty() {
+            if let Some(ph) = self.dom.attr(node, "placeholder") {
+                self.text(c, style, area.x, baseline, ph, PLACEHOLDER);
+            }
+        } else {
+            let x0 = area.x - field.map_or(0.0, TextField::scroll);
+            if let Some(f) = field.filter(|_| focused) {
+                let xs = TextField::positions(&self.fonts.advances(
+                    style.font(),
+                    style.font_size,
+                    &shown,
+                ));
+                let (s, e) = f.selection();
+                if s != e {
+                    let sel = RectF {
+                        x: x0 + xs[s],
+                        y: baseline - m.ascent,
+                        w: xs[e] - xs[s],
+                        h: m.ascent + m.descent,
+                    };
+                    self.fill(c, sel, SELECTION);
+                }
+            }
+            self.text(c, style, x0, baseline, &shown, style.color);
+        }
+        if focused && self.caret {
+            let xs =
+                TextField::positions(&self.fonts.advances(style.font(), style.font_size, &shown));
+            let caret = field.map_or(0, TextField::caret).min(xs.len() - 1);
+            let x0 = area.x - field.map_or(0.0, TextField::scroll);
+            let bar = RectF {
+                x: x0 + xs[caret],
+                y: baseline - m.ascent,
+                w: 1.0,
+                h: m.ascent + m.descent,
+            };
+            self.fill(c, bar, style.color);
         }
         c.set_clip(saved);
     }
@@ -379,5 +460,17 @@ impl Painter<'_> {
             SCROLLBAR.rgb(),
             SCROLLBAR.a,
         );
+    }
+}
+
+/// The text an input shows for `value` (bullets for passwords).
+pub fn display_value(dom: &Dom, node: NodeId, value: &str) -> String {
+    if dom
+        .attr(node, "type")
+        .is_some_and(|t| t.eq_ignore_ascii_case("password"))
+    {
+        "\u{2022}".repeat(value.chars().count())
+    } else {
+        value.to_string()
     }
 }

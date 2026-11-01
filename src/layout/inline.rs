@@ -250,6 +250,8 @@ pub fn layout(
         *x = 0.0;
     };
 
+    // Lines may only break where there is a space (or around atomics).
+    let mut breakable = false;
     for piece in pieces(content, styles, fonts) {
         match piece {
             Piece::Break => {
@@ -266,7 +268,7 @@ pub fn layout(
                 if at_line_start && text.trim().is_empty() {
                     continue; // collapsible space at line start
                 }
-                if !at_line_start && wraps && x + width - space > max_width {
+                if !at_line_start && wraps && breakable && x + width - space > max_width {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                     if text.trim().is_empty() {
                         continue;
@@ -296,6 +298,7 @@ pub fn layout(
                 }
                 x += width;
                 trailing = space;
+                breakable = space > 0.0;
             }
             Piece::Atomic {
                 index,
@@ -306,6 +309,7 @@ pub fn layout(
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                 }
                 trailing = 0.0;
+                breakable = true;
                 // The box's bottom sits on the baseline.
                 ext.0 = ext.0.max(height);
                 line.items.push(Placed::Atomic {
@@ -422,6 +426,19 @@ mod tests {
         let min = layout(&c, 0.0, &s, &f);
         assert_eq!(min.lines.len(), 3);
         assert!(min.width < one.width);
+    }
+
+    #[test]
+    fn no_break_without_a_space_between_runs() {
+        let f = Fonts::new();
+        let (mut c, mut s) = setup("aaa", WhiteSpace::Normal);
+        s.push(s[1].clone());
+        c.items.push(Item::Text {
+            node: 2,
+            text: ", bbb".into(),
+        });
+        let l = layout(&c, f.measure(Default::default(), 16.0, "aaa") + 2.0, &s, &f);
+        assert_eq!(texts(&l)[0], "aaa,");
     }
 
     #[test]

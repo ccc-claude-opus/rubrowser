@@ -118,6 +118,7 @@ impl Fonts {
         self.advances(key, size, text).iter().sum()
     }
 
+    #[allow(clippy::too_many_arguments)]
     /// Draws `text` with its baseline starting at physical `(x, baseline)`;
     /// `size` is in physical pixels. Returns the advance in physical pixels.
     pub fn draw(

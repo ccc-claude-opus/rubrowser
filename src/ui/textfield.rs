@@ -1,7 +1,6 @@
 //! A single-line text field: caret, selection, scrolling, clipboard.
 
 use crate::abi::key;
-use crate::gfx::{Color, Painter, Rect, char_width};
 use crate::input::{Host, Modifiers};
 
 /// What a key press did to the field.
@@ -189,66 +188,60 @@ impl TextField {
         Action::Handled
     }
 
-    /// Char index nearest to `x` (logical, relative to the text start).
-    pub fn index_at(&self, x: i32, cw: f32) -> usize {
-        (((x as f32 + self.scroll) / cw).round().max(0.0) as usize).min(self.chars.len())
+    /// Caret x positions (relative to the text start) for every index
+    /// `0..=len`, given the advance of each char.
+    pub fn positions(advances: &[f32]) -> Vec<f32> {
+        let mut xs = Vec::with_capacity(advances.len() + 1);
+        let mut x = 0.0;
+        xs.push(x);
+        for a in advances {
+            x += a;
+            xs.push(x);
+        }
+        xs
+    }
+
+    /// Char index nearest to `x` (relative to the text start, unscrolled).
+    pub fn index_at(&self, x: f32, xs: &[f32]) -> usize {
+        let x = x + self.scroll;
+        let mut best = 0;
+        for (i, &px) in xs.iter().enumerate().take(self.chars.len() + 1) {
+            if (px - x).abs() < (xs[best] - x).abs() {
+                best = i;
+            }
+        }
+        best
     }
 
     /// Mouse press at `x` relative to the field's text start.
-    pub fn click(&mut self, x: i32, cw: f32, extend: bool) {
-        let i = self.index_at(x, cw);
+    pub fn click(&mut self, x: f32, xs: &[f32], extend: bool) {
+        let i = self.index_at(x, xs);
         self.move_to(i, extend);
     }
 
     /// Mouse drag to `x` relative to the field's text start.
-    pub fn drag(&mut self, x: i32, cw: f32) {
-        let i = self.index_at(x, cw);
+    pub fn drag(&mut self, x: f32, xs: &[f32]) {
+        let i = self.index_at(x, xs);
         self.move_to(i, true);
     }
 
-    /// Keeps the caret visible in a text area `width` logical pixels wide.
-    fn scroll_to_caret(&mut self, width: f32, cw: f32) {
-        let caret_x = self.caret as f32 * cw;
-        if caret_x - self.scroll > width - cw {
-            self.scroll = caret_x - width + cw;
+    /// Horizontal scroll of the text, in logical pixels.
+    pub fn scroll(&self) -> f32 {
+        self.scroll
+    }
+
+    /// Keeps the caret visible in a text area `width` wide.
+    pub fn scroll_to_caret(&mut self, width: f32, xs: &[f32]) {
+        let caret_x = xs.get(self.caret).copied().unwrap_or(0.0);
+        let end = xs.last().copied().unwrap_or(0.0);
+        if caret_x - self.scroll > width - 2.0 {
+            self.scroll = caret_x - width + 2.0;
         }
         if caret_x < self.scroll {
             self.scroll = caret_x;
         }
-        let max = (self.chars.len() as f32 * cw - width + cw).max(0.0);
-        self.scroll = self.scroll.clamp(0.0, max);
+        self.scroll = self.scroll.clamp(0.0, (end - width + 2.0).max(0.0));
     }
-
-    /// Draws the text in `area` (the text area, without padding).
-    pub fn draw(&mut self, p: &mut Painter, area: Rect, style: &Style, caret_visible: bool) {
-        let cw = char_width(style.size, p.scale());
-        self.scroll_to_caret(area.w as f32, cw);
-        p.set_clip(area);
-        let x0 = area.x as f32 - self.scroll;
-        let ty = area.y + (area.h - style.size) / 2;
-        let (s, e) = self.selection();
-        if style.focused && s != e {
-            let sx = (x0 + s as f32 * cw).round() as i32;
-            let ex = (x0 + e as f32 * cw).round() as i32;
-            p.fill_rect(Rect::new(sx, ty, ex - sx, style.size), style.selection);
-        }
-        let text: String = self.chars.iter().collect();
-        p.text(x0.round() as i32, ty, style.size, &text, style.color);
-        if style.focused && caret_visible {
-            let cx = (x0 + self.caret as f32 * cw).round() as i32;
-            p.fill_rect(Rect::new(cx, ty, 2, style.size), style.caret);
-        }
-        p.reset_clip();
-    }
-}
-
-/// How a [`TextField`] is drawn.
-pub struct Style {
-    pub size: i32,
-    pub color: Color,
-    pub caret: Color,
-    pub selection: Color,
-    pub focused: bool,
 }
 
 #[cfg(test)]
@@ -342,14 +335,28 @@ mod tests {
     fn click_maps_to_index() {
         let mut f = TextField::default();
         f.set_text("abcd");
-        f.click(17, 8.0, false);
+        let xs = TextField::positions(&[8.0, 2.0, 8.0, 8.0]);
+        assert_eq!(xs, vec![0.0, 8.0, 10.0, 18.0, 26.0]);
+        f.click(9.5, &xs, false);
         assert_eq!(f.caret(), 2);
-        f.drag(100, 8.0);
+        f.drag(100.0, &xs);
         assert_eq!(f.selection(), (2, 4));
         assert_eq!(
             f.key(key::ENTER, NONE, &mut TestHost::default()),
             Action::Submit
         );
+    }
+
+    #[test]
+    fn scrolls_to_keep_caret_visible() {
+        let mut f = TextField::default();
+        f.set_text("abcdefghij");
+        let xs = TextField::positions(&[10.0; 10]);
+        f.scroll_to_caret(50.0, &xs);
+        assert_eq!(f.scroll(), 52.0);
+        f.key(key::HOME, NONE, &mut TestHost::default());
+        f.scroll_to_caret(50.0, &xs);
+        assert_eq!(f.scroll(), 0.0);
     }
 
     #[test]

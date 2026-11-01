@@ -1,0 +1,150 @@
+<!doctype html>
+<html>
+<head>
+<title>rubrowser</title>
+<style>
+  html, body { height: 100%; margin: 0; }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    font-family: sans-serif;
+    font-size: 13px;
+    color: #e8e8e8;
+    background: #1e1f22;
+  }
+
+  /* Tab strip */
+  #tabbar {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    height: 36px;
+    padding: 0 8px;
+    flex-shrink: 0;
+  }
+  #tabs {
+    display: flex;
+    gap: 2px;
+    min-width: 0;
+    flex-shrink: 1;
+    overflow: hidden;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 200px;
+    min-width: 48px;
+    flex-shrink: 1;
+    height: 30px;
+    padding: 0 6px 0 12px;
+    border-radius: 7px;
+    background: #2b2d31;
+    color: #9a9da3;
+    cursor: default;
+  }
+  .tab:hover { background: #35373c; }
+  .tab.active { background: #3c3f45; color: #ffffff; }
+  .tab .title {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
+  .tab .close {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    flex-shrink: 0;
+    border-radius: 9px;
+    font-size: 12px;
+  }
+  .tab .close:hover { background: #5d6068; color: #ffffff; }
+
+  /* Toolbar */
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 42px;
+    padding: 0 8px;
+    flex-shrink: 0;
+    background: #3c3f45;
+  }
+  button {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    padding: 0;
+    border: none;
+    border-radius: 7px;
+    background: transparent;
+    color: #e8e8e8;
+    font-size: 17px;
+  }
+  button:hover { background: #4e5158; }
+  button:active { background: #5d6068; }
+  button.disabled { color: #6b6e74; }
+  button.disabled:hover { background: transparent; }
+  #new-tab { margin-bottom: 2px; color: #9a9da3; }
+
+  #address {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
+    box-sizing: border-box;
+    padding: 0 14px;
+    border: 2px solid #1e1f22;
+    border-radius: 15px;
+    background: #1e1f22;
+    color: #e8e8e8;
+    font-size: 14px;
+  }
+  #address:focus { border-color: #5b8def; }
+
+  /* The active tab's page is drawn over this box. */
+  #viewport {
+    flex: 1;
+    min-height: 0;
+    background: #ffffff;
+  }
+
+  /* Link preview, drawn on top of the page. */
+  #status {
+    display: none;
+    position: absolute;
+    left: 0;
+    bottom: 0;
+    max-width: 60%;
+    padding: 3px 10px;
+    border-radius: 6px;
+    background: #2b2d31;
+    color: #e8e8e8;
+    font-size: 12px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #status.show { display: block; }
+</style>
+</head>
+<body>
+  <div id="tabbar">
+    <div id="tabs"></div>
+    <button id="new-tab" data-action="new-tab">+</button>
+  </div>
+  <div id="toolbar">
+    <button id="back" data-action="back">&#x2190;</button>
+    <button id="forward" data-action="forward">&#x2192;</button>
+    <button id="reload" data-action="reload">&#x21bb;</button>
+    <input id="address" placeholder="Enter an address">
+  </div>
+  <div id="viewport"></div>
+  <div id="status"></div>
+</body>
+</html>

@@ -120,9 +120,7 @@ pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<O
                 root_font = s.font_size;
             }
             s
-        } else if dom.text(id).is_some() {
-            parent_style.clone()
-        } else if id == Dom::ROOT {
+        } else if dom.text(id).is_some() || id == Dom::ROOT {
             parent_style.clone()
         } else {
             continue;

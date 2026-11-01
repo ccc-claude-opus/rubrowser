@@ -90,6 +90,8 @@ struct Ctx {
     node: Option<NodeId>,
     style_node: NodeId,
     inline: Option<Content>,
+    /// Content size of a replaced element such as `<input>`.
+    intrinsic: Option<(f32, f32)>,
 }
 
 struct Builder<'a> {
@@ -175,6 +177,12 @@ impl Builder<'_> {
                     style,
                     |_, _| 0.0,
                     |known, avail| {
+                        if let Some((w, h)) = ctx.as_ref().and_then(|c| c.intrinsic) {
+                            return Size {
+                                width: known.width.unwrap_or(w),
+                                height: known.height.unwrap_or(h),
+                            };
+                        }
                         let Some(content) = ctx.and_then(|c| c.inline.as_ref()) else {
                             return Size::ZERO;
                         };
@@ -206,6 +214,16 @@ impl Builder<'_> {
             Display::Block
         };
 
+        if self.dom.tag(id) == Some("input") {
+            let ctx = Ctx {
+                node: Some(id),
+                style_node: id,
+                inline: None,
+                intrinsic: Some((0.0, css.line_height_px())),
+            };
+            return tree.new_leaf_with_context(tstyle, ctx).unwrap();
+        }
+
         // Split children into block-level boxes and runs of inline content.
         let mut parts: Vec<Part> = Vec::new();
         self.collect_children(tree, id, is_flex, &mut parts);
@@ -223,6 +241,7 @@ impl Builder<'_> {
                 node: Some(id),
                 style_node: id,
                 inline: Some(Content { owner: id, items }),
+                intrinsic: None,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -243,6 +262,7 @@ impl Builder<'_> {
                         node: None,
                         style_node: id,
                         inline: Some(content),
+                        intrinsic: None,
                     };
                     kids.push(tree.new_leaf_with_context(anon, ctx).unwrap());
                 }
@@ -255,6 +275,7 @@ impl Builder<'_> {
                 node: Some(id),
                 style_node: id,
                 inline: None,
+                intrinsic: None,
             }),
         )
         .unwrap();

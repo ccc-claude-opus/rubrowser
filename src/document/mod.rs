@@ -10,6 +10,8 @@ use crate::layout::inline::Placed;
 use crate::layout::{LayoutTree, RectF, layout};
 use crate::paint::{Painter, ScrollOffsets};
 use crate::text::Fonts;
+use crate::ui::TextField;
+use std::collections::HashMap;
 
 /// Result of a hit test.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -33,6 +35,10 @@ pub struct Document {
     size: (f32, f32),
     needs_style: bool,
     needs_layout: bool,
+    /// Editing state of `<input>` elements, created on first use.
+    inputs: HashMap<NodeId, TextField>,
+    /// Whether the caret is in its visible blink phase.
+    pub caret_on: bool,
 }
 
 impl Document {
@@ -48,6 +54,8 @@ impl Document {
             size: (0.0, 0.0),
             needs_style: true,
             needs_layout: true,
+            inputs: HashMap::new(),
+            caret_on: true,
         }
     }
 
@@ -137,8 +145,163 @@ impl Document {
             tree: &self.tree,
             scroll: &self.scroll,
             scale,
+            inputs: &self.inputs,
+            focus: self.state.focus,
+            caret: self.caret_on,
         }
         .paint(canvas, origin);
+    }
+
+    /// The editing state of input `node`, initialized from its `value`.
+    pub fn input(&mut self, node: NodeId) -> &mut TextField {
+        let dom = &self.dom;
+        self.inputs.entry(node).or_insert_with(|| {
+            let mut f = TextField::default();
+            f.set_text(dom.attr(node, "value").unwrap_or(""));
+            f
+        })
+    }
+
+    pub fn input_value(&self, node: NodeId) -> String {
+        self.inputs.get(&node).map_or_else(
+            || self.dom.attr(node, "value").unwrap_or("").to_string(),
+            TextField::text,
+        )
+    }
+
+    pub fn set_input_value(&mut self, node: NodeId, value: &str) {
+        self.input(node).set_text(value);
+    }
+
+    pub fn is_text_input(&self, node: NodeId) -> bool {
+        self.dom.tag(node) == Some("input")
+            && !self.dom.attr(node, "type").is_some_and(|t| {
+                matches!(
+                    t.to_ascii_lowercase().as_str(),
+                    "button" | "submit" | "checkbox" | "radio" | "hidden"
+                )
+            })
+    }
+
+    /// Whether `node` can take keyboard focus.
+    pub fn is_focusable(&self, node: NodeId) -> bool {
+        match self.dom.tag(node) {
+            Some("input") | Some("button") => self.dom.attr(node, "disabled").is_none(),
+            Some("a") => self.dom.attr(node, "href").is_some(),
+            Some(_) => self.dom.attr(node, "tabindex").is_some(),
+            None => false,
+        }
+    }
+
+    /// The nearest focusable element at or above `node`.
+    pub fn focusable_ancestor(&self, node: NodeId) -> Option<NodeId> {
+        let mut n = Some(node);
+        while let Some(id) = n {
+            if self.is_focusable(id) {
+                return Some(id);
+            }
+            n = self.dom.parent(id);
+        }
+        None
+    }
+
+    /// Next (or previous) rendered focusable element after `from`.
+    pub fn next_focusable(&self, from: Option<NodeId>, backwards: bool) -> Option<NodeId> {
+        let mut all: Vec<NodeId> = self
+            .dom
+            .descendants(Dom::ROOT)
+            .into_iter()
+            .filter(|&n| self.is_focusable(n) && self.style(n).is_some())
+            .collect();
+        if backwards {
+            all.reverse();
+        }
+        match from.and_then(|f| all.iter().position(|&n| n == f)) {
+            Some(i) => all.get(i + 1).or(all.first()).copied(),
+            None => all.first().copied(),
+        }
+    }
+
+    /// Absolute content box of element `node` (viewport coordinates,
+    /// scrolling applied), if it is laid out.
+    pub fn content_box(&self, node: NodeId) -> Option<RectF> {
+        fn walk(d: &Document, i: usize, ox: f32, oy: f32, target: NodeId) -> Option<RectF> {
+            let b = &d.tree.boxes[i];
+            let r = RectF {
+                x: ox + b.rect.x,
+                y: oy + b.rect.y,
+                ..b.rect
+            };
+            let (cx, cy) = b.content_offset();
+            if b.node == Some(target) {
+                return Some(RectF {
+                    x: r.x + cx,
+                    y: r.y + cy,
+                    w: (r.w - cx - b.border[1] - b.padding[1]).max(0.0),
+                    h: (r.h - cy - b.border[2] - b.padding[2]).max(0.0),
+                });
+            }
+            let clips = b.node.is_some()
+                && d.style(b.style_node)
+                    .is_some_and(|s| s.overflow != crate::css::style::Overflow::Visible);
+            let sy = if clips { d.scroll_of(b.node) } else { 0.0 };
+            if let Some(il) = &b.inline {
+                for line in &il.lines {
+                    for item in &line.items {
+                        if let Placed::Atomic { index, x, y } = item
+                            && let Some(found) = walk(
+                                d,
+                                *index,
+                                r.x + cx + x,
+                                r.y + cy - sy + line.top + y,
+                                target,
+                            )
+                        {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            b.children
+                .iter()
+                .find_map(|&c| walk(d, c, r.x, r.y - sy, target))
+        }
+        if self.tree.boxes.is_empty() {
+            return None;
+        }
+        walk(self, LayoutTree::VIEWPORT, 0.0, -self.scroll_of(None), node)
+    }
+
+    /// Caret positions of an input's shown text, and its content box.
+    fn input_geometry(&self, node: NodeId, fonts: &Fonts) -> Option<(Vec<f32>, RectF)> {
+        let st = self.style(node)?;
+        let shown = crate::paint::display_value(&self.dom, node, &self.input_value(node));
+        let xs = TextField::positions(&fonts.advances(st.font(), st.font_size, &shown));
+        Some((xs, self.content_box(node)?))
+    }
+
+    /// Places the caret of input `node` at viewport point `x` (mouse press
+    /// or drag).
+    pub fn input_pointer(&mut self, node: NodeId, x: f32, drag: bool, extend: bool, fonts: &Fonts) {
+        let Some((xs, area)) = self.input_geometry(node, fonts) else {
+            return;
+        };
+        let f = self.input(node);
+        if drag {
+            f.drag(x - area.x, &xs);
+        } else {
+            f.click(x - area.x, &xs, extend);
+        }
+    }
+
+    /// Scrolls every input so its caret is visible.
+    pub fn scroll_inputs(&mut self, fonts: &Fonts) {
+        let nodes: Vec<NodeId> = self.inputs.keys().copied().collect();
+        for n in nodes {
+            if let Some((xs, area)) = self.input_geometry(n, fonts) {
+                self.input(n).scroll_to_caret(area.w, &xs);
+            }
+        }
     }
 
     pub fn state(&self) -> ElementState {
@@ -413,6 +576,6 @@ mod tests {
         let mut c = Canvas::new(100, 100);
         d.paint(&mut c, (0.0, 0.0), 2.0, &fonts);
         assert_eq!(c.pixels()[99 * 100 + 99], 0x00ff00);
-        assert!(c.pixels().iter().any(|&p| p == 0));
+        assert!(c.pixels().contains(&0));
     }
 }
