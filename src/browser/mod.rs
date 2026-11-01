@@ -94,6 +94,13 @@ enum Request {
         serial: u64,
         font: crate::document::FontRequest,
     },
+    /// An HTTP request from script `script` (its request `id`).
+    Http {
+        tab: u64,
+        serial: u64,
+        script: usize,
+        id: i32,
+    },
     /// A module imported by module script `slot`.
     Module {
         tab: u64,
@@ -205,6 +212,16 @@ fn profiling_now() -> Option<std::time::Instant> {
         return Some(std::time::Instant::now());
     }
     None
+}
+
+/// `scheme://host[:port]` of an http(s) URL.
+fn origin(u: &str) -> Option<String> {
+    let (scheme, rest) = u.split_once("://")?;
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next()?;
+    Some(format!("{}://{}", scheme, host.to_ascii_lowercase()))
 }
 
 /// Fuel all of a page's language-runtime calls may use while it loads
@@ -435,6 +452,9 @@ struct Tab {
     import_map: Vec<(String, String)>,
     /// Whether the JavaScript runtime has the import map.
     import_map_sent: bool,
+    /// `doc.dom.version()` when scripts last finished, to restyle only
+    /// after real changes.
+    dom_version: u64,
 }
 
 impl Tab {
@@ -552,6 +572,7 @@ impl Browser {
             pending: Default::default(),
             import_map: Vec::new(),
             import_map_sent: false,
+            dom_version: 0,
             runtimes: HashMap::new(),
             script_count: 0,
             loaded: false,
@@ -1142,6 +1163,36 @@ impl Browser {
                 }
                 self.run_scripts(i, host);
             }
+            Request::Http {
+                tab,
+                serial,
+                script,
+                id,
+            } => {
+                let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                else {
+                    return;
+                };
+                let (status, body) = match result {
+                    Ok(b) => (200, b),
+                    Err(e) => {
+                        host.log(&e);
+                        (0, Vec::new())
+                    }
+                };
+                let now = self.now;
+                let t = &mut self.tabs[i];
+                if let Some(Some(rt)) = t.scripts.get_mut(script) {
+                    match rt.http_done(&mut t.doc, id, status, body, now) {
+                        Ok(()) => {
+                            self.after_script(i, script, host);
+                        }
+                        Err(e) => self.script_failed(i, script, &e, host),
+                    }
+                }
+            }
             Request::Module {
                 tab,
                 serial,
@@ -1181,8 +1232,44 @@ impl Browser {
                 id,
             });
         }
-        tab.doc.dom_changed();
+        let version = tab.doc.dom.version();
+        if version != tab.dom_version {
+            tab.dom_version = version;
+            tab.doc.dom_changed();
+        }
         self.dirty = true;
+        let page = tab.doc.url.clone();
+        let (id, serial) = (tab.id, tab.serial);
+        for call in out.http {
+            let target = url::resolve(&page, &call.url);
+            let req = Request::Http {
+                tab: id,
+                serial,
+                script: si,
+                id: call.id,
+            };
+            // Only the page's own origin: without CORS checks, reading other
+            // sites' responses (with this browser's cookies) is not allowed.
+            if origin(&target) != origin(&page) || origin(&page).is_none() {
+                let fid = self.next_id;
+                self.next_id += 1;
+                self.requests.insert(fid, req);
+                self.local.push((
+                    fid,
+                    Err(format!("cross-origin request to {target} blocked")),
+                ));
+                continue;
+            }
+            let fid = self.next_id;
+            self.next_id += 1;
+            self.requests.insert(fid, req);
+            let request = crate::input::HttpRequest {
+                method: call.method,
+                body: call.body,
+                content_type: call.content_type,
+            };
+            host.fetch_with(fid, &target, &request);
+        }
         if let Some(target) = out.navigate
             && i == self.active
         {

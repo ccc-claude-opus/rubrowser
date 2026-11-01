@@ -45,6 +45,8 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `query_all(sel_ptr, sel_len, out_ptr, max) -> i32` | 把最多 `max` 個 handle（`i32` 陣列）寫到 `out_ptr`，回傳總數 |
 | `query_within(root, sel_ptr, sel_len, out_ptr, max) -> i32` | 同上，但只找 `root` 底下的節點（`root` 不在文件中也可以） |
 | `rect(h, which) -> f64` | 上次排版的幾何（邏輯像素、相對於視窗）：0 x、1 y、2 寬、3 高（border box），4 寬、5 高（padding box）；`h = 0` 是視窗 |
+| `http(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, type_ptr, type_len) -> i32` | 發出 HTTP 請求（只限同源），回傳請求編號；完成時瀏覽器呼叫匯出的 `rb_http(id, status)`（`status` 0 表示失敗） |
+| `http_body(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應內容，回傳總長度 |
 | `parent(h) -> i32` | 父元素 |
 | `relative(h, which) -> i32` | `which`：0 父節點、1 第一個子節點、2 最後一個子節點、3 下一個兄弟、4 上一個兄弟（含文字節點） |
 | `child_count(h) -> i32` / `child_at(h, i) -> i32` | 子節點數與第 `i` 個子節點 |

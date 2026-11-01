@@ -43,6 +43,12 @@
     addEventListener(type, fn, options) {
       if (typeof fn !== 'function' && !(fn && typeof fn.handleEvent === 'function')) return;
       type = String(type).toLowerCase();
+      if (this.__h === undefined) {
+        // Not a DOM node (XMLHttpRequest, AbortSignal…): listeners live here.
+        if (!this._ls) Object.defineProperty(this, '_ls', { value: [] });
+        if (!this._ls.some((l) => l.type === type && l.fn === fn)) this._ls.push({ type, fn });
+        return;
+      }
       for (const l of listeners.values()) {
         if (l.node === this && l.type === type && l.fn === fn) return;
       }
@@ -54,6 +60,10 @@
 
     removeEventListener(type, fn) {
       type = String(type).toLowerCase();
+      if (this.__h === undefined) {
+        if (this._ls) this._ls.splice(0, this._ls.length, ...this._ls.filter((l) => !(l.type === type && l.fn === fn)));
+        return;
+      }
       for (const [id, l] of listeners) {
         if (l.node === this && l.type === type && l.fn === fn) {
           listeners.delete(id);
@@ -62,6 +72,15 @@
       }
     }
   }
+
+  EventTarget.prototype.dispatchEvent = function (event) {
+    event.target = event.target || this;
+    event.currentTarget = this;
+    for (const l of (this._ls || []).filter((l) => l.type === String(event.type).toLowerCase())) {
+      call(typeof l.fn === 'function' ? l.fn : l.fn.handleEvent, typeof l.fn === 'function' ? this : l.fn, [event]);
+    }
+    return !event.defaultPrevented;
+  };
 
   class Node extends EventTarget {
     constructor(h) {
@@ -913,8 +932,8 @@
     }
   }
 
-  // No network access from scripts yet: requests fail like an offline
-  // browser's.
+  // HTTP from scripts goes through the browser (same origin only); the
+  // response arrives in __rb_http.
   class Headers {
     constructor(init) { this._m = new Map(); if (init) for (const [k, v] of Object.entries(init)) this.set(k, v); }
     get(k) { return this._m.get(String(k).toLowerCase()) ?? null; }
@@ -931,23 +950,58 @@
     text() { return Promise.resolve(this._body); }
     json() { return Promise.resolve(JSON.parse(this._body)); }
   }
-  function fetch(url) {
-    return new Promise((_, reject) => addTimer(() => reject(new TypeError('Failed to fetch ' + String(url))), 0, [], false));
+  const httpPending = new Map(); // id -> (status, body) => void
+  global.__rb_http = function (id, status) {
+    const done = httpPending.get(id);
+    httpPending.delete(id);
+    if (done) done(status, status ? rb.httpBody(id) : '');
+  };
+  function httpRequest(method, url, body, contentType, done) {
+    const id = rb.http(String(url), String(method || 'GET'), body == null ? '' : String(body), contentType || '');
+    httpPending.set(id, done);
+  }
+  function fetch(input, init) {
+    init = init || {};
+    const url = input instanceof Request ? input.url : String(input instanceof URL ? input.href : input);
+    const method = init.method || (input instanceof Request ? input.method : 'GET');
+    let body = init.body;
+    let ctype = '';
+    if (body instanceof URLSearchParams) { ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; body = body.toString(); }
+    else if (body instanceof FormData) { ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; body = new URLSearchParams(Object.fromEntries(body)).toString(); }
+    const headers = new Headers(init.headers && !(init.headers instanceof Headers) ? init.headers : undefined);
+    if (init.headers instanceof Headers) init.headers.forEach((v, k) => headers.set(k, v));
+    if (headers.has('content-type')) ctype = headers.get('content-type');
+    return new Promise((resolve, reject) => {
+      if (init.signal && init.signal.aborted) { reject(init.signal.reason); return; }
+      httpRequest(method, url, body, ctype, (status, text) => {
+        if (!status) reject(new TypeError('Failed to fetch'));
+        else { const r = new Response(text, { status }); r.url = new URL(url, location.href).href; resolve(r); }
+      });
+    });
   }
   class XMLHttpRequest extends EventTarget {
-    constructor() { super(); this.readyState = 0; this.status = 0; this.responseText = ''; this.response = null; }
-    open(method, url) { this.readyState = 1; this._url = url; }
-    setRequestHeader() {}
+    constructor() { super(); this.readyState = 0; this.status = 0; this.responseText = ''; this.response = null; this.responseType = ''; this._headers = {}; }
+    open(method, url) { this._method = method; this._url = url; this.readyState = 1; }
+    setRequestHeader(k, v) { this._headers[String(k).toLowerCase()] = String(v); }
     getResponseHeader() { return null; }
     getAllResponseHeaders() { return ''; }
-    abort() {}
-    send() {
-      addTimer(() => {
+    abort() { this._aborted = true; }
+    send(body) {
+      httpRequest(this._method, this._url, body, this._headers['content-type'], (status, text) => {
+        if (this._aborted) return;
         this.readyState = 4;
-        for (const h of ['onreadystatechange', 'onerror', 'onloadend']) {
-          if (typeof this[h] === 'function') call(this[h], this, [{ type: h.slice(2), target: this }]);
-        }
-      }, 0, [], false);
+        this.status = status;
+        this.responseText = text;
+        try { this.response = this.responseType === 'json' ? JSON.parse(text) : text; } catch (_) { this.response = null; }
+        const fire = (name) => {
+          const e = { type: name, target: this, currentTarget: this };
+          if (typeof this['on' + name] === 'function') call(this['on' + name], this, [e]);
+          this.dispatchEvent(Object.assign(new Event(name), e));
+        };
+        fire('readystatechange');
+        fire(status ? 'load' : 'error');
+        fire('loadend');
+      });
     }
   }
   class FormData {

@@ -159,6 +159,38 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             }
             Ok(JsArray::from_iter(out.into_iter().map(JsValue::from), c).into())
         }),
+        ("http", 4, |_, a, c| {
+            let (url, method, body, ctype) = (
+                text(a, 0, c)?,
+                text(a, 1, c)?,
+                text(a, 2, c)?,
+                text(a, 3, c)?,
+            );
+            Ok(unsafe {
+                ffi::http(
+                    url.as_ptr(),
+                    url.len(),
+                    method.as_ptr(),
+                    method.len(),
+                    body.as_ptr(),
+                    body.len(),
+                    ctype.as_ptr(),
+                    ctype.len(),
+                )
+            }
+            .into())
+        }),
+        ("httpBody", 1, |_, a, c| {
+            let id = int(a, 0, c)?;
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut n = unsafe { ffi::http_body(id, buf.as_mut_ptr(), buf.len()) };
+            if n > buf.len() as i32 {
+                buf.resize(n as usize, 0);
+                n = unsafe { ffi::http_body(id, buf.as_mut_ptr(), buf.len()) };
+            }
+            buf.truncate(n.max(0) as usize);
+            Ok(JsString::from(String::from_utf8_lossy(&buf).as_ref()).into())
+        }),
         ("rect", 2, |_, a, c| {
             Ok(unsafe { ffi::rect(int(a, 0, c)?, int(a, 1, c)?) }.into())
         }),
@@ -562,6 +594,18 @@ pub unsafe fn eval(src: *const u8, len: usize, name: *const u8, name_len: usize)
     });
 }
 
+/// `rb_http`: HTTP request `id` finished with `status` (0: failed).
+pub fn http(id: i32, status: i32) {
+    with_context(|ctx| {
+        let f = ctx.global_object().get(js_string!("__rb_http"), ctx);
+        if let Some(f) = f.ok().and_then(|f| f.as_callable())
+            && let Err(e) = f.call(&JsValue::undefined(), &[id.into(), status.into()], ctx)
+        {
+            report(e, ctx);
+        }
+    });
+}
+
 /// `rb_event`: runs listener `id`.
 pub fn event(id: i32) {
     call_global("__rb_dispatch", id);
@@ -601,6 +645,11 @@ macro_rules! js_runtime {
         #[unsafe(no_mangle)]
         pub extern "C" fn rb_timer(id: i32) {
             $crate::lang::js::timer(id)
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn rb_http(id: i32, status: i32) {
+            $crate::lang::js::http(id, status)
         }
     };
 }

@@ -58,6 +58,8 @@ imports! {
     fn query_all(p: *const u8, n: usize, out: *mut i32, max: i32) -> i32;
     fn query_within(root: i32, p: *const u8, n: usize, out: *mut i32, max: i32) -> i32;
     fn rect(h: i32, which: i32) -> f64;
+    fn http(up: *const u8, ul: usize, mp: *const u8, ml: usize, bp: *const u8, bl: usize, cp: *const u8, cl: usize) -> i32;
+    fn http_body(id: i32, p: *mut u8, cap: usize) -> i32;
     fn parent(h: i32) -> i32;
     fn get_text(h: i32, p: *mut u8, cap: usize) -> i32;
     fn set_text(h: i32, p: *const u8, n: usize);

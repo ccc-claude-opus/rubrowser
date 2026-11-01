@@ -81,6 +81,8 @@ pub struct Dom {
     nodes: Vec<Node>,
     /// The document has no (or an old) doctype: quirks-mode rendering.
     pub quirks: bool,
+    /// Bumped by every change (see [`Dom::version`]).
+    version: u64,
 }
 
 impl Default for Dom {
@@ -101,7 +103,14 @@ impl Dom {
                 data: NodeData::Document,
             }],
             quirks: false,
+            version: 0,
         }
+    }
+
+    /// A counter that changes whenever the tree, an attribute or a text
+    /// changes (to tell whether a script modified the document).
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     pub fn len(&self) -> usize {
@@ -130,14 +139,17 @@ impl Dom {
     }
 
     pub fn create_element(&mut self, element: Element) -> NodeId {
+        self.version += 1;
         self.create(NodeData::Element(element))
     }
 
     pub fn create_text(&mut self, text: &str) -> NodeId {
+        self.version += 1;
         self.create(NodeData::Text(text.to_string()))
     }
 
     pub fn create_comment(&mut self, text: &str) -> NodeId {
+        self.version += 1;
         self.create(NodeData::Comment(text.to_string()))
     }
 
@@ -157,6 +169,7 @@ impl Dom {
     }
 
     pub fn element_mut(&mut self, id: NodeId) -> Option<&mut Element> {
+        self.version += 1;
         match &mut self.nodes.get_mut(id)?.data {
             NodeData::Element(e) => Some(e),
             _ => None,
@@ -199,6 +212,7 @@ impl Dom {
 
     /// Removes `id` from its parent; it stays alive, detached.
     pub fn detach(&mut self, id: NodeId) {
+        self.version += 1;
         if let Some(p) = self.nodes[id].parent.take() {
             self.nodes[p].children.retain(|&c| c != id);
         }
@@ -207,11 +221,13 @@ impl Dom {
     /// Appends `child` to `parent` (moving it if attached elsewhere).
     /// Returns false if that would create a cycle.
     pub fn append(&mut self, parent: NodeId, child: NodeId) -> bool {
+        self.version += 1;
         self.insert_before(parent, child, None)
     }
 
     /// Inserts `child` into `parent` before `before` (or last).
     pub fn insert_before(&mut self, parent: NodeId, child: NodeId, before: Option<NodeId>) -> bool {
+        self.version += 1;
         if self.is_inclusive_ancestor(child, parent) {
             return false;
         }
@@ -227,6 +243,7 @@ impl Dom {
 
     /// Appends text, merging with a preceding text node.
     pub fn append_text(&mut self, parent: NodeId, text: &str) {
+        self.version += 1;
         if let Some(&last) = self.nodes[parent].children.last()
             && let NodeData::Text(t) = &mut self.nodes[last].data
         {
@@ -290,6 +307,7 @@ impl Dom {
 
     /// Replaces all children of `id` with one text node.
     pub fn set_text_content(&mut self, id: NodeId, text: &str) {
+        self.version += 1;
         for c in self.nodes[id].children.clone() {
             self.detach(c);
         }
@@ -302,6 +320,7 @@ impl Dom {
     /// Copies node `node` of `src` (with its subtree) into this tree,
     /// detached. Returns the new node.
     pub fn import(&mut self, src: &Dom, node: NodeId) -> NodeId {
+        self.version += 1;
         let copy = self.create(src.nodes[node].data.clone());
         for &c in &src.nodes[node].children {
             let child = self.import(src, c);
@@ -373,6 +392,7 @@ impl Dom {
 
     /// Replaces the children of `id` with nodes parsed from `html`.
     pub fn set_inner_html(&mut self, id: NodeId, html: &str) {
+        self.version += 1;
         let context = self.tag(id).unwrap_or("body").to_string();
         let (frag, top) = parse_html_fragment(html, &context);
         for c in self.nodes[id].children.clone() {

@@ -16,7 +16,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::abi::key;
 use crate::browser::Browser;
-use crate::input::{Cursor, Event, Host, Modifiers};
+use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers};
 use crate::net::url;
 use crate::text::Fonts;
 
@@ -77,10 +77,15 @@ struct NativeHost {
 
 impl Host for NativeHost {
     fn fetch(&mut self, id: u32, url: &str) {
+        self.fetch_with(id, url, &HttpRequest::default());
+    }
+
+    fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
         let proxy = self.proxy.clone();
         let url = url.to_string();
+        let request = (!request.method.is_empty()).then(|| request.clone());
         std::thread::spawn(move || {
-            let (result, final_url) = match load(&url) {
+            let (result, final_url) = match load_with(&url, request.as_ref()) {
                 Ok((bytes, f)) => (Ok(bytes), f),
                 Err(e) => (Err(e), None),
             };
@@ -183,20 +188,41 @@ fn agent() -> &'static ureq::Agent {
 /// Loads `url` over HTTP(S) or from the file system. Returns the bytes and,
 /// if redirects led elsewhere, the final URL.
 pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    load_with(url, None)
+}
+
+/// Like [`load`], with a script's method and body.
+pub fn load_with(
+    url: &str,
+    request: Option<&HttpRequest>,
+) -> Result<(Vec<u8>, Option<String>), String> {
     use ureq::ResponseExt;
     // The fragment is for the browser, not the server.
     let url = url.split('#').next().unwrap_or(url);
     match url::scheme(url) {
         Some("http") | Some("https") => {
-            let mut resp = agent()
-                .get(url)
-                .header(
-                    "Accept",
-                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                )
-                .header("Accept-Language", accept_language())
-                .call()
-                .map_err(|e| e.to_string())?;
+            let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+            let mut resp = match request.filter(|r| r.method != "GET") {
+                Some(r) => {
+                    let ctype = if r.content_type.is_empty() {
+                        "text/plain;charset=UTF-8"
+                    } else {
+                        &r.content_type
+                    };
+                    agent()
+                        .post(url)
+                        .header("Accept", "*/*")
+                        .header("Accept-Language", accept_language())
+                        .header("Content-Type", ctype)
+                        .send(&r.body[..])
+                }
+                None => agent()
+                    .get(url)
+                    .header("Accept", if request.is_some() { "*/*" } else { accept })
+                    .header("Accept-Language", accept_language())
+                    .call(),
+            }
+            .map_err(|e| e.to_string())?;
             let status = resp.status();
             let final_url = resp.get_uri().to_string();
             let body = resp
@@ -249,11 +275,15 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     }
     impl Host for Headless {
         fn fetch(&mut self, id: u32, url: &str) {
+            self.fetch_with(id, url, &HttpRequest::default());
+        }
+        fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
             self.pending += 1;
             let tx = self.tx.clone();
             let url = url.to_string();
+            let request = (!request.method.is_empty()).then(|| request.clone());
             std::thread::spawn(move || {
-                let (result, final_url) = match load(&url) {
+                let (result, final_url) = match load_with(&url, request.as_ref()) {
                     Ok((b, f)) => (Ok(b), f),
                     Err(e) => (Err(e), None),
                 };

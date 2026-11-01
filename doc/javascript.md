@@ -52,7 +52,9 @@ flowchart LR
 | 幾何 | `getBoundingClientRect`、`offsetWidth/Height/Top/Left`、`clientWidth/Height`、`innerWidth/innerHeight`（上次排版的結果） |
 | Web API | `URL`、`URLSearchParams`、`customElements`（含升級已存在的元素、`connectedCallback`、`attributeChangedCallback`）、`DocumentFragment`、`localStorage` / `sessionStorage`（只存在於這一頁）、`document.cookie`（同上）、`navigator`、`matchMedia`（一律不符合）、`TextEncoder/Decoder`、`atob/btoa`、`crypto.getRandomValues/randomUUID`、`structuredClone`、`AbortController`、`CustomEvent`、`dispatchEvent`、`DOMParser`、簡化的 `Intl`、`requestIdleCallback`；`MutationObserver`、`ResizeObserver`、`IntersectionObserver`（所有元素都算可見） |
 
-尚未支援：網路（`fetch` / `XMLHttpRequest` 會像離線一樣失敗）、canvas、Web Worker、WebSocket、shadow DOM 的繪製。
+| 網路 | `fetch`（含 `Request`、`Headers`、`URLSearchParams` / `FormData` 本文）、`XMLHttpRequest`；只允許與頁面同源的網址（還沒有 CORS 檢查），GET 與 POST |
+
+尚未支援：跨來源請求、canvas、Web Worker、WebSocket、shadow DOM 的繪製。
 
 ### 模組協定
 

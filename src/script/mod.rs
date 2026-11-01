@@ -71,6 +71,19 @@ pub struct Output {
     pub history: i32,
     /// A form the script submitted with `form.submit()`.
     pub submit: Option<NodeId>,
+    /// HTTP requests the script started (`fetch`, `XMLHttpRequest`).
+    pub http: Vec<HttpCall>,
+}
+
+/// An HTTP request started by a script; the browser answers it with
+/// [`Script::http_done`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HttpCall {
+    pub id: i32,
+    pub url: String,
+    pub method: String,
+    pub body: Vec<u8>,
+    pub content_type: String,
 }
 
 /// The event being dispatched, readable through the `event_*` imports.
@@ -103,6 +116,9 @@ struct State {
     event: Option<EventInfo>,
     /// Wall-clock milliseconds since the Unix epoch at `now == 0`.
     wall_offset: f64,
+    next_http: i32,
+    /// The response being delivered to `rb_http`: (id, body).
+    response: Option<(i32, Vec<u8>)>,
 }
 
 /// A loaded script module.
@@ -110,6 +126,7 @@ pub struct Script {
     store: Store<State>,
     event_fn: Option<TypedFunc<i32, ()>>,
     timer_fn: Option<TypedFunc<i32, ()>>,
+    http_fn: Option<TypedFunc<(i32, i32), ()>>,
     alloc_fn: Option<TypedFunc<i32, i32>>,
     eval_fn: Option<TypedFunc<(i32, i32, i32, i32), ()>>,
     memory: Option<Memory>,
@@ -150,6 +167,8 @@ impl Script {
                 .build(),
             event: None,
             wall_offset,
+            next_http: 0,
+            response: None,
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|s| &mut s.limits);
@@ -159,6 +178,7 @@ impl Script {
             store,
             event_fn: None,
             timer_fn: None,
+            http_fn: None,
             alloc_fn: None,
             eval_fn: None,
             memory: None,
@@ -171,6 +191,7 @@ impl Script {
                 .map_err(describe)?;
             s.event_fn = instance.get_typed_func(&s.store, "rb_event").ok();
             s.timer_fn = instance.get_typed_func(&s.store, "rb_timer").ok();
+            s.http_fn = instance.get_typed_func(&s.store, "rb_http").ok();
             s.alloc_fn = instance.get_typed_func(&s.store, "rb_alloc").ok();
             s.eval_fn = instance.get_typed_func(&s.store, "rb_eval").ok();
             s.memory = instance.get_memory(&s.store, "memory");
@@ -289,6 +310,28 @@ impl Script {
             return Ok(());
         };
         self.with_doc(doc, now, |s| f.call(&mut s.store, id).map_err(describe))
+    }
+
+    /// Delivers the response to HTTP request `id`: `status` (0 when the
+    /// request failed) and the body, readable with `http_body` during the
+    /// `rb_http` call.
+    pub fn http_done(
+        &mut self,
+        doc: &mut Document,
+        id: i32,
+        status: i32,
+        body: Vec<u8>,
+        now: f64,
+    ) -> Result<(), String> {
+        let Some(f) = self.http_fn else {
+            return Ok(());
+        };
+        self.store.data_mut().response = Some((id, body));
+        let r = self.with_doc(doc, now, |s| {
+            f.call(&mut s.store, (id, status)).map_err(describe)
+        });
+        self.store.data_mut().response = None;
+        r
     }
 
     /// Takes the requests the script made since the last call.
@@ -474,6 +517,60 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             _ => 0.0,
         }) as f64
     })?;
+    l.func_wrap(
+        "rb",
+        "http",
+        |mut c: C,
+         up: i32,
+         ul: i32,
+         mp: i32,
+         ml: i32,
+         bp: i32,
+         bl: i32,
+         cp: i32,
+         cl: i32|
+         -> Result<i32, Error> {
+            let url = read_str(&c, up, ul)?;
+            let method = read_str(&c, mp, ml)?.to_ascii_uppercase();
+            let content_type = read_str(&c, cp, cl)?;
+            let body = {
+                let mem = memory(&c)?;
+                let data = mem.data(&c);
+                data[range(data, bp, bl.max(0) as usize)?].to_vec()
+            };
+            let s = c.data_mut();
+            s.next_http += 1;
+            let id = s.next_http;
+            s.out.http.push(HttpCall {
+                id,
+                url,
+                method: if method.is_empty() {
+                    "GET".into()
+                } else {
+                    method
+                },
+                body,
+                content_type,
+            });
+            Ok(id)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "http_body",
+        |mut c: C, id: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let body = match &c.data().response {
+                Some((rid, b)) if *rid == id => b.clone(),
+                _ => return Ok(-1),
+            };
+            let n = body.len().min(cap.max(0) as usize);
+            let mem = memory(&c)?;
+            let data = mem.data_mut(&mut c);
+            let r = range(data, p, n)?;
+            data[r].copy_from_slice(&body[..n]);
+            Ok(body.len() as i32)
+        },
+    )?;
     l.func_wrap("rb", "parent", |c: C, h: i32| -> i32 {
         let doc = &c.data().doc;
         node(doc, h)

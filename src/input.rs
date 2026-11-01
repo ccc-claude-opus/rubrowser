@@ -92,10 +92,23 @@ pub enum Cursor {
 }
 
 /// What the browser needs from the platform it runs on.
+/// Method and body of an HTTP request made by a page script.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HttpRequest {
+    pub method: String,
+    pub body: Vec<u8>,
+    pub content_type: String,
+}
+
 pub trait Host {
     /// Starts loading `url`; the platform later calls
     /// [`Browser::fetch_done`](crate::browser::Browser::fetch_done) with `id`.
     fn fetch(&mut self, id: u32, url: &str);
+    /// Like [`Host::fetch`], with a method and body (requests from page
+    /// scripts). Platforms that only support GET may ignore them.
+    fn fetch_with(&mut self, id: u32, url: &str, _request: &HttpRequest) {
+        self.fetch(id, url);
+    }
     fn clipboard_get(&mut self) -> Option<String>;
     fn clipboard_set(&mut self, text: &str);
     fn set_cursor(&mut self, cursor: Cursor);
