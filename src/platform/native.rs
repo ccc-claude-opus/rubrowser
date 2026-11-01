@@ -109,6 +109,13 @@ impl Host for NativeHost {
     fn log(&mut self, message: &str) {
         eprintln!("[console] {message}");
     }
+
+    fn wall_clock(&mut self) -> Option<f64> {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(t.as_secs_f64() * 1000.0)
+    }
 }
 
 /// Loads `url` over HTTP(S) or from the file system.

@@ -1,0 +1,25 @@
+<!doctype html>
+<title>JS demo</title>
+<style>
+  body { font-family: sans-serif; margin: 32px; }
+  #out { font-size: 20px; color: #1a56c4; }
+  .hot { background: #fff3c4; }
+</style>
+<h1>JavaScript in rubrowser</h1>
+<p id="out">waiting…</p>
+<button id="btn">Click me</button>
+<ul id="list"></ul>
+<script>
+  const out = document.getElementById('out');
+  out.textContent = 'JS says hi at ' + new Date(Date.now()).toISOString().slice(0, 10);
+  let n = 0;
+  document.getElementById('btn').addEventListener('click', () => {
+    n++;
+    out.textContent = `clicked ${n} time${n === 1 ? '' : 's'}`;
+    const li = document.createElement('li');
+    li.textContent = 'item ' + n;
+    document.getElementById('list').appendChild(li);
+    out.classList.toggle('hot');
+  });
+  console.log('demo ready');
+</script>

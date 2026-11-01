@@ -42,6 +42,7 @@ function fitCanvas() {
 
 fitCanvas();
 rb.rb_web_init(width, height, scale);
+rb.rb_web_set_epoch(Date.now() - performance.now());
 
 window.addEventListener('resize', () => {
   fitCanvas();

@@ -26,6 +26,28 @@ pub const MAX_MEMORY: usize = 64 << 20;
 /// Longest string a script may pass to the browser.
 const MAX_STRING: usize = 1 << 20;
 
+/// Resource limits for one wasm module.
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    /// Instructions per call.
+    pub fuel: u64,
+    /// Linear memory, in bytes.
+    pub memory: usize,
+}
+
+impl Limits {
+    /// Scripts compiled to wasm (Rust, …).
+    pub const SCRIPT: Limits = Limits {
+        fuel: FUEL_PER_CALL,
+        memory: MAX_MEMORY,
+    };
+    /// Language runtimes (`js.wasm`), which interpret the page's source.
+    pub const RUNTIME: Limits = Limits {
+        fuel: RUNTIME_FUEL_PER_CALL,
+        memory: 512 << 20,
+    };
+}
+
 /// An event listener registered by a script.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Listener {
@@ -77,6 +99,8 @@ struct State {
     out: Output,
     limits: StoreLimits,
     event: Option<EventInfo>,
+    /// Wall-clock milliseconds since the Unix epoch at `now == 0`.
+    wall_offset: f64,
 }
 
 /// A loaded script module.
@@ -94,16 +118,19 @@ impl Script {
     /// Compiles and instantiates `wasm` against `doc`, then calls its
     /// `rb_init` export.
     pub fn load(wasm: &[u8], doc: &mut Document, now: f64) -> Result<Script, String> {
-        Self::load_with_fuel(wasm, doc, now, FUEL_PER_CALL)
+        Self::load_with(wasm, doc, now, 0.0, Limits::SCRIPT)
     }
 
-    /// Like [`Script::load`], with a custom fuel budget per call.
-    pub fn load_with_fuel(
+    /// Like [`Script::load`], with the wall clock (`Date.now()` epoch
+    /// milliseconds at `now == 0`) and resource limits.
+    pub fn load_with(
         wasm: &[u8],
         doc: &mut Document,
         now: f64,
-        fuel: u64,
+        wall_offset: f64,
+        limits: Limits,
     ) -> Result<Script, String> {
+        let fuel = limits.fuel;
         let mut config = Config::default();
         config.consume_fuel(true);
         let engine = Engine::new(&config);
@@ -114,10 +141,11 @@ impl Script {
             now,
             out: Output::default(),
             limits: StoreLimitsBuilder::new()
-                .memory_size(MAX_MEMORY)
+                .memory_size(limits.memory)
                 .instances(1)
                 .build(),
             event: None,
+            wall_offset,
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|s| &mut s.limits);
@@ -166,6 +194,11 @@ impl Script {
         };
         std::mem::swap(&mut self.store.data_mut().doc, doc);
         r
+    }
+
+    /// Sets the wall clock (`Date.now()`): epoch milliseconds at `now == 0`.
+    pub fn set_wall_offset(&mut self, offset: f64) {
+        self.store.data_mut().wall_offset = offset;
     }
 
     pub fn listeners(&self) -> &[Listener] {
@@ -598,6 +631,9 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
         },
     )?;
     l.func_wrap("rb", "now", |c: C| -> f64 { c.data().now })?;
+    l.func_wrap("rb", "wall_time", |c: C| -> f64 {
+        c.data().now + c.data().wall_offset
+    })?;
 
     // ----- ABI v1: tree navigation ---------------------------------------
     l.func_wrap("rb", "node_type", |c: C, h: i32| -> i32 {

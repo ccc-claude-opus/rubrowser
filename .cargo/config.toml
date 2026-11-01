@@ -1,0 +1,4 @@
+# boa (in the js-runtime feature) needs random numbers; on bare wasm there
+# is no OS source, so lang::js supplies them (getrandom "custom" backend).
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"custom\""]

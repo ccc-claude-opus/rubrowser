@@ -37,7 +37,7 @@ pub use crate::abi::{key, modifier};
 macro_rules! imports {
     ($(fn $name:ident($($arg:ident: $ty:ty),*) $(-> $ret:ty)?;)*) => {
         #[cfg(target_arch = "wasm32")]
-        mod ffi {
+        pub(crate) mod ffi {
             #[link(wasm_import_module = "rb")]
             unsafe extern "C" {
                 $(pub fn $name($($arg: $ty),*) $(-> $ret)?;)*
@@ -45,7 +45,7 @@ macro_rules! imports {
         }
         #[cfg(not(target_arch = "wasm32"))]
         #[allow(unused_variables, clippy::missing_safety_doc)]
-        mod ffi {
+        pub(crate) mod ffi {
             $(pub unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
                 unimplemented!("rubrowser scripts only run on wasm32")
             })*
@@ -79,6 +79,7 @@ imports! {
     fn navigate(p: *const u8, n: usize);
     fn log(p: *const u8, n: usize);
     fn now() -> f64;
+    fn wall_time() -> f64;
     fn node_type(h: i32) -> i32;
     fn tag_name(h: i32, p: *mut u8, cap: usize) -> i32;
     fn relative(h: i32, which: i32) -> i32;
@@ -98,7 +99,7 @@ imports! {
 }
 
 /// Reads a string the browser writes into a buffer, growing it if needed.
-fn read_string(mut get: impl FnMut(*mut u8, usize) -> i32) -> Option<String> {
+pub(crate) fn read_string(mut get: impl FnMut(*mut u8, usize) -> i32) -> Option<String> {
     let mut buf = vec![0u8; 256];
     loop {
         let n = get(buf.as_mut_ptr(), buf.len());
@@ -510,6 +511,11 @@ pub fn log(message: &str) {
 /// Milliseconds since the browser started.
 pub fn now() -> f64 {
     unsafe { ffi::now() }
+}
+
+/// Wall-clock time: milliseconds since the Unix epoch.
+pub fn wall_time() -> f64 {
+    unsafe { ffi::wall_time() }
 }
 
 enum Callback {

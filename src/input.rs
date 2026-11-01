@@ -102,6 +102,10 @@ pub trait Host {
     fn set_title(&mut self, title: &str);
     /// A console message from a page script or the browser.
     fn log(&mut self, _message: &str) {}
+    /// Wall-clock time in milliseconds since the Unix epoch, if known.
+    fn wall_clock(&mut self) -> Option<f64> {
+        None
+    }
 }
 
 #[cfg(test)]

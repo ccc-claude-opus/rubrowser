@@ -20,6 +20,9 @@ struct WebHost {
     /// Text the browser copied, handed to the next `copy` event.
     clipboard: String,
     logs: VecDeque<String>,
+    /// `Date.now() - performance.now()`, from JS.
+    epoch: f64,
+    now: f64,
 }
 
 impl Host for WebHost {
@@ -38,6 +41,9 @@ impl Host for WebHost {
     }
     fn set_title(&mut self, title: &str) {
         self.title = title.to_string();
+    }
+    fn wall_clock(&mut self) -> Option<f64> {
+        Some(self.epoch + self.now)
     }
     fn log(&mut self, message: &str) {
         if self.logs.len() < 1000 {
@@ -64,7 +70,14 @@ fn with<R: Default>(f: impl FnOnce(&mut Web) -> R) -> R {
 }
 
 fn send(web: &mut Web, e: Event) {
+    web.host.now = web.now;
     web.browser.event(e, web.now, &mut web.host);
+}
+
+/// Wall clock: `Date.now() - performance.now()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn rb_web_set_epoch(epoch: f64) {
+    with(|w| w.host.epoch = epoch);
 }
 
 #[unsafe(no_mangle)]
@@ -89,6 +102,7 @@ pub extern "C" fn rb_web_resize(width: u32, height: u32, scale: f32) {
 pub extern "C" fn rb_web_frame(now: f64) -> usize {
     with(|w| {
         w.now = now;
+        w.host.now = now;
         if !w.browser.needs_redraw(now) {
             return 0;
         }
@@ -199,6 +213,7 @@ pub extern "C" fn rb_web_fetch_done(id: u32, len: usize, ok: i32) {
         } else {
             Err(String::from_utf8_lossy(&bytes).into_owned())
         };
+        w.host.now = w.now;
         w.browser.fetch_done(id, result, &mut w.host);
     });
 }

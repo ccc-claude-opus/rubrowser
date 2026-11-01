@@ -15,7 +15,7 @@ use crate::gfx::Canvas;
 use crate::input::{Cursor, Event, Host, Modifiers};
 use crate::layout::RectF;
 use crate::net::url;
-use crate::script::{EventInfo, Script};
+use crate::script::{EventInfo, Limits, Script};
 use crate::text::Fonts;
 use crate::ui::textfield::Action;
 
@@ -63,8 +63,27 @@ struct Press {
 enum Request {
     Page { tab: u64, serial: u64, url: String },
     Stylesheet { tab: u64, serial: u64, link: NodeId },
-    Script { tab: u64, serial: u64, url: String },
+    Script { tab: u64, serial: u64, slot: usize },
 }
+
+/// Languages a `<script>` can be written in. Every one runs as wasm: Rust
+/// (and other compiled languages) directly, JavaScript inside `js.wasm`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lang {
+    Wasm,
+    JavaScript,
+}
+
+/// A `<script>` waiting to run (scripts run in document order).
+struct PendingScript {
+    lang: Lang,
+    /// URL or `inline script` (for messages).
+    name: String,
+    body: Option<Result<Vec<u8>, String>>,
+}
+
+/// The JavaScript runtime module (boa compiled to wasm).
+const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js.wasm");
 
 /// Extra fields of a dispatched event.
 #[derive(Clone, Copy, Debug, Default)]
@@ -114,9 +133,20 @@ struct Tab {
     /// The page's wasm scripts (`None` once a script has crashed).
     scripts: Vec<Option<Script>>,
     timers: Vec<Timer>,
+    /// Scripts not yet run, in document order.
+    pending: std::collections::VecDeque<PendingScript>,
+    /// Index in `scripts` of the page's JavaScript runtime, once loaded.
+    js: Option<usize>,
+    /// Number of `<script>`s found when the page loaded.
+    script_count: usize,
 }
 
 impl Tab {
+    /// Number of `<script>`s queued since the page loaded (run or not).
+    fn scripts_seen(&self) -> usize {
+        self.script_count
+    }
+
     fn url(&self) -> &str {
         &self.history[self.index]
     }
@@ -214,6 +244,9 @@ impl Browser {
             loading: false,
             scripts: Vec::new(),
             timers: Vec::new(),
+            pending: Default::default(),
+            js: None,
+            script_count: 0,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -316,9 +349,12 @@ impl Browser {
         tab.doc = Document::from_html(html, url);
         tab.scripts.clear();
         tab.timers.clear();
+        tab.pending.clear();
+        tab.js = None;
         let (id, serial) = (tab.id, tab.serial);
         let links = tab.doc.stylesheet_links();
-        let scripts = wasm_scripts(&tab.doc);
+        let scripts = page_scripts(&tab.doc);
+        tab.script_count = scripts.len();
         for (link, href) in links {
             let req = Request::Stylesheet {
                 tab: id,
@@ -327,16 +363,106 @@ impl Browser {
             };
             self.fetch(req, &url::resolve(url, &href), host);
         }
-        // Scripts run in document order: they are fetched in order and
-        // each is started when it arrives (in order for local files).
-        for src in scripts {
-            let target = url::resolve(url, &src);
-            let req = Request::Script {
-                tab: id,
-                serial,
-                url: target.clone(),
+        // Scripts are fetched in parallel but run in document order.
+        for (slot, (lang, src, inline)) in scripts.into_iter().enumerate() {
+            let tab = &mut self.tabs[i];
+            match src {
+                Some(src) => {
+                    let target = url::resolve(url, &src);
+                    tab.pending.push_back(PendingScript {
+                        lang,
+                        name: target.clone(),
+                        body: None,
+                    });
+                    let req = Request::Script {
+                        tab: id,
+                        serial,
+                        slot,
+                    };
+                    self.fetch(req, &target, host);
+                }
+                None => tab.pending.push_back(PendingScript {
+                    lang,
+                    name: format!("{url} (inline script)"),
+                    body: Some(Ok(inline.into_bytes())),
+                }),
+            }
+        }
+        self.run_scripts(i, host);
+        self.dirty = true;
+    }
+
+    /// Runs pending scripts of tab `i` from the front while they are ready.
+    fn run_scripts(&mut self, i: usize, host: &mut dyn Host) {
+        loop {
+            let tab = &mut self.tabs[i];
+            if !tab.pending.front().is_some_and(|p| p.body.is_some()) {
+                return;
+            }
+            let p = tab.pending.pop_front().unwrap();
+            // Later slots shift down as the front is consumed.
+            let body = match p.body.unwrap() {
+                Ok(b) => b,
+                Err(e) => {
+                    host.log(&format!("{}: {e}", p.name));
+                    continue;
+                }
             };
-            self.fetch(req, &target, host);
+            match p.lang {
+                Lang::Wasm => self.start_wasm(i, &body, &p.name, host),
+                Lang::JavaScript => {
+                    let source = String::from_utf8_lossy(&body).into_owned();
+                    self.run_js(i, &source, &p.name, host);
+                }
+            }
+            if i >= self.tabs.len() || self.tabs[i].pending.is_empty() {
+                return;
+            }
+        }
+    }
+
+    fn wall_offset(&self, host: &mut dyn Host) -> f64 {
+        host.wall_clock().map_or(0.0, |w| w - self.now)
+    }
+
+    fn start_wasm(&mut self, i: usize, bytes: &[u8], name: &str, host: &mut dyn Host) {
+        let (now, offset) = (self.now, self.wall_offset(host));
+        let t = &mut self.tabs[i];
+        match Script::load_with(bytes, &mut t.doc, now, offset, Limits::SCRIPT) {
+            Ok(script) => {
+                t.scripts.push(Some(script));
+                let si = t.scripts.len() - 1;
+                self.after_script(i, si, host);
+            }
+            Err(e) => host.log(&format!("{name}: {e}")),
+        }
+        self.dirty = true;
+    }
+
+    /// Runs JavaScript in the page's JS runtime, starting it if needed.
+    fn run_js(&mut self, i: usize, source: &str, name: &str, host: &mut dyn Host) {
+        let (now, offset) = (self.now, self.wall_offset(host));
+        if self.tabs[i].js.is_none() {
+            let t = &mut self.tabs[i];
+            match Script::load_with(JS_RUNTIME, &mut t.doc, now, offset, Limits::RUNTIME) {
+                Ok(rt) => {
+                    t.scripts.push(Some(rt));
+                    t.js = Some(t.scripts.len() - 1);
+                    self.after_script(i, t_js(&self.tabs[i]), host);
+                }
+                Err(e) => return host.log(&format!("JavaScript runtime: {e}")),
+            }
+        }
+        let si = t_js(&self.tabs[i]);
+        let t = &mut self.tabs[i];
+        let Some(Some(rt)) = t.scripts.get_mut(si) else {
+            return;
+        };
+        match rt.eval(&mut t.doc, source, name, now) {
+            Ok(()) => {
+                self.after_script(i, si, host);
+            }
+            Err(e) => self.script_failed(i, si, &e, host),
         }
         self.dirty = true;
     }
@@ -373,28 +499,22 @@ impl Browser {
                     self.dirty = true;
                 }
             }
-            Request::Script { tab, serial, url } => {
+            Request::Script { tab, serial, slot } => {
                 let Some(i) = self
                     .tab_index(tab)
                     .filter(|&i| self.tabs[i].serial == serial)
                 else {
                     return;
                 };
-                let bytes = match result {
-                    Ok(b) => b,
-                    Err(e) => return host.log(&format!("{url}: {e}")),
-                };
-                let now = self.now;
-                let t = &mut self.tabs[i];
-                match Script::load(&bytes, &mut t.doc, now) {
-                    Ok(script) => {
-                        t.scripts.push(Some(script));
-                        let si = t.scripts.len() - 1;
-                        self.after_script(i, si, host);
-                    }
-                    Err(e) => host.log(&format!("{url}: {e}")),
+                // Slots count from the start of the page's script list;
+                // already-run scripts have left the queue.
+                let total = self.tabs[i].scripts_seen();
+                let tab = &mut self.tabs[i];
+                let index = slot.checked_sub(total - tab.pending.len());
+                if let Some(p) = index.and_then(|k| tab.pending.get_mut(k)) {
+                    p.body = Some(result);
                 }
-                self.dirty = true;
+                self.run_scripts(i, host);
             }
         }
     }
@@ -1157,19 +1277,47 @@ impl Browser {
     }
 }
 
-/// `src` of every `<script>` that is WebAssembly (JavaScript is not run).
-fn wasm_scripts(doc: &Document) -> Vec<String> {
+/// Every `<script>` the browser can run, in document order: its language,
+/// `src` (if external) and inline text.
+fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
     let dom = &doc.dom;
     dom.descendants(crate::dom::Dom::ROOT)
         .into_iter()
         .filter(|&n| dom.tag(n) == Some("script"))
         .filter_map(|n| {
-            let src = dom.attr(n, "src")?;
-            let ty = dom.attr(n, "type").unwrap_or("").to_ascii_lowercase();
-            (ty == "application/wasm" || ty == "wasm" || src.ends_with(".wasm"))
-                .then(|| src.to_string())
+            let src = dom.attr(n, "src").map(str::to_string);
+            let ty = dom
+                .attr(n, "type")
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            let lang = match ty.as_str() {
+                "application/wasm" | "wasm" => Lang::Wasm,
+                ""
+                | "module"
+                | "text/javascript"
+                | "application/javascript"
+                | "application/ecmascript"
+                | "text/ecmascript" => {
+                    if src.as_deref().is_some_and(|s| s.ends_with(".wasm")) {
+                        Lang::Wasm
+                    } else {
+                        Lang::JavaScript
+                    }
+                }
+                _ => return None,
+            };
+            let inline = dom.text_content(n);
+            if src.is_none() && (lang == Lang::Wasm || inline.trim().is_empty()) {
+                return None;
+            }
+            Some((lang, src, inline))
         })
         .collect()
+}
+
+fn t_js(tab: &Tab) -> usize {
+    tab.js.unwrap_or(usize::MAX)
 }
 
 fn sanitize_scale(scale: f32) -> f32 {
@@ -1565,6 +1713,116 @@ mod tests {
         let ticks = b.tabs[b.active].doc.dom.text_content(page_el(&b, "ticks"));
         assert_eq!(ticks, "5");
         assert!(b.tabs[b.active].timers.is_empty());
+    }
+
+    #[derive(Default)]
+    struct LogHost {
+        inner: TestHost,
+        logs: Vec<String>,
+    }
+
+    impl Host for LogHost {
+        fn fetch(&mut self, id: u32, url: &str) {
+            self.inner.fetch(id, url)
+        }
+        fn clipboard_get(&mut self) -> Option<String> {
+            None
+        }
+        fn clipboard_set(&mut self, _: &str) {}
+        fn set_cursor(&mut self, _: Cursor) {}
+        fn set_title(&mut self, t: &str) {
+            self.inner.set_title(t)
+        }
+        fn log(&mut self, m: &str) {
+            self.logs.push(m.to_string());
+        }
+        fn wall_clock(&mut self) -> Option<f64> {
+            Some(1_700_000_000_000.0)
+        }
+    }
+
+    #[test]
+    fn javascript_runs_in_the_wasm_runtime() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<title>JS</title>
+            <p id=out>old</p><button id=btn>Go</button><ul id=list></ul>
+            <script>
+              const out = document.getElementById('out');
+              out.textContent = 'from js ' + [1, 2, 3].map(x => x * 2).join(',');
+              out.classList.add('done');
+              out.style.color = 'red';
+              console.log('sum', 2 + 3, { a: 1 });
+              let clicks = 0;
+              document.querySelector('#btn').addEventListener('click', (e) => {
+                clicks++;
+                document.title = 'clicked ' + clicks + ' ' + e.target.tagName;
+              });
+              setTimeout(() => console.log('timer', Date.now() > 1600000000000), 50);
+            </script>
+            <script src="more.js"></script>
+            <script>console.log('third runs after more.js', typeof fromMore);</script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        // more.js arrives later; the third script must wait for it.
+        let more = h.inner.fetched.last().unwrap();
+        assert_eq!(more.1, "https://js.test/more.js");
+        assert!(!h.logs.iter().any(|l| l.starts_with("third")));
+        let more_id = more.0;
+        let more_src = "var fromMore = 1; document.getElementById('list').innerHTML = '<li>a</li><li>b</li>'; nope();";
+        b.fetch_done(more_id, Ok(more_src.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+
+        let doc = &b.tabs[b.active].doc;
+        let out = doc.dom.element_by_id("out").unwrap();
+        assert_eq!(doc.dom.text_content(out), "from js 2,4,6");
+        assert_eq!(doc.dom.attr(out, "class"), Some("done"));
+        assert_eq!(doc.style(out).unwrap().color.rgb(), 0xff0000);
+        let list = doc.dom.element_by_id("list").unwrap();
+        assert_eq!(doc.dom.children(list).len(), 2);
+        assert!(
+            h.logs.contains(&"sum 5 {\"a\":1}".to_string()),
+            "{:?}",
+            h.logs
+        );
+        assert!(
+            h.logs
+                .iter()
+                .any(|l| l.contains("nope") && l.contains("Uncaught")),
+            "{:?}",
+            h.logs
+        );
+        assert!(
+            h.logs
+                .contains(&"third runs after more.js number".to_string()),
+            "{:?}",
+            h.logs
+        );
+
+        click_page_h(&mut b, &mut h, "btn");
+        click_page_h(&mut b, &mut h, "btn");
+        assert_eq!(
+            b.tabs[b.active].doc.title().as_deref(),
+            Some("clicked 2 BUTTON")
+        );
+
+        b.render(100.0, &mut h);
+        assert!(h.logs.contains(&"timer true".to_string()), "{:?}", h.logs);
+    }
+
+    fn click_page_h(b: &mut Browser, h: &mut LogHost, id: &str) {
+        let n = page_el(b, id);
+        let r = b.tabs[b.active].doc.content_box(n).unwrap();
+        let vp = b.viewport_rect();
+        let (x, y) = (
+            (vp.x + r.x + r.w / 2.0) as i32,
+            (vp.y + r.y + r.h / 2.0) as i32,
+        );
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, h);
+        b.render(0.0, h);
     }
 
     #[test]

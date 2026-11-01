@@ -29,6 +29,8 @@ core = [
 native = ["core", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard"]
 # Canvas version running inside a web browser (extra).
 web = ["core"]
+# The JavaScript runtime (boa) built as js.wasm; see scripts/build.sh.
+js-runtime = ["sdk", "dep:boa_engine", "dep:getrandom"]
 
 [dependencies]
 winit = { version = "0.30", optional = true }
@@ -42,6 +44,8 @@ html5ever = { version = "0.40", optional = true }
 simplecss = { version = "0.2", optional = true }
 csscolorparser = { version = "0.9", optional = true }
 taffy = { version = "0.15", optional = true }
+boa_engine = { version = "0.22", default-features = false, optional = true }
+getrandom = { version = "0.4", default-features = false, optional = true }
 
 [dev-dependencies]
 wasmi = { version = "2", features = ["wat"] }
@@ -82,6 +86,12 @@ required-features = ["sdk"]
 name = "events"
 crate-type = ["cdylib"]
 required-features = ["sdk"]
+
+# The JavaScript runtime module (boa compiled to wasm).
+[[example]]
+name = "js_runtime"
+crate-type = ["cdylib"]
+required-features = ["js-runtime"]
 
 [package.metadata.docs.rs]
 features = ["native", "sdk"]
