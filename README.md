@@ -127,7 +127,9 @@ Then open <http://localhost:8000>. Append `#URL` to open a page, e.g. `http://lo
 
 A practical subset: block, inline, inline-block, flex, grid and table layout; floats, absolute, fixed and sticky positioning, z-index; margins, padding, borders (solid, dashed, dotted, double), rounded corners, outlines, opacity; background colors and images; fonts, line height, text alignment, white-space, decorations, `text-transform`, sub/superscript, lists, `::before`/`::after` content with counters; `overflow` scrolling; `:hover`, `:active`, `:focus`; links; images (PNG, JPEG, GIF, WebP, BMP, SVG, `data:` URLs), inline SVG, `mask-image`; `#fragment` links; forms (text, password, textarea, checkbox, radio, select, buttons, labels, GET submission); `<details>`. See [doc/plan.md](doc/plan.md), [doc/plan2.md](doc/plan2.md), [doc/plan3.md](doc/plan3.md) and [doc/architecture.md](doc/architecture.md).
 
-Not supported yet: IME, `fetch`/`XMLHttpRequest`, `localStorage`, form POST, CSS transforms/animations, right-to-left text, video and canvas.
+Also: gradients and box shadows, web fonts (WOFF/WOFF2), right-to-left text with Arabic shaping, CJK line breaking, ES modules, same-origin `fetch`/`XMLHttpRequest`, custom elements, form POST.
+
+Not supported yet: IME, cross-origin requests from scripts, CSS rotation/scaling transforms and animations, video, canvas and WebGL.
 
 ## License
 

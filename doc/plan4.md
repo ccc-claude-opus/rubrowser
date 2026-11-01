@@ -46,7 +46,34 @@
 
 每完成一個里程碑：重跑調查、更新本文件的表格、commit。
 
-## 4. 不做的事
+## 4. 進度（2026-11-02）
 
-- 不繞過機器人檢查或 CAPTCHA（Cloudflare 等）。
+| 階段 | 狀態 | 內容 |
+|---|---|---|
+| X0 | 完成 | `scripts/survey.sh` |
+| X1 | 完成 | quirks 模式 UA 規則、`-webkit-center`、`align` 屬性、固定寬度的表格欄 |
+| X2 | 完成 | 相容的 User-Agent、`Accept`、`Accept-Language`、cookie、brotli |
+| X3 | 完成 | `srcset` / `sizes` / `<picture>`；`<noscript>` 的後備樣式 |
+| X4 | 完成 | 線性 / 放射 / 重複漸層、`box-shadow`、圓角背景裁切 |
+| X5 | 完成 | `@font-face`（WOFF / WOFF2 以 `wuff` 解開），依字重挑選 |
+| X6 | 完成 | `direction` / `dir`、bidi 重排、`rustybuzz` 字形整形（阿拉伯文、圖示字型連字）、中日韓斷行 |
+| X7 | 完成 | ES 模組與 import map、`fetch` / `XMLHttpRequest`（同源）、custom elements、`URL` 等大量 Web API；載入時的腳本時間預算；DOM 沒變就不重算樣式 |
+| X8 | 完成 | 表單 POST、`target=_blank` |
+
+其他修正：`translate` / `transform: translate()`、`aspect-ratio`、`@property`、具名 grid 線、`[hidden]`、`clip` / `clip-path` 的隱藏寫法、SVG 的 CSS `fill` / `stroke` 與屬性中的 `var()`、絕對定位元素以最近的定位祖先為包含區塊、CSS 已定尺寸的圖片載入時不重新排版、hover 的增量樣式計算。
+
+### 第二批調查
+
+| 網站 | 狀況 |
+|---|---|
+| The Guardian | 版面與 Chrome 相近（具名 grid 線、SVG 標誌） |
+| go.dev、Arch Linux、iThome、mozilla.org、wikipedia.org | 相近 |
+| CNN | 文章與圖片正常；頁首導覽列要等它自己的 JS 顯示（目前 JS 執行失敗） |
+| YouTube、craigslist | 整頁由 JS 產生，尚未能顯示 |
+| Amazon、w3.org、npm、Stack Overflow | 機器人檢查頁（Akamai / Cloudflare），不嘗試通過 |
+
+## 5. 不做的事
+
+- 不繞過機器人檢查或 CAPTCHA（Cloudflare、Akamai 等）。
+- 跨來源的 `fetch` 要等 CORS 檢查做好才開放。
 - DRM、WebGL、影片播放留到之後。
