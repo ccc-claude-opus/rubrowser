@@ -787,27 +787,16 @@ impl Builder<'_> {
         }
     }
 
-    /// Lays out a `display: table` element as a CSS grid: one grid row per
-    /// table row, cells placed with their `colspan` / `rowspan`.
-    /// Column tracks: fixed widths stay fixed; with a definite table width
-    /// the others share the extra room in proportion to their content.
-    fn table_columns(
-        &self,
-        cols: &[(Option<f32>, f32)],
-        definite: bool,
-    ) -> Vec<GridTemplateComponent<String>> {
+    /// Column tracks: a column with a fixed-width cell keeps that width;
+    /// the others are `auto` (sharing any extra room).
+    fn table_columns(cols: &[Option<f32>]) -> Vec<GridTemplateComponent<String>> {
         cols.iter()
-            .map(|&(fixed, content)| {
-                let track = match fixed {
-                    Some(w) => length(w),
-                    None if definite => minmax(auto(), fr(content.max(1.0))),
-                    None => auto(),
-                };
-                GridTemplateComponent::Single(track)
-            })
+            .map(|&fixed| GridTemplateComponent::Single(fixed.map_or_else(auto, length)))
             .collect()
     }
 
+    /// Lays out a `display: table` element as a CSS grid: one grid row per
+    /// table row, cells placed with their `colspan` / `rowspan`.
     fn build_table(
         &mut self,
         tree: &mut TaffyTree<Ctx>,
@@ -932,32 +921,20 @@ impl Builder<'_> {
                 kids.push(tree.new_leaf_with_context(st, ctx).unwrap());
             }
         }
-        // Per column: a fixed border-box width from a cell's `width`, and a
-        // rough max-content estimate (text width) to share out extra room.
-        let mut col_info: Vec<(Option<f32>, f32)> = vec![(None, 0.0); ncols];
-        for &(cell, _, col, _, cs) in &cells {
+        // Per column: a fixed border-box width from a cell's `width`.
+        let mut col_widths: Vec<Option<f32>> = vec![None; ncols];
+        for &(cell, _, col, _, span) in &cells {
             let Some(st) = self.style(cell) else { continue };
-            let pad = st.padding[cs::LEFT].px_or_zero(0.0)
-                + st.padding[cs::RIGHT].px_or_zero(0.0)
-                + st.border(cs::LEFT)
-                + st.border(cs::RIGHT);
-            let text = self.dom.text_content(cell);
-            let longest_line = text
-                .lines()
-                .map(|l| self.fonts.measure(st.font(), st.font_size, l.trim()))
-                .fold(0.0, f32::max);
-            let per_col = (longest_line + pad) / cs as f32;
-            for info in &mut col_info[col..col + cs] {
-                info.1 = info.1.max(per_col);
-            }
-            if cs == 1
-                && let Dim::Px(w) = st.width
-            {
+            if let (1, Dim::Px(w)) = (span, st.width) {
+                let pad = st.padding[cs::LEFT].px_or_zero(0.0)
+                    + st.padding[cs::RIGHT].px_or_zero(0.0)
+                    + st.border(cs::LEFT)
+                    + st.border(cs::RIGHT);
                 let w = match st.box_sizing {
                     cs::BoxSizing::BorderBox => w,
                     cs::BoxSizing::ContentBox => w + pad,
                 };
-                col_info[col].0 = Some(col_info[col].0.map_or(w, |o: f32| o.max(w)));
+                col_widths[col] = Some(col_widths[col].map_or(w, |o: f32| o.max(w)));
             }
         }
         let collapse = css.border_collapse;
@@ -988,7 +965,7 @@ impl Builder<'_> {
         let gap = if collapse { 0.0 } else { css.border_spacing };
         tstyle.display = Display::Grid;
         tstyle.item_is_table = true;
-        tstyle.grid_template_columns = self.table_columns(&col_info, css.width != Dim::Auto);
+        tstyle.grid_template_columns = Self::table_columns(&col_widths);
         tstyle.gap = Size {
             width: LengthPercentage::length(gap),
             height: LengthPercentage::length(gap),
