@@ -174,6 +174,18 @@ pub struct Styles {
     pub nodes: Vec<Option<Style>>,
     /// `::before` / `::after` / `::marker` styles of elements that have them.
     pub pseudo: HashMap<(NodeId, PseudoElement), Style>,
+    /// Generated content boxes. Box `i` has the synthetic node id
+    /// `dom.len() + 2 * i` and its text `dom.len() + 2 * i + 1`; both have
+    /// entries in `nodes`.
+    pub generated: Vec<Generated>,
+}
+
+/// A `::before` / `::after` box with its evaluated `content`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Generated {
+    pub owner: NodeId,
+    pub after: bool,
+    pub text: String,
 }
 
 /// One declaration in cascade order.
@@ -211,7 +223,10 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
     let mut out = Styles {
         nodes: vec![None; dom.len()],
         pseudo: HashMap::new(),
+        generated: Vec::new(),
     };
+    let mut counters: HashMap<String, i32> = HashMap::new();
+    let mut gen_styles: Vec<Style> = Vec::new();
     let mut venv = ValueEnv {
         root_font: 16.0,
         vw: env.width,
@@ -228,15 +243,34 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
             if dom.tag(id) == Some("html") {
                 venv.root_font = s.font_size;
             }
+            if s.display != style::Display::None {
+                update_counters(&s, &mut counters);
+            }
             for pe in [
                 PseudoElement::Before,
                 PseudoElement::After,
                 PseudoElement::Marker,
             ] {
                 let p = cascade_element(dom, id, cascade, &candidates, cx, &s, &venv, Some(pe));
-                if p.has_rules {
-                    out.pseudo.insert((id, pe), p);
+                if !p.has_rules {
+                    continue;
                 }
+                if pe != PseudoElement::Marker && s.display != style::Display::None {
+                    update_counters(&p, &mut counters);
+                    let text = p
+                        .content
+                        .as_deref()
+                        .and_then(|c| generated_text(c, dom, id, &counters));
+                    if let Some(text) = text.filter(|_| p.display != style::Display::None) {
+                        out.generated.push(Generated {
+                            owner: id,
+                            after: pe == PseudoElement::After,
+                            text,
+                        });
+                        gen_styles.push(p.clone());
+                    }
+                }
+                out.pseudo.insert((id, pe), p);
             }
             s
         } else if dom.text(id).is_some() || id == Dom::ROOT {
@@ -269,7 +303,200 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
         }
         out.nodes[id] = Some((*shared).clone());
     }
+    for (g, st) in out.generated.iter().zip(gen_styles) {
+        // Drop boxes whose owner is not rendered (or has no box to hold them).
+        let shown = out.nodes[g.owner].is_some();
+        let mut text = st.clone();
+        text.display = style::Display::Inline;
+        out.nodes.push(shown.then_some(st));
+        out.nodes.push(shown.then_some(text));
+    }
     out
+}
+
+/// Applies `counter-reset` then `counter-increment` (document order;
+/// counters are not scoped to subtrees).
+fn update_counters(s: &Style, counters: &mut HashMap<String, i32>) {
+    for (list, default) in [(&s.counter_reset, 0), (&s.counter_increment, 1)] {
+        let Some(list) = list.as_deref() else {
+            continue;
+        };
+        let words: Vec<&str> = list.split_whitespace().collect();
+        let mut i = 0;
+        while i < words.len() {
+            let name = words[i];
+            if name == "none" {
+                break;
+            }
+            let n = words.get(i + 1).and_then(|w| w.parse::<i32>().ok());
+            i += if n.is_some() { 2 } else { 1 };
+            let n = n.unwrap_or(default);
+            if default == 0 {
+                counters.insert(name.to_string(), n);
+            } else {
+                *counters.entry(name.to_string()).or_insert(0) += n;
+            }
+        }
+    }
+}
+
+/// Evaluates a `content` value: strings, `attr()`, `counter()`,
+/// `counters()` and quotes. `None` for `none` / `normal` (no box).
+pub fn generated_text(
+    value: &str,
+    dom: &Dom,
+    id: NodeId,
+    counters: &HashMap<String, i32>,
+) -> Option<String> {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("none") || v.eq_ignore_ascii_case("normal") || v.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let chars: Vec<char> = v.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c == '"' || c == '\'' {
+            i += 1;
+            while i < chars.len() && chars[i] != c {
+                if chars[i] == '\\' && i + 1 < chars.len() {
+                    let start = i + 1;
+                    let mut end = start;
+                    while end < chars.len() && end - start < 6 && chars[end].is_ascii_hexdigit() {
+                        end += 1;
+                    }
+                    if end > start {
+                        let hex: String = chars[start..end].iter().collect();
+                        if let Some(ch) =
+                            u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                        {
+                            out.push(ch);
+                        }
+                        i = end;
+                        if chars.get(i) == Some(&' ') {
+                            i += 1;
+                        }
+                    } else {
+                        if chars[start] != '\n' {
+                            out.push(chars[start]);
+                        }
+                        i = start + 1;
+                    }
+                } else {
+                    out.push(chars[i]);
+                    i += 1;
+                }
+            }
+            i += 1;
+        } else if c == '/' {
+            break; // alternative text follows
+        } else {
+            let start = i;
+            while i < chars.len() && !chars[i].is_whitespace() && chars[i] != '(' {
+                i += 1;
+            }
+            let name: String = chars[start..i]
+                .iter()
+                .collect::<String>()
+                .to_ascii_lowercase();
+            let mut args = String::new();
+            if chars.get(i) == Some(&'(') {
+                let mut depth = 0;
+                while i < chars.len() {
+                    match chars[i] {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                    if !(depth == 1 && chars[i] == '(') {
+                        args.push(chars[i]);
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            let args: Vec<String> = args
+                .split(',')
+                .map(|a| a.trim().trim_matches(|c| c == '"' || c == '\'').to_string())
+                .collect();
+            match name.as_str() {
+                "attr" => {
+                    let attr = args[0].split_whitespace().next().unwrap_or("");
+                    out.push_str(dom.attr(id, attr).unwrap_or(""));
+                }
+                "counter" | "counters" => {
+                    let n = counters.get(args[0].as_str()).copied().unwrap_or(0);
+                    let style = if name == "counter" {
+                        args.get(1)
+                    } else {
+                        args.get(2)
+                    };
+                    out.push_str(&counter_text(n, style.map_or("decimal", |s| s.as_str())));
+                }
+                "open-quote" => out.push('\u{201C}'),
+                "close-quote" => out.push('\u{201D}'),
+                _ => {} // url(), no-open-quote, …
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Formats a counter value in a `list-style-type`.
+pub fn counter_text(n: i32, style: &str) -> String {
+    let alpha = |base: u8| {
+        let mut n = n.max(1) as u32;
+        let mut s = Vec::new();
+        while n > 0 {
+            n -= 1;
+            s.push((base + (n % 26) as u8) as char);
+            n /= 26;
+        }
+        s.iter().rev().collect()
+    };
+    let roman = |upper: bool| {
+        let mut n = n.clamp(1, 3999) as u32;
+        let mut s = String::new();
+        for (v, r) in [
+            (1000, "m"),
+            (900, "cm"),
+            (500, "d"),
+            (400, "cd"),
+            (100, "c"),
+            (90, "xc"),
+            (50, "l"),
+            (40, "xl"),
+            (10, "x"),
+            (9, "ix"),
+            (5, "v"),
+            (4, "iv"),
+            (1, "i"),
+        ] {
+            while n >= v {
+                s.push_str(r);
+                n -= v;
+            }
+        }
+        if upper { s.to_uppercase() } else { s }
+    };
+    match style.trim() {
+        "none" => String::new(),
+        "lower-alpha" | "lower-latin" => alpha(b'a'),
+        "upper-alpha" | "upper-latin" => alpha(b'A'),
+        "lower-roman" => roman(false),
+        "upper-roman" => roman(true),
+        "disc" => "\u{2022}".into(),
+        "circle" => "\u{25E6}".into(),
+        "square" => "\u{25AA}".into(),
+        "decimal-leading-zero" => format!("{n:02}"),
+        _ => n.to_string(),
+    }
 }
 
 /// Cascades element `id` (or its pseudo-element `pe`).
@@ -640,6 +867,41 @@ mod tests {
             "hovering a child hovers the link"
         );
         assert_eq!(by_id(&d, &s, "i").color, BLUE);
+    }
+
+    #[test]
+    fn generated_content_and_counters() {
+        let html = r#"<style>
+            .q::before { content: "\201C" attr(data-x) " " }
+            .q::after { content: none }
+            ol { counter-reset: n 4 }
+            li { counter-increment: n }
+            li::before { content: counter(n, upper-roman) "." }
+            </style><p class="q" data-x="hi">a</p><ol><li>x</li><li>y</li></ol>"#;
+        let dom = parse_html(html);
+        let env = MediaEnv::default();
+        let sheet = Rc::new(syntax::parse_stylesheet(
+            &author_sheets(&dom, &[]).join("\n"),
+            None,
+        ));
+        let cascade = Cascade::new(&[(sheet, MediaList::default())], &env);
+        let no = |_: NodeId| false;
+        let cx = Matcher {
+            dom: &dom,
+            state: ElementState::default(),
+            checked: &no,
+        };
+        let st = compute(&dom, &cascade, &cx, &env);
+        let texts: Vec<(bool, &str)> = st
+            .generated
+            .iter()
+            .map(|g| (g.after, g.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            [(false, "\u{201C}hi "), (false, "V."), (false, "VI.")]
+        );
+        assert_eq!(st.nodes.len(), dom.len() + 6);
     }
 
     #[test]

@@ -8,6 +8,8 @@
 pub mod inline;
 
 use std::collections::HashMap;
+
+use crate::css::Generated;
 use taffy::prelude::*;
 use taffy::{
     AvailableSpace, LayoutInput, LayoutOutput, Overflow as TOverflow, Point, compute_leaf_layout,
@@ -109,6 +111,10 @@ struct Builder<'a> {
     fixed: Vec<taffy::NodeId>,
     dom: &'a Dom,
     styles: &'a [Option<Css>],
+    /// `::before` / `::after` boxes, with ids from `dom.len()` on.
+    generated: &'a [Generated],
+    /// Generated box index of each element's `::before` and `::after`.
+    gen_of: HashMap<NodeId, [Option<usize>; 2]>,
     fonts: &'a Fonts,
     viewport: (f32, f32),
     boxes: Vec<LBox>,
@@ -127,6 +133,7 @@ pub type Replaced = std::collections::HashMap<NodeId, (f32, f32)>;
 pub fn layout(
     dom: &Dom,
     styles: &[Option<Css>],
+    generated: &[Generated],
     fonts: &Fonts,
     width: f32,
     height: f32,
@@ -137,26 +144,42 @@ pub fn layout(
     // Shrink-to-fit needs the container width, which is only known after
     // layout: re-run with caps for the inline-blocks that overflowed.
     for _ in 0..3 {
-        let (tree, overflow) =
-            layout_pass(dom, styles, fonts, width, height, replaced, caps.clone());
+        let (tree, overflow) = layout_pass(
+            dom,
+            styles,
+            generated,
+            fonts,
+            width,
+            height,
+            replaced,
+            caps.clone(),
+        );
         if overflow.is_empty() {
             return tree;
         }
         caps.extend(overflow);
     }
-    layout_pass(dom, styles, fonts, width, height, replaced, caps).0
+    layout_pass(dom, styles, generated, fonts, width, height, replaced, caps).0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn layout_pass(
     dom: &Dom,
     styles: &[Option<Css>],
+    generated: &[Generated],
     fonts: &Fonts,
     width: f32,
     height: f32,
     replaced: &Replaced,
     caps: HashMap<NodeId, f32>,
 ) -> (LayoutTree, HashMap<NodeId, f32>) {
+    let mut gen_of: HashMap<NodeId, [Option<usize>; 2]> = HashMap::new();
+    for (i, g) in generated.iter().enumerate() {
+        gen_of.entry(g.owner).or_default()[g.after as usize] = Some(i);
+    }
     let mut b = Builder {
+        generated,
+        gen_of,
         caps,
         overflow: HashMap::new(),
         in_block: true,
@@ -216,6 +239,35 @@ fn layout_pass(
 }
 
 impl Builder<'_> {
+    /// Children of `id` including generated `::before` / `::after` boxes.
+    fn kids(&self, id: NodeId) -> Vec<NodeId> {
+        let base = self.dom.len();
+        if id >= base {
+            // A generated box holds its text node.
+            return if (id - base) % 2 == 0 {
+                vec![id + 1]
+            } else {
+                Vec::new()
+            };
+        }
+        let gens = self.gen_of.get(&id).copied().unwrap_or_default();
+        let mut out = Vec::with_capacity(self.dom.children(id).len() + 2);
+        out.extend(gens[0].map(|g| base + 2 * g));
+        out.extend_from_slice(self.dom.children(id));
+        out.extend(gens[1].map(|g| base + 2 * g));
+        out
+    }
+
+    /// Text of a DOM text node or a generated text node.
+    fn text_of(&self, id: NodeId) -> Option<&str> {
+        let base = self.dom.len();
+        if id >= base {
+            let i = id - base;
+            return (i % 2 == 1).then(|| self.generated[i / 2].text.as_str());
+        }
+        self.dom.text(id)
+    }
+
     fn style(&self, id: NodeId) -> Option<&Css> {
         self.styles.get(id).and_then(Option::as_ref)
     }
@@ -410,24 +462,24 @@ impl Builder<'_> {
         flex: bool,
         parts: &mut Vec<Part>,
     ) {
-        for &c in self.dom.children(parent) {
+        for c in self.kids(parent) {
             let Some(css) = self.style(c) else { continue };
             if css.display == CDisplay::Contents {
                 // No box of its own: its children take its place.
                 self.collect_children(tree, c, flex, parts);
                 continue;
             }
-            if self.dom.text(c).is_some() {
+            if let Some(text) = self.text_of(c) {
                 push_inline(
                     parts,
                     Item::Text {
                         node: c,
-                        text: self.dom.text(c).unwrap_or("").to_string(),
+                        text: text.to_string(),
                     },
                 );
                 continue;
             }
-            if self.dom.element(c).is_none() {
+            if self.dom.element(c).is_none() && c < self.dom.len() {
                 continue;
             }
             let block_level = flex
@@ -1201,7 +1253,7 @@ mod tests {
         let sheets = author_sheets(&dom, &[]);
         let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
         let styles = compute_styles(&dom, &refs, &ElementState::default());
-        let tree = layout(&dom, &styles, &Fonts::new(), w, h, &Replaced::new());
+        let tree = layout(&dom, &styles, &[], &Fonts::new(), w, h, &Replaced::new());
         Laid { dom, tree }
     }
 

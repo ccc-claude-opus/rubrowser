@@ -51,6 +51,8 @@ pub struct Document {
     styles: Vec<Option<Style>>,
     /// `::before` / `::after` / `::marker` styles.
     pub pseudo: HashMap<(NodeId, PseudoElement), Style>,
+    /// `::before` / `::after` boxes (see [`crate::css::Styles::generated`]).
+    pub generated: Vec<crate::css::Generated>,
     tree: LayoutTree,
     state: ElementState,
     scroll: ScrollOffsets,
@@ -79,6 +81,7 @@ impl Document {
             cascade: None,
             styles: Vec::new(),
             pseudo: HashMap::new(),
+            generated: Vec::new(),
             tree: LayoutTree::default(),
             state: ElementState::default(),
             scroll: ScrollOffsets::new(),
@@ -262,9 +265,13 @@ impl Document {
                 checked: &checked,
             };
             let styles = compute(dom, &cascade, &cx, &env);
-            if styles.nodes != self.styles || styles.pseudo != self.pseudo {
+            if styles.nodes != self.styles
+                || styles.pseudo != self.pseudo
+                || styles.generated != self.generated
+            {
                 self.styles = styles.nodes;
                 self.pseudo = styles.pseudo;
+                self.generated = styles.generated;
                 self.needs_layout = true;
             }
             self.needs_style = false;
@@ -274,6 +281,7 @@ impl Document {
             self.tree = layout(
                 &self.dom,
                 &self.styles,
+                &self.generated,
                 fonts,
                 self.size.0,
                 self.size.1,
@@ -818,6 +826,14 @@ impl Document {
     }
 
     /// What is at logical point `(x, y)` (relative to the viewport).
+    /// Maps a generated (`::before` / `::after`) node to its element.
+    fn real_node(&self, id: NodeId) -> Option<NodeId> {
+        match id.checked_sub(self.dom.len()) {
+            Some(i) => self.generated.get(i / 2).map(|g| g.owner),
+            None => Some(id),
+        }
+    }
+
     pub fn hit_test(&self, x: f32, y: f32) -> Hit {
         let mut hit = Hit::default();
         if self.tree.boxes.is_empty() {
@@ -904,7 +920,13 @@ impl Document {
                                 h: line.height,
                             };
                             if rect.contains(x, y) {
-                                hit.element = self.dom.parent(*node);
+                                hit.element = self.real_node(*node).and_then(|n| {
+                                    if n == *node {
+                                        self.dom.parent(n)
+                                    } else {
+                                        Some(n)
+                                    }
+                                });
                                 return true;
                             }
                         }
@@ -923,7 +945,7 @@ impl Document {
             }
         }
         if inside {
-            hit.element = Some(b.node.unwrap_or(b.style_node));
+            hit.element = self.real_node(b.node.unwrap_or(b.style_node));
             return true;
         }
         false

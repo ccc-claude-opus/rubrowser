@@ -139,11 +139,11 @@ impl Dom {
     }
 
     pub fn parent(&self, id: NodeId) -> Option<NodeId> {
-        self.nodes[id].parent
+        self.nodes.get(id)?.parent
     }
 
     pub fn children(&self, id: NodeId) -> &[NodeId] {
-        &self.nodes[id].children
+        self.nodes.get(id).map_or(&[], |n| &n.children)
     }
 
     pub fn element(&self, id: NodeId) -> Option<&Element> {

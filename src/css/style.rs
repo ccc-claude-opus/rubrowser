@@ -303,6 +303,11 @@ pub struct Style {
     pub vars: Rc<BTreeMap<String, String>>,
     /// Whether any declaration applied (used for pseudo-elements).
     pub has_rules: bool,
+    /// Raw `content`, `counter-reset` and `counter-increment` values
+    /// (evaluated by [`super::generated_text`] and the counter walk).
+    pub content: Option<Rc<str>>,
+    pub counter_reset: Option<Rc<str>>,
+    pub counter_increment: Option<Rc<str>>,
 }
 
 impl Default for Style {
@@ -371,6 +376,9 @@ impl Default for Style {
             visible: true,
             vars: Rc::default(),
             has_rules: false,
+            content: None,
+            counter_reset: None,
+            counter_increment: None,
         }
     }
 }
@@ -797,6 +805,9 @@ impl Style {
                 }
             }
             "visibility" => self.visible = v != "hidden" && v != "collapse",
+            "content" => self.content = Some(value.into()),
+            "counter-reset" => self.counter_reset = Some(value.into()),
+            "counter-increment" => self.counter_increment = Some(value.into()),
             "vertical-align" => {
                 self.vertical_align = match v {
                     "baseline" => VerticalAlign::Baseline,
