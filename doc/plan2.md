@@ -107,9 +107,9 @@ flowchart LR
 
 | 階段 | 內容 | 完成條件 |
 |---|---|---|
-| **D1** DOM API v1 | ABI v1、事件物件、innerHTML、導覽、更多事件；Rust SDK 與文件更新 | 單元測試；現有範例照常運作 |
-| **J1** JS runtime | boa 編成 `js.wasm`、runtime 協定（`rb_eval`）、時間與亂數 | 在瀏覽器中執行 `console.log` 與計算 |
-| **J2** JS DOM 綁定 | `document`、元素、事件、計時器；`<script>`（內嵌與外部）、`onclick` 等屬性、JS 版範例 | JS 版 todo 在瀏覽器中運作 |
+| **D1** DOM API v1 | ABI v1、事件物件、innerHTML、導覽、更多事件；Rust SDK 與文件更新 | 單元測試；現有範例照常運作 ✅ |
+| **J1** JS runtime | boa 編成 `js.wasm`、runtime 協定（`rb_eval`）、時間與亂數 | 在瀏覽器中執行 `console.log` 與計算 ✅ |
+| **J2** JS DOM 綁定 | `document`、元素、事件、計時器；`<script>`（內嵌與外部）、`onclick` 等屬性、JS 版範例 | JS 版 todo 在瀏覽器中運作 ✅ |
 | **H10** 圖片 | `<img>` 解碼、尺寸、載入 | 範例頁顯示 PNG / JPEG / GIF |
 | **H11** 表格 | grid 對應、span、表頭表尾 | 表格範例排版正確 |
 | **H12** 表單 | textarea、checkbox、radio、select、label、form 送出 | 表單範例可操作 |

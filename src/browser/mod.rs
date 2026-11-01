@@ -38,6 +38,8 @@ fn builtin(name: &str) -> Option<&'static [u8]> {
         "stopwatch.wasm" => include_bytes!("pages/stopwatch.wasm"),
         "events" => include_bytes!("pages/events.html"),
         "events.wasm" => include_bytes!("pages/events.wasm"),
+        "js-todo" => include_bytes!("pages/js-todo.html"),
+        "calc" => include_bytes!("pages/calc.html"),
         _ => return None,
     })
 }
@@ -139,6 +141,8 @@ struct Tab {
     js: Option<usize>,
     /// Number of `<script>`s found when the page loaded.
     script_count: usize,
+    /// Whether `DOMContentLoaded` / `load` have fired.
+    loaded: bool,
 }
 
 impl Tab {
@@ -247,6 +251,7 @@ impl Browser {
             pending: Default::default(),
             js: None,
             script_count: 0,
+            loaded: false,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -353,8 +358,14 @@ impl Browser {
         tab.js = None;
         let (id, serial) = (tab.id, tab.serial);
         let links = tab.doc.stylesheet_links();
-        let scripts = page_scripts(&tab.doc);
+        let mut scripts = page_scripts(&tab.doc);
+        // Inline handlers (onclick="…") are JavaScript too; register them
+        // first so scripts can rely on them.
+        if let Some(code) = inline_handlers(&tab.doc) {
+            scripts.insert(0, (Lang::JavaScript, None, code));
+        }
         tab.script_count = scripts.len();
+        tab.loaded = false;
         for (link, href) in links {
             let req = Request::Stylesheet {
                 tab: id,
@@ -392,10 +403,18 @@ impl Browser {
         self.dirty = true;
     }
 
-    /// Runs pending scripts of tab `i` from the front while they are ready.
+    /// Runs pending scripts of tab `i` from the front while they are ready,
+    /// then fires the load events once all have run.
     fn run_scripts(&mut self, i: usize, host: &mut dyn Host) {
         loop {
             let tab = &mut self.tabs[i];
+            if tab.pending.is_empty() {
+                if !tab.loaded {
+                    tab.loaded = true;
+                    self.fire_load(i, host);
+                }
+                return;
+            }
             if !tab.pending.front().is_some_and(|p| p.body.is_some()) {
                 return;
             }
@@ -415,10 +434,30 @@ impl Browser {
                     self.run_js(i, &source, &p.name, host);
                 }
             }
-            if i >= self.tabs.len() || self.tabs[i].pending.is_empty() {
+            if i >= self.tabs.len() {
                 return;
             }
         }
+    }
+
+    /// `DOMContentLoaded` at the document, then `load` at the body.
+    fn fire_load(&mut self, i: usize, host: &mut dyn Host) {
+        if i != self.active || self.tabs[i].scripts.is_empty() {
+            return;
+        }
+        self.dispatch(
+            crate::dom::Dom::ROOT,
+            "domcontentloaded",
+            EventInit::default(),
+            host,
+        );
+        let body = self.tabs[self.active].doc.dom.body();
+        self.dispatch(
+            body.unwrap_or(crate::dom::Dom::ROOT),
+            "load",
+            EventInit::default(),
+            host,
+        );
     }
 
     fn wall_offset(&self, host: &mut dyn Host) -> f64 {
@@ -1316,6 +1355,44 @@ fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
         .collect()
 }
 
+/// JavaScript registering every `on…="code"` attribute, if there are any.
+fn inline_handlers(doc: &Document) -> Option<String> {
+    let dom = &doc.dom;
+    let mut js = String::new();
+    for n in dom.descendants(crate::dom::Dom::ROOT) {
+        let Some(e) = dom.element(n) else { continue };
+        for (name, code) in &e.attrs {
+            if let Some(event) = name.strip_prefix("on").filter(|e| !e.is_empty()) {
+                js.push_str(&format!(
+                    "__rb_inline({n}, {}, {});\n",
+                    js_string(event),
+                    js_string(code)
+                ));
+            }
+        }
+    }
+    (!js.is_empty()).then_some(js)
+}
+
+/// A JavaScript string literal for `s`.
+fn js_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn t_js(tab: &Tab) -> usize {
     tab.js.unwrap_or(usize::MAX)
 }
@@ -1742,6 +1819,17 @@ mod tests {
     }
 
     #[test]
+    fn embedded_js_runtime_is_up_to_date() {
+        // js.wasm embeds prelude.js verbatim; if this fails, run
+        // scripts/build.sh to rebuild the runtime.
+        let prelude = include_bytes!("../lang/prelude.js");
+        assert!(
+            JS_RUNTIME.windows(prelude.len()).any(|w| w == prelude),
+            "src/browser/runtimes/js.wasm is stale: run scripts/build.sh"
+        );
+    }
+
+    #[test]
     fn javascript_runs_in_the_wasm_runtime() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);
@@ -1810,6 +1898,126 @@ mod tests {
 
         b.render(100.0, &mut h);
         assert!(h.logs.contains(&"timer true".to_string()), "{:?}", h.logs);
+    }
+
+    #[test]
+    fn javascript_calculator_with_inline_handlers() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.navigate("about:calc", &mut h);
+        b.render(0.0, &mut h);
+        let screen = |b: &Browser| b.tabs[b.active].doc.dom.text_content(page_el(b, "screen"));
+        assert_eq!(screen(&b), "0", "body onload ran: {:?}", h.logs);
+        // Click buttons by their label.
+        let mut click_label = |b: &mut Browser, label: &str| {
+            let doc = &b.tabs[b.active].doc;
+            let btn = doc
+                .dom
+                .descendants(Dom::ROOT)
+                .into_iter()
+                .find(|&n| doc.dom.tag(n) == Some("button") && doc.dom.text_content(n) == label)
+                .unwrap();
+            let r = doc.content_box(btn).unwrap();
+            let vp = b.viewport_rect();
+            let (x, y) = (
+                (vp.x + r.x + r.w / 2.0) as i32,
+                (vp.y + r.y + r.h / 2.0) as i32,
+            );
+            b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+            b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        };
+        for k in ["1", "2", "+", "3", "×", "4"] {
+            click_label(&mut b, k);
+        }
+        assert_eq!(screen(&b), "12+3*4");
+        click_label(&mut b, "=");
+        assert_eq!(screen(&b), "24");
+        // Keyboard: the document's keydown listener sees symbol keys.
+        let mut h2 = LogHost::default();
+        for k in ['-', '4'] {
+            let code = if k.is_ascii_digit() {
+                k as i32
+            } else {
+                key::CHAR_BASE + k as i32
+            };
+            b.event(
+                Event::KeyDown {
+                    key: code,
+                    mods: Modifiers::default(),
+                },
+                0.0,
+                &mut h2,
+            );
+        }
+        b.event(
+            Event::KeyDown {
+                key: key::ENTER,
+                mods: Modifiers::default(),
+            },
+            0.0,
+            &mut h2,
+        );
+        assert_eq!(screen(&b), "20");
+        assert!(
+            h.logs.is_empty() && h2.logs.is_empty(),
+            "{:?} {:?}",
+            h.logs,
+            h2.logs
+        );
+    }
+
+    #[test]
+    fn javascript_todo_page() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.navigate("about:js-todo", &mut h);
+        b.render(0.0, &mut h);
+        assert!(
+            h.logs.contains(&"JS todo ready with 3 items".to_string()),
+            "{:?}",
+            h.logs
+        );
+        let items = |b: &Browser| {
+            let doc = &b.tabs[b.active].doc;
+            doc.dom.children(page_el(b, "list")).len()
+        };
+        assert_eq!(items(&b), 3);
+        click_page_h(&mut b, &mut h, "new");
+        b.event(Event::Text("Ship <it>".into()), 0.0, &mut h);
+        b.event(
+            Event::KeyDown {
+                key: key::ENTER,
+                mods: Modifiers::default(),
+            },
+            0.0,
+            &mut h,
+        );
+        b.render(0.0, &mut h);
+        assert_eq!(items(&b), 4);
+        let list = b.tabs[b.active].doc.dom.text_content(page_el(&b, "list"));
+        assert!(list.contains("Ship <it>"), "escaped text: {list}");
+        // Delegated click on the first item's text marks it done.
+        let doc = &b.tabs[b.active].doc;
+        let first = doc.dom.children(page_el(&b, "list"))[0];
+        let span = doc.dom.children(first)[0];
+        let r = doc.content_box(span).unwrap();
+        let vp = b.viewport_rect();
+        click_at(
+            &mut b,
+            &mut h.inner,
+            RectF {
+                x: vp.x + r.x,
+                y: vp.y + r.y,
+                ..r
+            },
+        );
+        let left = b.tabs[b.active].doc.dom.text_content(page_el(&b, "left"));
+        assert_eq!(left, "3 of 4 left");
+        assert!(
+            !h.logs.iter().any(|l| l.contains("Uncaught")),
+            "{:?}",
+            h.logs
+        );
     }
 
     fn click_page_h(b: &mut Browser, h: &mut LogHost, id: &str) {

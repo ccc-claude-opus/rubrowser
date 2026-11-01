@@ -367,6 +367,34 @@
     call(l.fn, e.currentTarget, [e]);
   };
 
+  // Inline handler attributes (onclick="…"), registered by the browser.
+  global.__rb_inline = function (h, type, code) {
+    const el = wrap(h);
+    let fn;
+    try {
+      fn = new Function('event', code);
+    } catch (err) {
+      reportError(err);
+      return;
+    }
+    el.addEventListener(type, function (event) {
+      if (fn.call(this, event) === false) event.preventDefault();
+    });
+  };
+
+  // `window.onload = …` and friends.
+  function handlerProperty(target, name) {
+    let current = null;
+    Object.defineProperty(target, 'on' + name, {
+      get: () => current,
+      set: (fn) => {
+        if (current) document.removeEventListener(name, current);
+        current = typeof fn === 'function' ? fn : null;
+        if (current) document.addEventListener(name, current);
+      },
+    });
+  }
+
   // element.click() from script: run click listeners up the tree in JS.
   function dispatchSynthetic(target, type) {
     let stopped = false;
@@ -449,6 +477,7 @@
 
   const document = wrap(0);
   wrappers.set(0, document);
+  for (const name of ['load', 'domcontentloaded', 'keydown', 'click']) handlerProperty(global, name);
 
   Object.assign(global, {
     window: global,

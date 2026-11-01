@@ -2,12 +2,13 @@
 
 A browser based on wasm. (RUST)
 
-rubrowser draws an entire web browser on a **blank canvas** — a native window's pixel buffer, or a single HTML `<canvas>`. It lays out and paints **HTML + CSS** itself, and runs **WebAssembly instead of JavaScript**. Even the browser's own tabs, toolbar and address bar are an HTML/CSS document rendered by the same engine.
+rubrowser draws an entire web browser on a **blank canvas** — a native window's pixel buffer, or a single HTML `<canvas>`. It lays out and paints **HTML + CSS** itself, and **only executes WebAssembly**: page scripts are wasm modules, and **JavaScript runs inside a JS engine compiled to wasm** ([boa](https://crates.io/crates/boa_engine)). Even the browser's own tabs, toolbar and address bar are an HTML/CSS document rendered by the same engine.
 
 - HTML parsed by [`html5ever`](https://crates.io/crates/html5ever) into rubrowser's own DOM
 - CSS selectors and cascade with [`simplecss`](https://crates.io/crates/simplecss); block and flex layout with [`taffy`](https://crates.io/crates/taffy); inline layout written from scratch
 - Text rendered with [`fontdue`](https://crates.io/crates/fontdue) and the bundled DejaVu fonts
 - Page scripts are wasm modules run by [`wasmi`](https://crates.io/crates/wasmi), sandboxed with fuel and memory limits
+- `<script>` JavaScript, inline `onclick` handlers and a familiar DOM API, executed by `js.wasm` (see [doc/javascript.md](doc/javascript.md))
 
 ## Install and run
 
@@ -25,11 +26,23 @@ Open a file or URL directly:
 rubrowser page.html
 ```
 
-Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`.
+Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`, `about:events` (Rust/wasm) and `about:js-todo`, `about:calc` (JavaScript).
 
 Shortcuts: <kbd>Cmd/Ctrl</kbd>+<kbd>L</kbd> address bar, +<kbd>T</kbd> new tab, +<kbd>W</kbd> close tab, +<kbd>R</kbd> reload, +<kbd>[</kbd>/<kbd>]</kbd> back/forward, <kbd>Tab</kbd> moves focus.
 
-## Scripts in Rust instead of JavaScript
+## JavaScript
+
+```html
+<button onclick="count()">+1</button> <span id="n">0</span>
+<script>
+  let n = 0;
+  function count() { document.getElementById('n').textContent = ++n; }
+</script>
+```
+
+The browser compiles nothing at runtime: it loads the bundled `js.wasm` (boa) and hands it the source. See [doc/javascript.md](doc/javascript.md).
+
+## Scripts in Rust
 
 ```html
 <button id="inc">+1</button> <span id="count">0</span>

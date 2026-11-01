@@ -105,7 +105,9 @@ const NAMED = {
 function keyCode(e) {
   if (e.key in NAMED) return NAMED[e.key];
   if (/^Key[A-Z]$/.test(e.code)) return e.code.charCodeAt(3);
-  if (/^Digit[0-9]$/.test(e.code)) return e.code.charCodeAt(5);
+  if (/^Digit[0-9]$/.test(e.code) && !e.shiftKey) return e.code.charCodeAt(5);
+  // Other printable characters: CHAR_BASE + code point.
+  if ([...e.key].length === 1) return 1000 + e.key.codePointAt(0);
   return 0;
 }
 

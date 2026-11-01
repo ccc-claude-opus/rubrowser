@@ -338,6 +338,7 @@ fn key_code(k: &Key) -> i32 {
                 (Some(']'), None) => key::RIGHT_BRACKET,
                 (Some(' '), None) => key::SPACE,
                 (Some(c), None) if c.is_ascii_alphanumeric() => c.to_ascii_uppercase() as i32,
+                (Some(c), None) if !c.is_control() => key::CHAR_BASE + c as i32,
                 _ => 0,
             }
         }

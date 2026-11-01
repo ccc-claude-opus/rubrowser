@@ -24,7 +24,9 @@ jobs:
       - name: Engine without a platform
         run: cargo check --no-default-features --features core
       - name: Page scripts (sdk only)
-        run: cargo build --profile page --target wasm32-unknown-unknown --no-default-features --features sdk --example counter --example todo --example stopwatch
+        run: cargo build --profile page --target wasm32-unknown-unknown --no-default-features --features sdk --example counter --example todo --example stopwatch --example events
+      - name: JavaScript runtime (boa -> wasm)
+        run: cargo build --profile page --target wasm32-unknown-unknown --no-default-features --features js-runtime --example js_runtime
       - name: Web version
         run: cargo rustc --lib --release --target wasm32-unknown-unknown --no-default-features --features web --crate-type cdylib
       - name: Package

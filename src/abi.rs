@@ -59,6 +59,8 @@ pub mod key {
     pub const F5: i32 = 116;
     pub const LEFT_BRACKET: i32 = 219;
     pub const RIGHT_BRACKET: i32 = 221;
+    /// Other printable characters: `CHAR_BASE + Unicode scalar value`.
+    pub const CHAR_BASE: i32 = 1000;
 }
 
 /// DOM-style `KeyboardEvent.key` name for a key code.
@@ -82,6 +84,10 @@ pub fn key_name(code: i32, shift: bool) -> String {
         key::F5 => "F5",
         key::LEFT_BRACKET => "[",
         key::RIGHT_BRACKET => "]",
+        c if c >= key::CHAR_BASE => {
+            return char::from_u32((c - key::CHAR_BASE) as u32)
+                .map_or_else(|| "Unidentified".to_string(), |ch| ch.to_string());
+        }
         c => {
             return match char::from_u32(c as u32) {
                 Some(ch) if ch.is_ascii_alphabetic() && !shift => {
@@ -93,4 +99,17 @@ pub fn key_name(code: i32, shift: bool) -> String {
         }
     };
     named.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names() {
+        assert_eq!(key_name('A' as i32, false), "a");
+        assert_eq!(key_name('A' as i32, true), "A");
+        assert_eq!(key_name(key::ENTER, false), "Enter");
+        assert_eq!(key_name(key::CHAR_BASE + '+' as i32, true), "+");
+    }
 }

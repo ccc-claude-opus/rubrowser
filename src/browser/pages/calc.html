@@ -1,0 +1,70 @@
+<!doctype html>
+<html>
+<head>
+<title>Calculator (JavaScript)</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 48px; background: #202124; color: #e8eaed; }
+  .calc { width: 280px; padding: 16px; background: #303134; border-radius: 16px; }
+  #screen { font-family: monospace; font-size: 32px; text-align: right; padding: 12px; margin-bottom: 12px;
+            background: #202124; border-radius: 8px; min-height: 40px; overflow: hidden; white-space: nowrap; }
+  .keys { display: flex; flex-wrap: wrap; gap: 8px; }
+  .keys button { width: 62px; height: 48px; font-size: 20px; border: none; border-radius: 10px;
+                 background: #3c4043; color: #e8eaed; }
+  .keys button:hover { background: #4a4e52; }
+  .keys button.op { background: #8ab4f8; color: #202124; }
+  .keys button.op:hover { background: #aecbfa; }
+  .keys button.wide { width: 132px; }
+  p { color: #9aa0a6; }
+</style>
+</head>
+<body onload="clearAll()">
+  <div class="calc">
+    <div id="screen"></div>
+    <div class="keys">
+      <button onclick="clearAll()">C</button>
+      <button onclick="press('(')">(</button>
+      <button onclick="press(')')">)</button>
+      <button class="op" onclick="press('/')">÷</button>
+      <button onclick="press('7')">7</button>
+      <button onclick="press('8')">8</button>
+      <button onclick="press('9')">9</button>
+      <button class="op" onclick="press('*')">×</button>
+      <button onclick="press('4')">4</button>
+      <button onclick="press('5')">5</button>
+      <button onclick="press('6')">6</button>
+      <button class="op" onclick="press('-')">−</button>
+      <button onclick="press('1')">1</button>
+      <button onclick="press('2')">2</button>
+      <button onclick="press('3')">3</button>
+      <button class="op" onclick="press('+')">+</button>
+      <button class="wide" onclick="press('0')">0</button>
+      <button onclick="press('.')">.</button>
+      <button class="op" onclick="equals()">=</button>
+    </div>
+  </div>
+  <p>Buttons use inline <code>onclick</code> attributes; keys work too.</p>
+<script>
+let expr = '';
+const screen = document.getElementById('screen');
+const show = () => { screen.textContent = expr || '0'; };
+function press(k) { expr += k; show(); }
+function clearAll() { expr = ''; show(); }
+function equals() {
+  try {
+    // Only digits, operators and parentheses reach here.
+    const value = Function('"use strict"; return (' + expr + ')')();
+    expr = Number.isFinite(value) ? String(Math.round(value * 1e10) / 1e10) : 'Error';
+  } catch (e) {
+    expr = 'Error';
+  }
+  show();
+}
+document.addEventListener('keydown', (e) => {
+  if (/^[0-9+\-*/().]$/.test(e.key)) press(e.key);
+  else if (e.key === 'Enter') equals();
+  else if (e.key === 'Backspace') { expr = expr.slice(0, -1); show(); }
+  else if (e.key === 'Escape') clearAll();
+});
+</script>
+</body>
+</html>

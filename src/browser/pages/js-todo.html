@@ -1,0 +1,116 @@
+<!doctype html>
+<html>
+<head>
+<title>Todo (JavaScript)</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 48px; background: #f6f7f9; color: #202124; }
+  .card { max-width: 480px; padding: 24px; background: #fff; border: 1px solid #dadce0; border-radius: 12px; }
+  h1 { font-size: 22px; margin: 0 0 4px 0; }
+  .sub { color: #5f6368; margin: 0 0 16px 0; }
+  .row { display: flex; gap: 8px; }
+  #new { flex: 1; font-size: 15px; padding: 6px 10px; border-radius: 6px; }
+  #add { font-size: 15px; padding: 6px 16px; border-radius: 6px; background: #f9ab00; color: #202124; border: none; }
+  #add:hover { background: #fbbc04; }
+  ul { list-style: none; padding: 0; margin: 16px 0 8px 0; }
+  li { display: flex; align-items: center; padding: 8px 4px; border-bottom: 1px solid #eceef1; }
+  li span { flex: 1; cursor: pointer; font-size: 15px; }
+  li.done span { color: #9aa0a6; text-decoration: line-through; }
+  li button { border: none; background: transparent; color: #9aa0a6; border-radius: 4px; }
+  li button:hover { background: #fce8e6; color: #c5221f; }
+  .filters { display: flex; gap: 6px; margin-top: 8px; }
+  .filters button { border: 1px solid #dadce0; background: #fff; border-radius: 12px; padding: 2px 10px; font-size: 12px; }
+  .filters button.on { border-color: #f9ab00; background: #fef7e0; }
+  #left { color: #5f6368; font-size: 13px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Todo</h1>
+    <p class="sub">Written in JavaScript, run by boa compiled to WebAssembly.</p>
+    <div class="row">
+      <input id="new" placeholder="What needs to be done?">
+      <button id="add">Add</button>
+    </div>
+    <ul id="list"></ul>
+    <div id="left"></div>
+    <div class="filters">
+      <button data-filter="all" class="on">All</button>
+      <button data-filter="active">Active</button>
+      <button data-filter="done">Done</button>
+    </div>
+  </div>
+<script>
+class TodoList {
+  constructor(root) {
+    this.items = [];
+    this.filter = 'all';
+    this.list = root.querySelector('#list');
+    this.left = root.querySelector('#left');
+  }
+
+  add(text) {
+    this.items.push({ id: this.items.length + 1, text, done: false });
+    this.render();
+  }
+
+  toggle(id) {
+    const item = this.items.find((i) => i.id === id);
+    if (item) item.done = !item.done;
+    this.render();
+  }
+
+  remove(id) {
+    this.items = this.items.filter((i) => i.id !== id);
+    this.render();
+  }
+
+  render() {
+    const visible = this.items.filter((i) =>
+      this.filter === 'all' ? true : this.filter === 'done' ? i.done : !i.done);
+    this.list.innerHTML = visible
+      .map(({ id, text, done }) =>
+        `<li data-id="${id}" class="${done ? 'done' : ''}"><span>${escape(text)}</span><button>✕</button></li>`)
+      .join('');
+    const left = this.items.filter((i) => !i.done).length;
+    this.left.textContent = `${left} of ${this.items.length} left`;
+  }
+}
+
+const escape = (s) => s.replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]);
+
+const todos = new TodoList(document.body);
+const input = document.getElementById('new');
+
+function addFromInput() {
+  const text = input.value.trim();
+  if (!text) return;
+  todos.add(text);
+  input.value = '';
+}
+
+document.getElementById('add').addEventListener('click', addFromInput);
+input.addEventListener('change', addFromInput);
+
+// One listener for the whole list (event delegation).
+todos.list.addEventListener('click', (e) => {
+  const li = e.target.closest('li');
+  if (!li) return;
+  const id = Number(li.dataset.id);
+  if (e.target.tagName === 'BUTTON') todos.remove(id);
+  else todos.toggle(id);
+});
+
+for (const b of document.querySelectorAll('.filters button')) {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.filters button').forEach((x) => x.classList.remove('on'));
+    b.classList.add('on');
+    todos.filter = b.dataset.filter;
+    todos.render();
+  });
+}
+
+['Parse HTML', 'Compute styles', 'Lay out boxes'].forEach((t) => todos.add(t));
+console.log('JS todo ready with', todos.items.length, 'items');
+</script>
+</body>
+</html>

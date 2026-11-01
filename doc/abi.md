@@ -102,7 +102,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `keydown` | 頁面有鍵盤焦點時按鍵；目標是焦點元素或 `<body>` | 鍵碼、key 名稱、修飾鍵 |
 | `focus` / `blur` | 元素取得／失去焦點 | — |
 
-鍵碼與修飾鍵位元定義在 `rubrowser::abi`（`key::ENTER = 13`、`modifier::SHIFT = 1` 等）。
+鍵碼與修飾鍵位元定義在 `rubrowser::abi`（`key::ENTER = 13`、`modifier::SHIFT = 1` 等）。字母與數字的鍵碼是大寫 ASCII；其他可列印字元（`+`、`.` 等）的鍵碼是 `key::CHAR_BASE`（1000）加上字元碼。
 
 ### 其他
 
@@ -115,6 +115,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `navigate(ptr, len)` | 以目前頁面為基準開啟網址 |
 | `log(ptr, len)` | 輸出到主控台（原生版為 stderr，網頁版為瀏覽器 console） |
 | `now() -> f64` | 瀏覽器啟動後的毫秒數 |
+| `wall_time() -> f64` | 真實時間：Unix epoch 起的毫秒數（`Date.now()`） |
 
 ## 4. 沙箱
 
@@ -146,3 +147,15 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
     ;; event_int(0) is the event's target.
     (call $set_text (call $event_int (i32.const 0)) (i32.const 16) (i32.const 8))))
 ```
+
+## 6. 語言 runtime 協定
+
+JavaScript 等直譯式語言以「runtime 模組」執行：一個額外匯出下列函式的 wasm 模組（見 [javascript.md](javascript.md)）。
+
+| 匯出 | 說明 |
+|---|---|
+| `rb_alloc(len: i32) -> i32` | 配置 `len` 位元組，讓瀏覽器寫入原始碼與檔名 |
+| `rb_eval(src, src_len, name, name_len)` | 執行一段原始碼；例外自行回報到 `log` |
+| `rb_event` / `rb_timer` | 和一般模組相同，由 runtime 轉給語言內的處理函式 |
+
+瀏覽器每頁每種語言只建立一個 runtime instance，依文件順序對每個 `<script>` 呼叫一次 `rb_eval`。runtime 的 fuel 上限是每次呼叫 20 億條指令、記憶體 512 MiB。
