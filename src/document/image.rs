@@ -94,12 +94,15 @@ impl ImageState {
     }
 }
 
+/// A resized copy of an image: (width, height, pixels).
+type Scaled = (u32, u32, Rc<Vec<u32>>);
+
 /// All images of a document, plus resized copies for painting.
 #[derive(Default)]
 pub struct Images {
     pub states: HashMap<NodeId, ImageState>,
     /// node → (width, height, pixels) at the last painted size.
-    scaled: RefCell<HashMap<NodeId, (u32, u32, Rc<Vec<u32>>)>>,
+    scaled: RefCell<HashMap<NodeId, Scaled>>,
 }
 
 impl Images {
