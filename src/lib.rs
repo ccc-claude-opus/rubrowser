@@ -12,6 +12,8 @@ pub mod abi;
 #[cfg(feature = "core")]
 pub mod browser;
 #[cfg(feature = "core")]
+pub mod dom;
+#[cfg(feature = "core")]
 pub mod gfx;
 #[cfg(feature = "core")]
 pub mod input;
