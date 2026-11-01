@@ -1,5 +1,8 @@
 //! Computed style of an element and how declarations change it.
 
+use std::collections::BTreeMap;
+use std::rc::Rc;
+
 use super::values::{self, Dim, FontContext, Rgba, four, tokens};
 use crate::text::{Family, FontKey};
 
@@ -271,6 +274,10 @@ pub struct Style {
     pub cursor: Cursor,
     pub list_style: ListStyle,
     pub visible: bool,
+    /// Custom properties (`--name`), inherited.
+    pub vars: Rc<BTreeMap<String, String>>,
+    /// Whether any declaration applied (used for pseudo-elements).
+    pub has_rules: bool,
 }
 
 impl Default for Style {
@@ -333,6 +340,8 @@ impl Default for Style {
             cursor: Cursor::Auto,
             list_style: ListStyle::Disc,
             visible: true,
+            vars: Rc::default(),
+            has_rules: false,
         }
     }
 }
@@ -357,6 +366,7 @@ impl Style {
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
             text_transform: parent.text_transform,
+            vars: parent.vars.clone(),
             ..Style::default()
         }
     }
@@ -390,6 +400,17 @@ impl Style {
     /// Applies one declaration. `parent` serves `inherit`; `root_font_size`
     /// serves `rem`. Unknown properties and invalid values are ignored.
     pub fn apply(&mut self, name: &str, value: &str, parent: &Style, root_font_size: f32) {
+        let env = super::ValueEnv {
+            root_font: root_font_size,
+            vw: 1280.0,
+            vh: 800.0,
+        };
+        self.apply_in(name, value, parent, &env);
+    }
+
+    /// Applies one declaration with the viewport known (for `vw`/`vh`).
+    pub fn apply_in(&mut self, name: &str, value: &str, parent: &Style, env: &super::ValueEnv) {
+        let root_font_size = env.root_font;
         let value = value.trim();
         let lower = value.to_ascii_lowercase();
         match lower.as_str() {
@@ -409,6 +430,8 @@ impl Style {
         let fc = FontContext {
             em: self.font_size,
             rem: root_font_size,
+            vw: env.vw,
+            vh: env.vh,
         };
         let v = lower.as_str();
         let dim = |s: &str| values::dim(s, fc);
@@ -658,6 +681,8 @@ impl Style {
                 let pfc = FontContext {
                     em: parent.font_size,
                     rem: root_font_size,
+                    vw: env.vw,
+                    vh: env.vh,
                 };
                 if let Some(s) = font_size(v, parent.font_size, pfc) {
                     self.font_size = s;
@@ -666,7 +691,7 @@ impl Style {
             "font-weight" => set(&mut self.bold, font_weight(v, parent.bold)),
             "font-style" => self.italic = v == "italic" || v.starts_with("oblique"),
             "font-family" => self.family = font_family(v),
-            "font" => self.font_shorthand(v, parent, root_font_size),
+            "font" => self.font_shorthand(v, parent, env),
             "line-height" => set(&mut self.line_height, line_height(v, fc)),
             "text-align" => {
                 self.text_align = match v {
@@ -788,11 +813,14 @@ impl Style {
     }
 
     /// `font: [style] [weight] size[/line-height] family`.
-    fn font_shorthand(&mut self, v: &str, parent: &Style, root_font_size: f32) {
+    fn font_shorthand(&mut self, v: &str, parent: &Style, env: &super::ValueEnv) {
+        let root_font_size = env.root_font;
         let t = tokens(v);
         let pfc = FontContext {
             em: parent.font_size,
             rem: root_font_size,
+            vw: env.vw,
+            vh: env.vh,
         };
         let Some(size_at) = t.iter().position(|s| {
             let size = s.split('/').next().unwrap_or("");
@@ -820,6 +848,8 @@ impl Style {
         let fc = FontContext {
             em: self.font_size,
             rem: root_font_size,
+            vw: env.vw,
+            vh: env.vh,
         };
         if let Some(lh) = parts.next().and_then(|s| line_height(s, fc)) {
             self.line_height = lh;
@@ -1068,9 +1098,8 @@ fn font_size(v: &str, parent: f32, pfc: FontContext) -> Option<f32> {
         "larger" => parent * 1.2,
         _ => {
             return match values::dim(v, pfc)? {
-                Dim::Px(px) => Some(px),
-                Dim::Percent(p) => Some(parent * p / 100.0),
                 Dim::Auto => None,
+                d => Some(d.px_or_zero(parent)),
             };
         }
     };
@@ -1112,9 +1141,8 @@ fn line_height(v: &str, fc: FontContext) -> Option<LineHeight> {
         return Some(LineHeight::Number(n));
     }
     match values::dim(v, fc)? {
-        Dim::Px(px) => Some(LineHeight::Px(px)),
-        Dim::Percent(p) => Some(LineHeight::Px(fc.em * p / 100.0)),
         Dim::Auto => None,
+        d => Some(LineHeight::Px(d.px_or_zero(fc.em))),
     }
 }
 

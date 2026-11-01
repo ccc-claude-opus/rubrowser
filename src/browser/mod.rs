@@ -74,7 +74,9 @@ enum Request {
     Stylesheet {
         tab: u64,
         serial: u64,
-        link: NodeId,
+        /// The `<link>`, or `None` for an `@import`.
+        link: Option<NodeId>,
+        url: String,
     },
     Script {
         tab: u64,
@@ -434,12 +436,14 @@ impl Browser {
         tab.script_count = scripts.len();
         tab.loaded = false;
         for (link, href) in links {
+            let target = url::resolve(url, &href);
             let req = Request::Stylesheet {
                 tab: id,
                 serial,
-                link,
+                link: Some(link),
+                url: target.clone(),
             };
-            self.fetch(req, &url::resolve(url, &href), host);
+            self.fetch(req, &target, host);
         }
         // Scripts are fetched in parallel but run in document order.
         for (slot, (lang, src, inline)) in scripts.into_iter().enumerate() {
@@ -640,7 +644,12 @@ impl Browser {
                 };
                 self.set_page(i, &html, &url, host);
             }
-            Request::Stylesheet { tab, serial, link } => {
+            Request::Stylesheet {
+                tab,
+                serial,
+                link,
+                url,
+            } => {
                 let Some(i) = self
                     .tab_index(tab)
                     .filter(|&i| self.tabs[i].serial == serial)
@@ -649,7 +658,10 @@ impl Browser {
                 };
                 if let Ok(bytes) = result {
                     let css = String::from_utf8_lossy(&bytes).into_owned();
-                    self.tabs[i].doc.add_stylesheet(link, css);
+                    match link {
+                        Some(link) => self.tabs[i].doc.add_stylesheet(link, css, &url),
+                        None => self.tabs[i].doc.add_import(&url, css),
+                    }
                     self.dirty = true;
                 }
             }
@@ -1634,6 +1646,16 @@ impl Browser {
         let tab = &mut self.tabs[self.active];
         let (id, serial) = (tab.id, tab.serial);
         let base = tab.doc.base_url();
+        for url in tab.doc.import_requests() {
+            let req = Request::Stylesheet {
+                tab: id,
+                serial,
+                link: None,
+                url: url.clone(),
+            };
+            self.fetch(req, &url, host);
+        }
+        let tab = &mut self.tabs[self.active];
         for (node, src) in tab.doc.image_requests() {
             let req = Request::Image {
                 tab: id,

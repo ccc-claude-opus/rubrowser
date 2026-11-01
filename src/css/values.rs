@@ -44,6 +44,8 @@ pub enum Dim {
     Auto,
     Px(f32),
     Percent(f32),
+    /// `calc()` mixing both: `px + percent% of the base`.
+    Calc(f32, f32),
 }
 
 impl Dim {
@@ -53,6 +55,7 @@ impl Dim {
             Dim::Auto => 0.0,
             Dim::Px(v) => v,
             Dim::Percent(p) => base * p / 100.0,
+            Dim::Calc(px, p) => px + base * p / 100.0,
         }
     }
 }
@@ -64,6 +67,9 @@ pub struct FontContext {
     pub em: f32,
     /// Root element font size, for `rem`.
     pub rem: f32,
+    /// Viewport size, for `vw` / `vh`.
+    pub vw: f32,
+    pub vh: f32,
 }
 
 /// Parses a number with an optional unit into a [`Dim`].
@@ -71,6 +77,20 @@ pub fn dim(s: &str, fc: FontContext) -> Option<Dim> {
     let s = s.trim().to_ascii_lowercase();
     if s == "auto" || s == "none" {
         return Some(Dim::Auto);
+    }
+    if s.ends_with(')')
+        && (s.starts_with("calc(")
+            || s.starts_with("min(")
+            || s.starts_with("max(")
+            || s.starts_with("clamp("))
+    {
+        let lin = Calc {
+            s: s.as_bytes(),
+            i: 0,
+            fc,
+        }
+        .expr()?;
+        return Some(lin.dim());
     }
     if let Some(n) = s.strip_suffix('%') {
         return n.trim().parse().ok().map(Dim::Percent);
@@ -90,9 +110,212 @@ pub fn dim(s: &str, fc: FontContext) -> Option<Dim> {
         "cm" => v * 96.0 / 2.54,
         "mm" => v * 96.0 / 25.4,
         "ex" | "ch" => v * fc.em * 0.5,
+        "vw" => v * fc.vw / 100.0,
+        "vh" => v * fc.vh / 100.0,
+        "vmin" => v * fc.vw.min(fc.vh) / 100.0,
+        "vmax" => v * fc.vw.max(fc.vh) / 100.0,
+        "q" => v * 96.0 / 101.6,
         _ => return None,
     };
     Some(Dim::Px(px))
+}
+
+/// A linear length `px + pct%` (or a plain number) inside `calc()`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Lin {
+    px: f32,
+    pct: f32,
+    /// A unitless number (multiplier).
+    num: bool,
+}
+
+impl Lin {
+    fn dim(self) -> Dim {
+        if self.pct == 0.0 {
+            Dim::Px(self.px)
+        } else if self.px == 0.0 {
+            Dim::Percent(self.pct)
+        } else {
+            Dim::Calc(self.px, self.pct)
+        }
+    }
+}
+
+/// A recursive-descent evaluator for `calc()`, `min()`, `max()`, `clamp()`.
+struct Calc<'a> {
+    s: &'a [u8],
+    i: usize,
+    fc: FontContext,
+}
+
+impl Calc<'_> {
+    fn ws(&mut self) {
+        while self.s.get(self.i).is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i += 1;
+        }
+    }
+
+    fn expr(&mut self) -> Option<Lin> {
+        self.ws();
+        let mut acc = self.term()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b'+') | Some(b'-') => {
+                    let neg = self.s[self.i] == b'-';
+                    self.i += 1;
+                    let t = self.term()?;
+                    let k = if neg { -1.0 } else { 1.0 };
+                    acc = Lin {
+                        px: acc.px + k * t.px,
+                        pct: acc.pct + k * t.pct,
+                        num: acc.num && t.num,
+                    };
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    fn term(&mut self) -> Option<Lin> {
+        let mut acc = self.factor()?;
+        loop {
+            self.ws();
+            match self.s.get(self.i) {
+                Some(b'*') => {
+                    self.i += 1;
+                    let f = self.factor()?;
+                    acc = if acc.num {
+                        Lin {
+                            px: f.px * acc.px,
+                            pct: f.pct * acc.px,
+                            num: f.num,
+                        }
+                    } else if f.num {
+                        Lin {
+                            px: acc.px * f.px,
+                            pct: acc.pct * f.px,
+                            num: false,
+                        }
+                    } else {
+                        return None;
+                    };
+                }
+                Some(b'/') => {
+                    self.i += 1;
+                    let f = self.factor()?;
+                    if !f.num || f.px == 0.0 {
+                        return None;
+                    }
+                    acc = Lin {
+                        px: acc.px / f.px,
+                        pct: acc.pct / f.px,
+                        num: acc.num,
+                    };
+                }
+                _ => return Some(acc),
+            }
+        }
+    }
+
+    fn factor(&mut self) -> Option<Lin> {
+        self.ws();
+        let rest = std::str::from_utf8(&self.s[self.i..]).ok()?;
+        for (name, kind) in [
+            ("calc(", 0),
+            ("min(", 1),
+            ("max(", 2),
+            ("clamp(", 3),
+            ("(", 0),
+        ] {
+            if rest.starts_with(name) {
+                self.i += name.len();
+                let mut args = vec![self.expr()?];
+                self.ws();
+                while self.s.get(self.i) == Some(&b',') {
+                    self.i += 1;
+                    args.push(self.expr()?);
+                    self.ws();
+                }
+                if self.s.get(self.i) != Some(&b')') {
+                    return None;
+                }
+                self.i += 1;
+                return pick(kind, &args);
+            }
+        }
+        // A number with an optional unit.
+        let start = self.i;
+        if matches!(self.s.get(self.i), Some(b'+') | Some(b'-')) {
+            self.i += 1;
+        }
+        while self
+            .s
+            .get(self.i)
+            .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'.' || *c == b'%')
+        {
+            self.i += 1;
+        }
+        let tok = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+        if let Ok(n) = tok.parse::<f32>() {
+            return Some(Lin {
+                px: n,
+                pct: 0.0,
+                num: true,
+            });
+        }
+        match dim(tok, self.fc)? {
+            Dim::Px(px) => Some(Lin {
+                px,
+                pct: 0.0,
+                num: false,
+            }),
+            Dim::Percent(p) => Some(Lin {
+                px: 0.0,
+                pct: p,
+                num: false,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// `min`/`max`/`clamp` of linear values; exact when all are pixels,
+/// otherwise the percentage-free argument wins where it can.
+fn pick(kind: u8, args: &[Lin]) -> Option<Lin> {
+    let all_px = args.iter().all(|a| a.pct == 0.0);
+    match kind {
+        0 => args.first().copied(),
+        1 | 2 if all_px => {
+            let v = args.iter().map(|a| a.px);
+            let px = if kind == 1 {
+                v.fold(f32::INFINITY, f32::min)
+            } else {
+                v.fold(f32::NEG_INFINITY, f32::max)
+            };
+            Some(Lin {
+                px,
+                pct: 0.0,
+                num: args.iter().all(|a| a.num),
+            })
+        }
+        // Mixed: prefer the percentage term for min() (responsive widths
+        // such as min(100%, 600px)), the pixel term for max().
+        1 => args.iter().find(|a| a.pct != 0.0).copied(),
+        2 => args.iter().find(|a| a.pct == 0.0).copied(),
+        3 if args.len() == 3 => {
+            if all_px {
+                Some(Lin {
+                    px: args[1].px.clamp(args[0].px, args[2].px.max(args[0].px)),
+                    pct: 0.0,
+                    num: false,
+                })
+            } else {
+                Some(args[1])
+            }
+        }
+        _ => None,
+    }
 }
 
 /// Parses a length that must resolve to pixels (no `auto`, no `%`).
@@ -150,7 +373,23 @@ mod tests {
     const FC: FontContext = FontContext {
         em: 10.0,
         rem: 16.0,
+        vw: 1000.0,
+        vh: 500.0,
     };
+
+    #[test]
+    fn calc_and_viewport_units() {
+        assert_eq!(dim("10vw", FC), Some(Dim::Px(100.0)));
+        assert_eq!(dim("calc(2em + 5px)", FC), Some(Dim::Px(25.0)));
+        assert_eq!(dim("calc(100% - 20px)", FC), Some(Dim::Calc(-20.0, 100.0)));
+        assert_eq!(dim("calc(50% * 2)", FC), Some(Dim::Percent(100.0)));
+        assert_eq!(dim("calc((1rem + 4px) / 2)", FC), Some(Dim::Px(10.0)));
+        assert_eq!(dim("min(10px, 2em)", FC), Some(Dim::Px(10.0)));
+        assert_eq!(dim("max(10px, 2em)", FC), Some(Dim::Px(20.0)));
+        assert_eq!(dim("clamp(10px, 50px, 30px)", FC), Some(Dim::Px(30.0)));
+        assert_eq!(dim("min(100%, 600px)", FC), Some(Dim::Percent(100.0)));
+        assert_eq!(dim("calc(1px +)", FC), None);
+    }
 
     #[test]
     fn lengths() {

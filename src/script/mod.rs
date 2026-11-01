@@ -351,9 +351,13 @@ fn select(doc: &Document, selector: &str) -> Vec<NodeId> {
 
 /// Sets (or with an empty value removes) one property in a `style` attribute.
 fn set_style_property(style: &str, prop: &str, value: &str) -> String {
-    let mut out: Vec<String> = simplecss::DeclarationTokenizer::from(style)
+    let mut out: Vec<String> = css::syntax::parse_declarations(style, None)
+        .into_iter()
         .filter(|d| !d.name.eq_ignore_ascii_case(prop))
-        .map(|d| format!("{}: {}", d.name, d.value))
+        .map(|d| {
+            let imp = if d.important { " !important" } else { "" };
+            format!("{}: {}{imp}", d.name, d.value)
+        })
         .collect();
     if !value.trim().is_empty() {
         out.push(format!("{prop}: {value}"));

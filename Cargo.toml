@@ -21,7 +21,6 @@ core = [
     "dep:fontdue",
     "dep:dejavu",
     "dep:html5ever",
-    "dep:simplecss",
     "dep:csscolorparser",
     "dep:taffy",
     "dep:image",
@@ -42,7 +41,6 @@ arboard = { version = "3", default-features = false, optional = true }
 fontdue = { version = "0.9", optional = true }
 dejavu = { version = "2.37", optional = true }
 html5ever = { version = "0.40", optional = true }
-simplecss = { version = "0.2", optional = true }
 csscolorparser = { version = "0.9", optional = true }
 taffy = { version = "0.15", optional = true }
 boa_engine = { version = "0.22", default-features = false, optional = true }

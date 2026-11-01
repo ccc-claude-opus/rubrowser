@@ -105,11 +105,13 @@ enum Piece {
 }
 
 fn style(styles: &[Option<Style>], node: NodeId) -> &Style {
-    static DEFAULT: std::sync::OnceLock<Style> = std::sync::OnceLock::new();
+    thread_local! {
+        static DEFAULT: &'static Style = Box::leak(Box::new(Style::default()));
+    }
     styles
         .get(node)
         .and_then(Option::as_ref)
-        .unwrap_or_else(|| DEFAULT.get_or_init(Style::default))
+        .unwrap_or_else(|| DEFAULT.with(|d| *d))
 }
 
 /// Splits items into pieces, applying `white-space` rules.

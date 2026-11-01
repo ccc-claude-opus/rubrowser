@@ -123,6 +123,7 @@ pub fn layout(
     height: f32,
     replaced: &Replaced,
 ) -> LayoutTree {
+    CALC_BASE.with(|b| b.set(width));
     let mut b = Builder {
         fixed: Vec::new(),
         replaced,
@@ -757,11 +758,24 @@ fn push_inline(parts: &mut Vec<Part>, item: Item) {
     }
 }
 
+thread_local! {
+    /// Viewport width while converting styles: mixed `calc(% + px)` values
+    /// cannot be expressed in taffy, so their pixel part is approximated
+    /// as a share of the viewport.
+    static CALC_BASE: std::cell::Cell<f32> = const { std::cell::Cell::new(1280.0) };
+}
+
+fn calc_percent(px: f32, pct: f32) -> f32 {
+    let base = CALC_BASE.with(|b| b.get()).max(1.0);
+    (pct + px * 100.0 / base) / 100.0
+}
+
 fn dim(d: Dim) -> Dimension {
     match d {
         Dim::Auto => Dimension::auto(),
         Dim::Px(v) => Dimension::length(v),
         Dim::Percent(p) => Dimension::percent(p / 100.0),
+        Dim::Calc(px, p) => Dimension::percent(calc_percent(px, p)),
     }
 }
 
@@ -770,6 +784,7 @@ fn lpa(d: Dim) -> LengthPercentageAuto {
         Dim::Auto => LengthPercentageAuto::auto(),
         Dim::Px(v) => LengthPercentageAuto::length(v),
         Dim::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
+        Dim::Calc(px, p) => LengthPercentageAuto::percent(calc_percent(px, p)),
     }
 }
 
@@ -778,6 +793,7 @@ fn lp(d: Dim) -> LengthPercentage {
         Dim::Auto => LengthPercentage::length(0.0),
         Dim::Px(v) => LengthPercentage::length(v),
         Dim::Percent(p) => LengthPercentage::percent(p / 100.0),
+        Dim::Calc(px, p) => LengthPercentage::percent(calc_percent(px, p)),
     }
 }
 

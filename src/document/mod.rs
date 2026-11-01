@@ -1,8 +1,11 @@
 //! A live document: DOM + styles + layout, with hover, scrolling and
 //! hit-testing. Used for both web pages and the browser's own chrome.
 
+use crate::css::media::{MediaEnv, MediaList};
+use crate::css::selector::PseudoElement;
 use crate::css::style::Cursor as CssCursor;
-use crate::css::{ElementState, Style, author_sheets, compute_styles};
+use crate::css::syntax::{Rule, Sheet, parse_stylesheet};
+use crate::css::{Cascade, ElementState, Matcher, Style, compute};
 use crate::dom::{Dom, NodeId, parse_html};
 use crate::gfx::Canvas;
 use crate::input::Cursor;
@@ -12,6 +15,7 @@ use crate::paint::{Painter, ScrollOffsets};
 use crate::text::Fonts;
 use crate::ui::TextField;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 mod forms;
 mod image;
@@ -35,8 +39,18 @@ pub struct Document {
     pub url: String,
     pub dom: Dom,
     /// Contents of loaded `<link rel=stylesheet>` elements.
-    linked_css: Vec<(NodeId, String)>,
+    linked_css: HashMap<NodeId, Rc<Sheet>>,
+    /// Parsed `<style>` elements: node → (text, sheet).
+    inline_css: HashMap<NodeId, (String, Rc<Sheet>)>,
+    /// Sheets loaded through `@import`, by URL.
+    imported: HashMap<String, Rc<Sheet>>,
+    /// `@import` URLs already requested.
+    requested_imports: std::collections::HashSet<String>,
+    /// The cascade index for the current sheets and viewport.
+    cascade: Option<(Vec<*const Sheet>, MediaEnv, Rc<Cascade>)>,
     styles: Vec<Option<Style>>,
+    /// `::before` / `::after` / `::marker` styles.
+    pub pseudo: HashMap<(NodeId, PseudoElement), Style>,
     tree: LayoutTree,
     state: ElementState,
     scroll: ScrollOffsets,
@@ -58,8 +72,13 @@ impl Document {
         Document {
             url: url.to_string(),
             dom,
-            linked_css: Vec::new(),
+            linked_css: HashMap::new(),
+            inline_css: HashMap::new(),
+            imported: HashMap::new(),
+            requested_imports: Default::default(),
+            cascade: None,
             styles: Vec::new(),
+            pseudo: HashMap::new(),
             tree: LayoutTree::default(),
             state: ElementState::default(),
             scroll: ScrollOffsets::new(),
@@ -101,6 +120,8 @@ impl Document {
         if self.size != (w, h) {
             self.size = (w, h);
             self.needs_layout = true;
+            // Media queries and viewport units may change.
+            self.needs_style = true;
         }
     }
 
@@ -124,9 +145,89 @@ impl Document {
             .collect()
     }
 
-    pub fn add_stylesheet(&mut self, link: NodeId, css: String) {
-        self.linked_css.push((link, css));
+    /// Delivers the text of a `<link rel=stylesheet>` loaded from `url`.
+    pub fn add_stylesheet(&mut self, link: NodeId, css: String, url: &str) {
+        self.linked_css
+            .insert(link, Rc::new(parse_stylesheet(&css, Some(url))));
         self.needs_style = true;
+    }
+
+    /// Delivers a sheet requested by `@import`.
+    pub fn add_import(&mut self, url: &str, css: String) {
+        self.imported
+            .insert(url.to_string(), Rc::new(parse_stylesheet(&css, Some(url))));
+        self.needs_style = true;
+    }
+
+    /// `@import` URLs of loaded sheets not requested yet.
+    pub fn import_requests(&mut self) -> Vec<String> {
+        let mut out = Vec::new();
+        let sheets: Vec<Rc<Sheet>> = self
+            .linked_css
+            .values()
+            .chain(self.inline_css.values().map(|(_, s)| s))
+            .chain(self.imported.values())
+            .cloned()
+            .collect();
+        for sheet in sheets {
+            for r in &sheet.rules {
+                if let Rule::Import(url, _) = r
+                    && self.requested_imports.insert(url.clone())
+                {
+                    out.push(url.clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Author stylesheets in cascade order, with the media they apply to.
+    fn author_sheets(&mut self) -> Vec<(Rc<Sheet>, MediaList)> {
+        let base = self.base_url();
+        let mut out = Vec::new();
+        for n in self.dom.descendants(Dom::ROOT) {
+            let media = MediaList::parse(self.dom.attr(n, "media").unwrap_or(""));
+            let sheet = match self.dom.tag(n) {
+                Some("style") => {
+                    let text = self.dom.text_content(n);
+                    match self.inline_css.get(&n) {
+                        Some((t, sheet)) if *t == text => sheet.clone(),
+                        _ => {
+                            let sheet = Rc::new(parse_stylesheet(&text, Some(&base)));
+                            self.inline_css.insert(n, (text, sheet.clone()));
+                            sheet
+                        }
+                    }
+                }
+                Some("link") => match self.linked_css.get(&n) {
+                    Some(sheet) if self.dom.attr(n, "disabled").is_none() => sheet.clone(),
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            self.push_with_imports(&sheet, media, &mut out, 0);
+        }
+        out
+    }
+
+    /// Adds `sheet` after the sheets it imports.
+    fn push_with_imports(
+        &self,
+        sheet: &Rc<Sheet>,
+        media: MediaList,
+        out: &mut Vec<(Rc<Sheet>, MediaList)>,
+        depth: u32,
+    ) {
+        if depth < 8 {
+            for r in &sheet.rules {
+                if let Rule::Import(url, m) = r
+                    && let Some(imported) = self.imported.get(url)
+                {
+                    self.push_with_imports(imported, m.clone(), out, depth + 1);
+                }
+            }
+        }
+        out.push((sheet.clone(), media));
     }
 
     pub fn style(&self, id: NodeId) -> Option<&Style> {
@@ -136,11 +237,34 @@ impl Document {
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
         if self.needs_style {
-            let sheets = author_sheets(&self.dom, &self.linked_css);
-            let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
-            let styles = compute_styles(&self.dom, &refs, &self.state);
-            if styles != self.styles {
-                self.styles = styles;
+            let sheets = self.author_sheets();
+            let env = MediaEnv {
+                width: self.size.0,
+                height: self.size.1,
+                scale: 1.0,
+                dark: false,
+            };
+            let keys: Vec<*const Sheet> = sheets.iter().map(|(s, _)| Rc::as_ptr(s)).collect();
+            let cascade = match &self.cascade {
+                Some((k, e, c)) if *k == keys && *e == env => c.clone(),
+                _ => {
+                    let c = Rc::new(Cascade::new(&sheets, &env));
+                    self.cascade = Some((keys, env, c.clone()));
+                    c
+                }
+            };
+            let forms = &self.forms;
+            let dom = &self.dom;
+            let checked = |n: NodeId| forms.checked(dom, n);
+            let cx = Matcher {
+                dom,
+                state: self.state,
+                checked: &checked,
+            };
+            let styles = compute(dom, &cascade, &cx, &env);
+            if styles.nodes != self.styles || styles.pseudo != self.pseudo {
+                self.styles = styles.nodes;
+                self.pseudo = styles.pseudo;
                 self.needs_layout = true;
             }
             self.needs_style = false;

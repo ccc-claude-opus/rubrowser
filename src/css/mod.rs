@@ -1,19 +1,37 @@
 //! CSS: stylesheets, selector matching, cascade and computed styles.
 //!
-//! Parsing and selector matching use `simplecss`. Stylesheets are kept as
-//! source text and parsed on each restyle (fast, and avoids self-referential
-//! storage of borrowed rules).
+//! Stylesheets are parsed once ([`syntax`]) and indexed by the key of each
+//! selector's subject (id, class, tag) so an element only tests the rules
+//! that could match it. Media queries are evaluated against the viewport
+//! when the index is built. Custom properties are inherited and `var()` is
+//! substituted when a declaration is applied.
 
+pub mod media;
+pub mod selector;
 pub mod style;
+pub mod syntax;
 pub mod values;
 
-use simplecss::{AttributeOperator, DeclarationTokenizer, PseudoClass, StyleSheet};
+use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
 use crate::dom::{Dom, NodeId};
+use media::{MediaEnv, MediaList};
+use selector::{Context, Key, PseudoElement, Selector};
 pub use style::Style;
+use syntax::{Decl, Rule, Sheet};
 
 /// The browser's default stylesheet.
 pub const UA_CSS: &str = include_str!("ua.css");
+
+thread_local! {
+    static UA_SHEET: Rc<Sheet> = Rc::new(syntax::parse_stylesheet(UA_CSS, None));
+}
+
+/// The parsed UA stylesheet.
+pub fn ua_sheet() -> Rc<Sheet> {
+    UA_SHEET.with(Rc::clone)
+}
 
 /// Dynamic element state that pseudo-classes depend on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,115 +41,214 @@ pub struct ElementState {
     pub focus: Option<NodeId>,
 }
 
-/// An element as seen by `simplecss` selector matching.
-#[derive(Clone, Copy)]
-struct El<'a> {
-    dom: &'a Dom,
-    id: NodeId,
-    state: &'a ElementState,
+/// Matching context: the DOM, element state and checked controls.
+pub struct Matcher<'a> {
+    pub dom: &'a Dom,
+    pub state: ElementState,
+    pub checked: &'a dyn Fn(NodeId) -> bool,
 }
 
-impl simplecss::Element for El<'_> {
-    fn parent_element(&self) -> Option<Self> {
-        let p = self.dom.parent(self.id)?;
-        self.dom.element(p)?;
-        Some(El { id: p, ..*self })
-    }
-
-    fn prev_sibling_element(&self) -> Option<Self> {
-        let s = self.dom.previous_element_sibling(self.id)?;
-        Some(El { id: s, ..*self })
-    }
-
-    fn has_local_name(&self, name: &str) -> bool {
+impl Context for Matcher<'_> {
+    fn dom(&self) -> &Dom {
         self.dom
-            .tag(self.id)
-            .is_some_and(|t| t.eq_ignore_ascii_case(name))
     }
-
-    fn attribute_matches(&self, name: &str, op: AttributeOperator<'_>) -> bool {
-        match self.dom.attr(self.id, name) {
-            Some(v) if name == "class" => match op {
-                // Classes may be separated by any whitespace.
-                AttributeOperator::Contains(c) => v.split_ascii_whitespace().any(|x| x == c),
-                _ => op.matches(v),
-            },
-            Some(v) => op.matches(v),
-            None => false,
-        }
+    fn is_hovered(&self, n: NodeId) -> bool {
+        self.state
+            .hover
+            .is_some_and(|h| self.dom.is_inclusive_ancestor(n, h))
     }
-
-    fn pseudo_class_matches(&self, class: PseudoClass<'_>) -> bool {
-        let within = |target: Option<NodeId>| {
-            target.is_some_and(|t| self.dom.is_inclusive_ancestor(self.id, t))
-        };
-        match class {
-            PseudoClass::FirstChild => self.dom.previous_element_sibling(self.id).is_none(),
-            PseudoClass::Link => {
-                self.has_local_name("a") && self.dom.attr(self.id, "href").is_some()
-            }
-            PseudoClass::Visited => false,
-            PseudoClass::Hover => within(self.state.hover),
-            PseudoClass::Active => within(self.state.active),
-            PseudoClass::Focus => self.state.focus == Some(self.id),
-            PseudoClass::Lang(_) => false,
-        }
+    fn is_active(&self, n: NodeId) -> bool {
+        self.state
+            .active
+            .is_some_and(|h| self.dom.is_inclusive_ancestor(n, h))
+    }
+    fn is_focused(&self, n: NodeId) -> bool {
+        self.state.focus == Some(n)
+    }
+    fn is_checked(&self, n: NodeId) -> bool {
+        (self.checked)(n)
     }
 }
 
 /// Whether `selector` matches element `id`. Used by scripts' `query`.
 pub fn matches(dom: &Dom, id: NodeId, selector: &str, state: &ElementState) -> bool {
+    let no = |_: NodeId| false;
+    let cx = Matcher {
+        dom,
+        state: *state,
+        checked: &no,
+    };
     dom.element(id).is_some()
-        && selector.split(',').any(|s| {
-            simplecss::Selector::parse(s.trim())
-                .is_some_and(|sel| sel.matches(&El { dom, id, state }))
+        && selector::parse_list(selector).is_some_and(|list| {
+            list.iter()
+                .any(|s| s.pseudo_element.is_none() && selector::matches(&cx, s, id))
         })
 }
 
-/// One matched declaration, with what decides its cascade order.
-struct Matched<'a> {
-    important: bool,
-    /// 0 = user agent, 1 = presentational attributes, 2 = author
-    /// sheet, 3 = `style` attribute.
+/// One rule of the index: a single selector with its declarations.
+struct Indexed {
+    selector: Selector,
+    decls: Rc<[Decl]>,
+    /// 0 = user agent, 2 = author (1 and 3 are hints and inline styles).
     origin: u8,
-    specificity: [u8; 3],
-    order: usize,
+    order: u32,
+}
+
+/// Every rule that applies at one viewport, filed by selector key.
+pub struct Cascade {
+    rules: Vec<Indexed>,
+    buckets: HashMap<Key, Vec<u32>>,
+    /// Whether any rule depends on :hover/:active/:focus.
+    pub dynamic: bool,
+}
+
+impl Cascade {
+    /// Indexes the UA sheet and `author` sheets (in order, with the media
+    /// list they were included with) for `env`.
+    pub fn new(author: &[(Rc<Sheet>, MediaList)], env: &MediaEnv) -> Cascade {
+        let mut c = Cascade {
+            rules: Vec::new(),
+            buckets: HashMap::new(),
+            dynamic: false,
+        };
+        let ua = ua_sheet();
+        c.add(&ua.rules, 0, env);
+        for (sheet, media) in author {
+            if media.matches(env) {
+                c.add(&sheet.rules, 2, env);
+            }
+        }
+        c
+    }
+
+    fn add(&mut self, rules: &[Rule], origin: u8, env: &MediaEnv) {
+        for r in rules {
+            match r {
+                Rule::Style { selectors, decls } => {
+                    for sel in selectors.iter() {
+                        let order = self.rules.len() as u32;
+                        self.buckets.entry(sel.key()).or_default().push(order);
+                        self.rules.push(Indexed {
+                            selector: sel.clone(),
+                            decls: decls.clone(),
+                            origin,
+                            order,
+                        });
+                    }
+                }
+                Rule::Media(list, inner) => {
+                    if list.matches(env) {
+                        self.add(inner, origin, env);
+                    }
+                }
+                Rule::Import(..) => {}
+            }
+        }
+    }
+
+    /// Indices of rules whose subject key fits element `n`.
+    fn candidates(&self, dom: &Dom, n: NodeId, out: &mut Vec<u32>) {
+        out.clear();
+        let Some(e) = dom.element(n) else { return };
+        let mut push = |k: Key| {
+            if let Some(v) = self.buckets.get(&k) {
+                out.extend_from_slice(v);
+            }
+        };
+        if let Some(id) = e.id() {
+            push(Key::Id(id.to_string()));
+        }
+        for c in e.classes() {
+            push(Key::Class(c.to_string()));
+        }
+        push(Key::Tag(e.name.clone()));
+        push(Key::Any);
+    }
+}
+
+/// Computed styles of a document.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Styles {
+    /// One entry per node: elements and text (their parent's style);
+    /// `None` when not rendered.
+    pub nodes: Vec<Option<Style>>,
+    /// `::before` / `::after` / `::marker` styles of elements that have them.
+    pub pseudo: HashMap<(NodeId, PseudoElement), Style>,
+}
+
+/// One declaration in cascade order.
+struct Matched<'a> {
+    rank: (u8, [u16; 3], u32),
     name: &'a str,
     value: &'a str,
 }
 
-/// Computes the style of every node. `sheets` are author stylesheets in
-/// document order (the UA sheet is added automatically). Returns one entry
-/// per node id; text nodes get their parent's style, others `None` when
-/// they are not rendered.
-pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<Option<Style>> {
-    let parsed: Vec<StyleSheet> = std::iter::once(UA_CSS)
-        .chain(sheets.iter().copied())
-        .map(StyleSheet::parse)
-        .collect();
-    let mut out: Vec<Option<Style>> = vec![None; dom.len()];
+/// Cascade rank: normal declarations by origin; `!important` ones above
+/// all normal ones, with the user agent's on top.
+fn rank(important: bool, origin: u8, specificity: [u16; 3], order: u32) -> (u8, [u16; 3], u32) {
+    let level = if important {
+        10 + match origin {
+            0 => 3,
+            3 => 2,
+            _ => 1,
+        }
+    } else {
+        origin
+    };
+    (level, specificity, order)
+}
+
+/// Inputs that `em`, `rem`, `vw` and `vh` depend on.
+#[derive(Clone, Copy, Debug)]
+pub struct ValueEnv {
+    pub root_font: f32,
+    pub vw: f32,
+    pub vh: f32,
+}
+
+/// Computes the style of every node.
+pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> Styles {
+    let mut out = Styles {
+        nodes: vec![None; dom.len()],
+        pseudo: HashMap::new(),
+    };
+    let mut venv = ValueEnv {
+        root_font: 16.0,
+        vw: env.width,
+        vh: env.height,
+    };
+    let mut candidates = Vec::new();
     let root_style = Style::default();
-    let mut root_font = root_style.font_size;
-    // Walk in document order so parents are styled before children.
-    let mut stack: Vec<(NodeId, Style)> = vec![(Dom::ROOT, root_style)];
-    while let Some((id, parent_style)) = stack.pop() {
-        let style = if dom.element(id).is_some() {
-            let s = cascade(dom, id, &parsed, state, &parent_style, root_font);
+    // Document order, parents before children.
+    let mut stack: Vec<(NodeId, Rc<Style>)> = vec![(Dom::ROOT, Rc::new(root_style))];
+    while let Some((id, parent)) = stack.pop() {
+        let mut style = if dom.element(id).is_some() {
+            cascade.candidates(dom, id, &mut candidates);
+            let s = cascade_element(dom, id, cascade, &candidates, cx, &parent, &venv, None);
             if dom.tag(id) == Some("html") {
-                root_font = s.font_size;
+                venv.root_font = s.font_size;
+            }
+            for pe in [
+                PseudoElement::Before,
+                PseudoElement::After,
+                PseudoElement::Marker,
+            ] {
+                let p = cascade_element(dom, id, cascade, &candidates, cx, &s, &venv, Some(pe));
+                if p.has_rules {
+                    out.pseudo.insert((id, pe), p);
+                }
             }
             s
         } else if dom.text(id).is_some() || id == Dom::ROOT {
-            parent_style.clone()
+            (*parent).clone()
         } else {
             continue;
         };
-        let mut style = style;
+        style.has_rules = false;
         // <details>: only the summary shows until it is opened.
         if let Some(p) = dom.parent(id).filter(|&p| dom.tag(p) == Some("details")) {
             let open = dom.attr(p, "open").is_some();
-            let is_summary = dom.tag(id) == Some("summary");
-            if is_summary {
+            if dom.tag(id) == Some("summary") {
                 style.list_style = if open {
                     style::ListStyle::DisclosureOpen
                 } else {
@@ -146,83 +263,178 @@ pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<O
         if style.display == style::Display::None {
             continue;
         }
+        let shared = Rc::new(style);
         for &c in dom.children(id).iter().rev() {
-            stack.push((c, style.clone()));
+            stack.push((c, shared.clone()));
         }
-        out[id] = Some(style);
+        out.nodes[id] = Some((*shared).clone());
     }
     out
 }
 
-fn cascade(
+/// Cascades element `id` (or its pseudo-element `pe`).
+#[allow(clippy::too_many_arguments)]
+fn cascade_element(
     dom: &Dom,
     id: NodeId,
-    sheets: &[StyleSheet],
-    state: &ElementState,
+    cascade: &Cascade,
+    candidates: &[u32],
+    cx: &Matcher,
     parent: &Style,
-    root_font: f32,
+    venv: &ValueEnv,
+    pe: Option<PseudoElement>,
 ) -> Style {
-    let el = El { dom, id, state };
     let mut decls: Vec<Matched> = Vec::new();
-    let mut order = 0;
-    for (i, sheet) in sheets.iter().enumerate() {
-        for rule in &sheet.rules {
-            order += 1;
-            if !rule.selector.matches(&el) {
-                continue;
-            }
-            for d in &rule.declarations {
-                decls.push(Matched {
-                    important: d.important,
-                    origin: if i == 0 { 0 } else { 2 },
-                    specificity: rule.selector.specificity(),
-                    order,
-                    name: d.name,
-                    value: d.value,
-                });
-            }
+    for &i in candidates {
+        let r = &cascade.rules[i as usize];
+        if r.selector.pseudo_element != pe || !selector::matches(cx, &r.selector, id) {
+            continue;
+        }
+        for d in r.decls.iter() {
+            decls.push(Matched {
+                rank: rank(d.important, r.origin, r.selector.specificity, r.order),
+                name: &d.name,
+                value: &d.value,
+            });
         }
     }
-    let hints = presentational_hints(dom, id);
-    for (name, value) in &hints {
-        order += 1;
-        decls.push(Matched {
-            important: false,
-            origin: 1,
-            specificity: [0; 3],
-            order,
-            name,
-            value,
-        });
-    }
-    let inline = dom.attr(id, "style").unwrap_or("");
-    for d in DeclarationTokenizer::from(inline) {
-        order += 1;
-        decls.push(Matched {
-            important: d.important,
-            origin: 3,
-            specificity: [0; 3],
-            order,
-            name: d.name,
-            value: d.value,
-        });
-    }
-    decls.sort_by_key(|d| (d.important, d.origin, d.specificity, d.order));
     let mut style = Style::inherit(parent);
+    if pe.is_some() {
+        if decls.is_empty() {
+            return style;
+        }
+        style.display = style::Display::Inline;
+    }
+    let hints;
+    let inline;
+    if pe.is_none() {
+        let base = cascade.rules.len() as u32;
+        hints = presentational_hints(dom, id);
+        for (k, (name, value)) in hints.iter().enumerate() {
+            decls.push(Matched {
+                rank: rank(false, 1, [0; 3], base + k as u32),
+                name,
+                value,
+            });
+        }
+        inline = dom
+            .attr(id, "style")
+            .map(|s| syntax::parse_declarations(s, None))
+            .unwrap_or_default();
+        for (k, d) in inline.iter().enumerate() {
+            decls.push(Matched {
+                rank: rank(d.important, 3, [0; 3], base + 1000 + k as u32),
+                name: &d.name,
+                value: &d.value,
+            });
+        }
+    }
+    decls.sort_by_key(|d| d.rank);
+    style.has_rules = !decls.is_empty();
+
+    // Custom properties first (later ones win), inherited from the parent.
+    if decls.iter().any(|d| d.name.starts_with("--")) {
+        let mut vars: BTreeMap<String, String> = (*parent.vars).clone();
+        for d in decls.iter().filter(|d| d.name.starts_with("--")) {
+            vars.insert(d.name.to_string(), d.value.to_string());
+        }
+        style.vars = Rc::new(vars);
+    }
+    let apply = |style: &mut Style, d: &Matched| {
+        if d.name.starts_with("--") {
+            return;
+        }
+        if d.value.contains("var(") {
+            match substitute_vars(d.value, &style.vars, 0) {
+                Some(v) => style.apply_in(d.name, &v, parent, venv),
+                // Invalid at computed-value time: behaves as `unset`.
+                None => style.apply_in(d.name, "unset", parent, venv),
+            }
+        } else {
+            style.apply_in(d.name, d.value, parent, venv);
+        }
+    };
     // font-size first: other lengths in `em` depend on it.
     for d in decls
         .iter()
         .filter(|d| d.name == "font-size" || d.name == "font")
     {
-        style.apply(d.name, d.value, parent, root_font);
+        apply(&mut style, d);
     }
     for d in decls
         .iter()
         .filter(|d| d.name != "font-size" && d.name != "font")
     {
-        style.apply(d.name, d.value, parent, root_font);
+        apply(&mut style, d);
     }
     style
+}
+
+/// Replaces `var(--name[, fallback])` using `vars`; `None` if a variable
+/// is missing and has no fallback.
+pub fn substitute_vars(value: &str, vars: &BTreeMap<String, String>, depth: u32) -> Option<String> {
+    if depth > 16 {
+        return None;
+    }
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(k) = rest.find("var(") {
+        out.push_str(&rest[..k]);
+        let after = &rest[k + 4..];
+        // Find the matching `)`.
+        let mut d = 1;
+        let mut end = None;
+        for (i, c) in after.char_indices() {
+            match c {
+                '(' => d += 1,
+                ')' => {
+                    d -= 1;
+                    if d == 0 {
+                        end = Some(i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let end = end?;
+        let inner = &after[..end];
+        let (name, fallback) = match inner.find(',') {
+            Some(c) => (inner[..c].trim(), Some(inner[c + 1..].trim())),
+            None => (inner.trim(), None),
+        };
+        let replacement = match vars.get(name) {
+            Some(v) if !v.trim().is_empty() || fallback.is_none() => Some(v.clone()),
+            _ => fallback.map(str::to_string),
+        }?;
+        out.push_str(&substitute_vars(&replacement, vars, depth + 1)?);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Convenience: computes styles from stylesheet source text (the UA sheet
+/// is added automatically). Used by tests.
+pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<Option<Style>> {
+    let parsed: Vec<(Rc<Sheet>, MediaList)> = sheets
+        .iter()
+        .map(|s| {
+            (
+                Rc::new(syntax::parse_stylesheet(s, None)),
+                MediaList::default(),
+            )
+        })
+        .collect();
+    let env = MediaEnv::default();
+    let cascade = Cascade::new(&parsed, &env);
+    let no = |_: NodeId| false;
+    let cx = Matcher {
+        dom,
+        state: *state,
+        checked: &no,
+    };
+    compute(dom, &cascade, &cx, &env).nodes
 }
 
 /// Styling attributes from older HTML (`<img width>`, `<td bgcolor>`, …),
@@ -428,6 +640,63 @@ mod tests {
             "hovering a child hovers the link"
         );
         assert_eq!(by_id(&d, &s, "i").color, BLUE);
+    }
+
+    #[test]
+    fn custom_properties_media_and_pseudo_elements() {
+        let html = r#"<style>
+            :root { --brand: #ff0000; --gap: 8px; --pad: var(--gap) }
+            .card { color: var(--brand); padding: var(--pad); margin: var(--missing, 3px) }
+            .alt { --brand: blue }
+            .bad { width: 10px; width: var(--nope) }
+            @media (min-width: 2000px) { .card { color: green } }
+            @media (max-width: 2000px) { .card { font-size: 20px } }
+            .card::before { content: "x"; color: blue }
+          </style>
+          <div id=c class=card>a</div><div class=alt><p id=n class=card>b</p></div>
+          <div id=b class=bad></div>"#;
+        let dom = parse_html(html);
+        let sheets = author_sheets(&dom, &[]);
+        let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
+        let parsed: Vec<_> = refs
+            .iter()
+            .map(|s| {
+                (
+                    Rc::new(syntax::parse_stylesheet(s, None)),
+                    MediaList::default(),
+                )
+            })
+            .collect();
+        let env = MediaEnv::default();
+        let cascade = Cascade::new(&parsed, &env);
+        let no = |_: NodeId| false;
+        let cx = Matcher {
+            dom: &dom,
+            state: ElementState::default(),
+            checked: &no,
+        };
+        let st = compute(&dom, &cascade, &cx, &env);
+        let get = |id: &str| st.nodes[dom.element_by_id(id).unwrap()].as_ref().unwrap();
+        let c = get("c");
+        assert_eq!(c.color, RED);
+        assert_eq!(c.padding[0], Dim::Px(8.0), "nested var()");
+        assert_eq!(c.margin[0], Dim::Px(3.0), "fallback");
+        assert_eq!(c.font_size, 20.0, "matching @media applies");
+        assert_eq!(
+            get("n").color,
+            BLUE,
+            "custom properties inherit and override"
+        );
+        assert_eq!(
+            get("b").width,
+            Dim::Auto,
+            "invalid var() makes the property unset"
+        );
+        let before = st.pseudo.get(&(
+            dom.element_by_id("c").unwrap(),
+            selector::PseudoElement::Before,
+        ));
+        assert_eq!(before.map(|s| s.color), Some(BLUE));
     }
 
     #[test]
