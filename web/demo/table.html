@@ -1,0 +1,27 @@
+<!doctype html>
+<title>Tables</title>
+<style>
+  body { font-family: sans-serif; margin: 24px; }
+  table.grid { border-collapse: collapse; }
+  .grid th, .grid td { border: 1px solid #c4c7cc; padding: 6px 12px; }
+  .grid thead tr { background: #e8f0fe; }
+  .grid tbody tr:hover { background: #fef7e0; }
+  .num { text-align: right; font-family: monospace; }
+  caption { font-weight: bold; padding: 6px; }
+</style>
+<h2>Styled table</h2>
+<table class="grid">
+  <caption>Browser engines</caption>
+  <thead><tr><th>Engine</th><th>Language</th><th>Lines</th></tr></thead>
+  <tbody>
+    <tr><td>rubrowser</td><td>Rust</td><td class="num">~15k</td></tr>
+    <tr><td rowspan="2">Servo parts</td><td>html5ever</td><td class="num">~20k</td></tr>
+    <tr><td>taffy</td><td class="num">~30k</td></tr>
+    <tr><td colspan="2">Total (approx.)</td><td class="num">65k</td></tr>
+  </tbody>
+</table>
+<h2>Old-style attributes</h2>
+<table border="1" cellpadding="8" cellspacing="0" bgcolor="#fafafa">
+  <tr bgcolor="#ffd"><th>Left</th><th align="right">Right</th></tr>
+  <tr><td height="60" valign="top">top</td><td valign="bottom" align="right">bottom</td></tr>
+</table>

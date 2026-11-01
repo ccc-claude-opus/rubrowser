@@ -52,6 +52,8 @@ pub struct LBox {
     pub content_w: f32,
     pub content_h: f32,
     pub absolute: bool,
+    /// Downward shift of the content (table cells with `vertical-align`).
+    pub content_shift: f32,
 }
 
 impl LBox {
@@ -59,7 +61,7 @@ impl LBox {
     pub fn content_offset(&self) -> (f32, f32) {
         (
             self.border[cs::LEFT] + self.padding[cs::LEFT],
-            self.border[cs::TOP] + self.padding[cs::TOP],
+            self.border[cs::TOP] + self.padding[cs::TOP] + self.content_shift,
         )
     }
 
@@ -140,6 +142,7 @@ pub fn layout(
         content_w: width,
         content_h: height,
         absolute: false,
+        content_shift: 0.0,
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
@@ -237,6 +240,9 @@ impl Builder<'_> {
         } else {
             Display::Block
         };
+        if css.display == CDisplay::Table {
+            return self.build_table(tree, id, &css, tstyle);
+        }
 
         if self.dom.tag(id) == Some("input") {
             let ctx = Ctx {
@@ -474,6 +480,7 @@ impl Builder<'_> {
                 .max(l.size.height),
             inline,
             absolute,
+            content_shift: 0.0,
         });
         let kids: Vec<usize> = tree
             .children(node)
@@ -482,8 +489,226 @@ impl Builder<'_> {
             .map(|c| self.collect(tree, c))
             .collect();
         self.boxes[index].children = kids;
+        if let Some(n) = dom_node {
+            self.align_cell(index, n);
+        }
         index
     }
+
+    /// Shifts a table cell's content for `vertical-align: middle/bottom`.
+    fn align_cell(&mut self, index: usize, node: NodeId) {
+        let Some(css) = self.style(node) else { return };
+        if css.display != CDisplay::TableCell {
+            return;
+        }
+        let factor = match css.vertical_align {
+            cs::VerticalAlign::Middle => 0.5,
+            cs::VerticalAlign::Bottom => 1.0,
+            _ => return,
+        };
+        let b = &self.boxes[index];
+        let (_, top) = b.content_offset();
+        let inner = b.rect.h - top - b.border[cs::BOTTOM] - b.padding[cs::BOTTOM];
+        let used = match &b.inline {
+            Some(il) => il.height,
+            None => b
+                .children
+                .iter()
+                .map(|&c| self.boxes[c].rect.y + self.boxes[c].rect.h - top)
+                .fold(0.0, f32::max),
+        };
+        let shift = ((inner - used) * factor).max(0.0);
+        if shift > 0.0 {
+            let kids = self.boxes[index].children.clone();
+            for c in kids {
+                self.boxes[c].rect.y += shift;
+            }
+            self.boxes[index].content_shift = shift;
+        }
+    }
+
+    /// Lays out a `display: table` element as a CSS grid: one grid row per
+    /// table row, cells placed with their `colspan` / `rowspan`.
+    fn build_table(
+        &mut self,
+        tree: &mut TaffyTree<Ctx>,
+        id: NodeId,
+        css: &Css,
+        mut tstyle: Style,
+    ) -> taffy::NodeId {
+        // Rows in display order: header groups, bodies, footer groups.
+        let mut captions = Vec::new();
+        let (mut head, mut body, mut foot) = (Vec::new(), Vec::new(), Vec::new());
+        for &c in self.dom.children(id) {
+            let Some(cs) = self.style(c) else { continue };
+            match cs.display {
+                CDisplay::TableCaption => captions.push(c),
+                CDisplay::TableRow => body.push(c),
+                CDisplay::TableRowGroup => {
+                    let rows: Vec<NodeId> = self
+                        .dom
+                        .children(c)
+                        .iter()
+                        .copied()
+                        .filter(|&r| {
+                            self.style(r)
+                                .is_some_and(|s| s.display == CDisplay::TableRow)
+                        })
+                        .collect();
+                    match self.dom.tag(c) {
+                        Some("thead") => head.extend(rows),
+                        Some("tfoot") => foot.extend(rows),
+                        _ => body.extend(rows),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let rows: Vec<NodeId> = head.into_iter().chain(body).chain(foot).collect();
+
+        // Place cells, skipping slots taken by rowspans from above.
+        let mut taken: Vec<Vec<bool>> = Vec::new();
+        let mut cells = Vec::new(); // (cell, row, col, rowspan, colspan)
+        let span = |n: NodeId, attr: &str| {
+            self.dom
+                .attr(n, attr)
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(1)
+                .clamp(1, 1000)
+        };
+        for (r, &row) in rows.iter().enumerate() {
+            let mut col = 0;
+            for &cell in self.dom.children(row) {
+                if !self
+                    .style(cell)
+                    .is_some_and(|s| s.display == CDisplay::TableCell)
+                {
+                    continue;
+                }
+                let (rs, cs) = (span(cell, "rowspan"), span(cell, "colspan"));
+                while taken
+                    .get(r)
+                    .and_then(|t| t.get(col))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    col += 1;
+                }
+                for rr in r..r + rs {
+                    if taken.len() <= rr {
+                        taken.resize(rr + 1, Vec::new());
+                    }
+                    if taken[rr].len() < col + cs {
+                        taken[rr].resize(col + cs, false);
+                    }
+                    for slot in &mut taken[rr][col..col + cs] {
+                        *slot = true;
+                    }
+                }
+                cells.push((cell, r, col, rs, cs));
+                col += cs;
+            }
+        }
+        let ncols = taken.iter().map(Vec::len).max().unwrap_or(0).max(1);
+        let first = captions.len();
+        let line = |i: usize| taffy::style_helpers::line::<GridPlacement>(i as i16 + 1);
+        let spanning = |n: usize| taffy::style_helpers::span::<GridPlacement>(n as u16);
+        let whole_row = |r: usize| {
+            (
+                taffy::Line {
+                    start: line(r),
+                    end: spanning(1),
+                },
+                taffy::Line {
+                    start: line(0),
+                    end: spanning(ncols),
+                },
+            )
+        };
+
+        let mut kids = Vec::new();
+        for (i, &cap) in captions.iter().enumerate() {
+            let node = self.build(tree, cap);
+            let mut st = tree.style(node).unwrap().clone();
+            (st.grid_row, st.grid_column) = whole_row(i);
+            tree.set_style(node, st).unwrap();
+            kids.push(node);
+        }
+        // Row backgrounds: an empty item behind the row's cells.
+        for (r, &row) in rows.iter().enumerate() {
+            if self.style(row).is_some_and(|s| s.background.is_visible()) {
+                let (grid_row, grid_column) = whole_row(first + r);
+                let st = Style {
+                    grid_row,
+                    grid_column,
+                    ..Default::default()
+                };
+                let ctx = Ctx {
+                    node: Some(row),
+                    style_node: row,
+                    inline: None,
+                    intrinsic: None,
+                };
+                kids.push(tree.new_leaf_with_context(st, ctx).unwrap());
+            }
+        }
+        let collapse = css.border_collapse;
+        for (cell, r, col, rs, cs) in cells {
+            let node = self.build(tree, cell);
+            let mut st = tree.style(node).unwrap().clone();
+            st.grid_row = taffy::Line {
+                start: line(first + r),
+                end: spanning(rs),
+            };
+            st.grid_column = taffy::Line {
+                start: line(col),
+                end: spanning(cs),
+            };
+            if collapse {
+                // Adjacent cells share one border: overlap by its width.
+                if r > 0 {
+                    st.margin.top = LengthPercentageAuto::length(-border_px(&st.border.top));
+                }
+                if col > 0 {
+                    st.margin.left = LengthPercentageAuto::length(-border_px(&st.border.left));
+                }
+            }
+            tree.set_style(node, st).unwrap();
+            kids.push(node);
+        }
+
+        let gap = if collapse { 0.0 } else { css.border_spacing };
+        tstyle.display = Display::Grid;
+        tstyle.item_is_table = true;
+        tstyle.grid_template_columns = vec![GridTemplateComponent::Single(auto()); ncols];
+        tstyle.gap = Size {
+            width: LengthPercentage::length(gap),
+            height: LengthPercentage::length(gap),
+        };
+        tstyle.padding = taffy::Rect {
+            left: LengthPercentage::length(gap),
+            right: LengthPercentage::length(gap),
+            top: LengthPercentage::length(gap),
+            bottom: LengthPercentage::length(gap),
+        };
+        let node = tree.new_with_children(tstyle, &kids).unwrap();
+        tree.set_node_context(
+            node,
+            Some(Ctx {
+                node: Some(id),
+                style_node: id,
+                inline: None,
+                intrinsic: None,
+            }),
+        )
+        .unwrap();
+        node
+    }
+}
+
+/// Width of a border given in pixels (taffy stores it as a length).
+fn border_px(l: &LengthPercentage) -> f32 {
+    l.into_raw().value()
 }
 
 enum Part {
@@ -757,6 +982,82 @@ mod tests {
         );
         assert!(l.rect("a").w >= 80.0, "{:?}", l.rect("a"));
         assert!(l.rect("b").x >= 80.0);
+    }
+
+    #[test]
+    fn tables_place_cells_in_a_grid() {
+        let l = lay(
+            r#"<style>body{margin:0} table{border-spacing:0} td{padding:0}
+               .tall{height:60px}</style>
+               <table id=t>
+                 <caption id=cap>Caption</caption>
+                 <thead><tr><th id=h1>Name</th><th id=h2>Value</th><th id=h3>Unit</th></tr></thead>
+                 <tr><td id=a rowspan=2 class=tall>A</td><td id=b colspan=2>B wide</td></tr>
+                 <tr><td id=c>C</td><td id=d>D</td></tr>
+                 <tfoot><tr><td id=f colspan=3>footer</td></tr></tfoot>
+               </table><p id=after style="margin:0">after</p>"#,
+            600.0,
+            400.0,
+        );
+        let (cap, h1, h2) = (l.rect("cap"), l.rect("h1"), l.rect("h2"));
+        let (a, b, c, d, f) = (
+            l.rect("a"),
+            l.rect("b"),
+            l.rect("c"),
+            l.rect("d"),
+            l.rect("f"),
+        );
+        let t = l.rect("t");
+        assert!(t.w < 600.0, "tables shrink to fit: {t:?}");
+        assert!(cap.y < h1.y, "caption above the header");
+        assert_eq!(h1.y, h2.y);
+        assert!(h2.x > h1.x);
+        assert_eq!(a.x, h1.x, "first column");
+        assert_eq!(b.x, h2.x, "B starts in column 2");
+        assert!(
+            (b.w - (l.rect("h3").x + l.rect("h3").w - h2.x)).abs() < 1.0,
+            "B spans 2 columns"
+        );
+        assert_eq!(c.x, h2.x, "C skips the rowspan slot");
+        assert_eq!(d.x, l.rect("h3").x);
+        assert!((a.h - (c.y + c.h - b.y)).abs() < 1.0, "A spans 2 rows");
+        assert!(f.y > c.y, "footer last");
+        assert!(l.rect("after").y >= t.y + t.h);
+    }
+
+    #[test]
+    fn table_attributes_and_vertical_align() {
+        let l = lay(
+            r#"<style>body{margin:0}</style>
+               <table border=1 cellpadding=4 cellspacing=0>
+                 <tr><td id=x style="height:50px">x</td><td id=y valign=top>y</td></tr>
+               </table>"#,
+            400.0,
+            200.0,
+        );
+        let target = l.dom.element_by_id("x").unwrap();
+        let b = l
+            .tree
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(target))
+            .unwrap();
+        assert_eq!(b.border[0], 1.0);
+        assert_eq!(b.padding[0], 4.0);
+        assert!(
+            b.content_shift > 10.0,
+            "middle-aligned: {}",
+            b.content_shift
+        );
+        let target = l.dom.element_by_id("y").unwrap();
+        let b = l
+            .tree
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(target))
+            .unwrap();
+        assert_eq!(b.content_shift, 0.0);
+        assert!(b.rect.h >= 50.0, "cells stretch to the row");
     }
 
     #[test]

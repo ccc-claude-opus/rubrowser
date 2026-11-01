@@ -2,10 +2,18 @@
 
 html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, pre, hr, blockquote,
 header, footer, main, nav, section, article, aside, figure, figcaption,
-address, details, summary, dl, dt, dd, form, fieldset, legend, center,
-table, tr, td, th, thead, tbody, tfoot, caption {
+address, details, summary, dl, dt, dd, form, fieldset, legend, center {
   display: block;
 }
+
+table { display: table; border-spacing: 2px; }
+thead { display: table-header-group; }
+tbody { display: table-row-group; }
+tfoot { display: table-footer-group; }
+tr { display: table-row; }
+td, th { display: table-cell; vertical-align: middle; }
+caption { display: table-caption; text-align: center; }
+colgroup, col { display: table-column; }
 
 head, style, script, title, meta, link, base, template, noscript {
   display: none;
@@ -53,6 +61,7 @@ hr {
 }
 
 td, th { padding: 1px; }
+th { text-align: center; }
 
 input, button, textarea, select {
   display: inline-block;

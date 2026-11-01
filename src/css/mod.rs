@@ -233,6 +233,57 @@ fn presentational_hints(dom: &Dom, id: NodeId) -> Vec<(&'static str, String)> {
             }
         }
     }
+    if matches!(
+        tag,
+        "table" | "tr" | "td" | "th" | "body" | "thead" | "tbody" | "tfoot"
+    ) && let Some(c) = dom.attr(id, "bgcolor")
+    {
+        out.push(("background-color", c.to_string()));
+    }
+    if matches!(
+        tag,
+        "td" | "th" | "tr" | "div" | "p" | "h1" | "h2" | "h3" | "caption"
+    ) && let Some(a) = dom.attr(id, "align")
+    {
+        out.push(("text-align", a.to_string()));
+    }
+    if matches!(tag, "td" | "th" | "tr")
+        && let Some(v) = dom.attr(id, "valign")
+    {
+        out.push(("vertical-align", v.to_string()));
+    }
+    // Cells take `border` and `cellpadding` from their table.
+    let table = if tag == "table" {
+        Some(id)
+    } else if matches!(tag, "td" | "th") {
+        let mut n = dom.parent(id);
+        while let Some(p) = n.filter(|&p| dom.tag(p) != Some("table")) {
+            n = dom.parent(p);
+        }
+        n
+    } else {
+        None
+    };
+    if let Some(t) = table {
+        let border = dom
+            .attr(t, "border")
+            .map(|b| b.trim().parse::<f32>().unwrap_or(1.0));
+        if tag == "table" {
+            if let Some(b) = border.filter(|&b| b > 0.0) {
+                out.push(("border", format!("{b}px outset #808080")));
+            }
+            if let Some(s) = dom.attr(t, "cellspacing").and_then(length) {
+                out.push(("border-spacing", s));
+            }
+        } else {
+            if border.is_some_and(|b| b > 0.0) {
+                out.push(("border", "1px inset #808080".to_string()));
+            }
+            if let Some(p) = dom.attr(t, "cellpadding").and_then(length) {
+                out.push(("padding", p));
+            }
+        }
+    }
     out
 }
 

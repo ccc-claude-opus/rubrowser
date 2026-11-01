@@ -13,6 +13,11 @@ pub enum Display {
     Flex,
     InlineFlex,
     ListItem,
+    Table,
+    TableRowGroup,
+    TableRow,
+    TableCell,
+    TableCaption,
 }
 
 impl Display {
@@ -109,6 +114,17 @@ pub enum ListStyle {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VerticalAlign {
+    #[default]
+    Baseline,
+    Top,
+    Middle,
+    Bottom,
+    Sub,
+    Super,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FlexDirection {
     #[default]
     Row,
@@ -170,7 +186,10 @@ pub struct Style {
     pub flex_grow: f32,
     pub flex_shrink: f32,
     pub flex_basis: Dim,
+    pub vertical_align: VerticalAlign,
     // Inherited:
+    pub border_spacing: f32,
+    pub border_collapse: bool,
     pub color: Rgba,
     pub font_size: f32,
     pub bold: bool,
@@ -217,6 +236,9 @@ impl Default for Style {
             flex_grow: 0.0,
             flex_shrink: 1.0,
             flex_basis: Dim::Auto,
+            vertical_align: VerticalAlign::Baseline,
+            border_spacing: 0.0,
+            border_collapse: false,
             color: Rgba::BLACK,
             font_size: 16.0,
             bold: false,
@@ -251,6 +273,8 @@ impl Style {
             cursor: parent.cursor,
             list_style: parent.list_style,
             visible: parent.visible,
+            border_spacing: parent.border_spacing,
+            border_collapse: parent.border_collapse,
             ..Style::default()
         }
     }
@@ -311,9 +335,17 @@ impl Style {
             "display" => {
                 self.display = match v {
                     "none" => Display::None,
-                    "block" | "flow-root" | "table" | "table-row" | "table-cell" => Display::Block,
+                    "block" | "flow-root" => Display::Block,
+                    "table" | "inline-table" => Display::Table,
+                    "table-row-group" | "table-header-group" | "table-footer-group" => {
+                        Display::TableRowGroup
+                    }
+                    "table-row" => Display::TableRow,
+                    "table-cell" => Display::TableCell,
+                    "table-caption" => Display::TableCaption,
+                    "table-column" | "table-column-group" => Display::None,
                     "inline" => Display::Inline,
-                    "inline-block" | "inline-table" => Display::InlineBlock,
+                    "inline-block" => Display::InlineBlock,
                     "flex" => Display::Flex,
                     "inline-flex" => Display::InlineFlex,
                     "list-item" => Display::ListItem,
@@ -514,6 +546,23 @@ impl Style {
                 }
             }
             "visibility" => self.visible = v != "hidden" && v != "collapse",
+            "vertical-align" => {
+                self.vertical_align = match v {
+                    "baseline" => VerticalAlign::Baseline,
+                    "top" | "text-top" => VerticalAlign::Top,
+                    "middle" => VerticalAlign::Middle,
+                    "bottom" | "text-bottom" => VerticalAlign::Bottom,
+                    "sub" => VerticalAlign::Sub,
+                    "super" => VerticalAlign::Super,
+                    _ => return,
+                }
+            }
+            "border-spacing" => {
+                if let Some(px) = tokens(v).first().and_then(|t| px(t)) {
+                    self.border_spacing = px;
+                }
+            }
+            "border-collapse" => self.border_collapse = v == "collapse",
             _ => {}
         }
     }
@@ -660,6 +709,9 @@ impl Style {
             "cursor" => self.cursor = from.cursor,
             "list-style" | "list-style-type" => self.list_style = from.list_style,
             "visibility" => self.visible = from.visible,
+            "vertical-align" => self.vertical_align = from.vertical_align,
+            "border-spacing" => self.border_spacing = from.border_spacing,
+            "border-collapse" => self.border_collapse = from.border_collapse,
             "flex-grow" => self.flex_grow = from.flex_grow,
             "flex-shrink" => self.flex_shrink = from.flex_shrink,
             "flex-basis" => self.flex_basis = from.flex_basis,
@@ -685,6 +737,8 @@ fn is_inherited(name: &str) -> bool {
                 | "list-style"
                 | "list-style-type"
                 | "visibility"
+                | "border-spacing"
+                | "border-collapse"
         )
 }
 
