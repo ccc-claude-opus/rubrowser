@@ -101,6 +101,9 @@ struct Ctx {
 }
 
 struct Builder<'a> {
+    /// Whether the element being built sits in a block container (not a
+    /// flex or grid item).
+    in_block: bool,
     /// `position: fixed` elements, attached to the viewport.
     fixed: Vec<taffy::NodeId>,
     dom: &'a Dom,
@@ -125,6 +128,7 @@ pub fn layout(
 ) -> LayoutTree {
     CALC_BASE.with(|b| b.set(width));
     let mut b = Builder {
+        in_block: true,
         fixed: Vec::new(),
         replaced,
         dom,
@@ -246,11 +250,17 @@ impl Builder<'_> {
 
     /// Creates the taffy node for element `id` and its subtree.
     fn build(&mut self, tree: &mut TaffyTree<Ctx>, id: NodeId) -> taffy::NodeId {
+        // Read before building children, which reset it.
+        let in_block = std::mem::replace(&mut self.in_block, true);
         let css = self.style(id).cloned().unwrap_or_default();
         let is_flex = matches!(css.display, CDisplay::Flex | CDisplay::InlineFlex);
+        let is_grid = matches!(css.display, CDisplay::Grid | CDisplay::InlineGrid);
         let mut tstyle = convert(&css);
         tstyle.display = if is_flex {
             Display::Flex
+        } else if is_grid {
+            grid_style(&css.grid, &mut tstyle);
+            Display::Grid
         } else {
             Display::Block
         };
@@ -289,10 +299,15 @@ impl Builder<'_> {
 
         // Split children into block-level boxes and runs of inline content.
         let mut parts: Vec<Part> = Vec::new();
-        self.collect_children(tree, id, is_flex, &mut parts);
+        self.collect_children(tree, id, is_flex || is_grid, &mut parts);
 
         let all_inline = parts.iter().all(|p| matches!(p, Part::Inline(_)));
-        if !is_flex && all_inline {
+        if !is_flex && !is_grid && all_inline {
+            if in_block {
+                // Text flows beside floats: as a new block formatting
+                // context, taffy places the box next to them.
+                tstyle.overflow = avoid_floats(tstyle.overflow);
+            }
             let items: Vec<Item> = parts
                 .into_iter()
                 .flat_map(|p| match p {
@@ -319,6 +334,17 @@ impl Builder<'_> {
                     }
                     let anon = Style {
                         display: Display::Block,
+                        overflow: if is_flex || is_grid {
+                            Point {
+                                x: TOverflow::Visible,
+                                y: TOverflow::Visible,
+                            }
+                        } else {
+                            avoid_floats(Point {
+                                x: TOverflow::Visible,
+                                y: TOverflow::Visible,
+                            })
+                        },
                         ..Default::default()
                     };
                     let ctx = Ctx {
@@ -355,6 +381,11 @@ impl Builder<'_> {
     ) {
         for &c in self.dom.children(parent) {
             let Some(css) = self.style(c) else { continue };
+            if css.display == CDisplay::Contents {
+                // No box of its own: its children take its place.
+                self.collect_children(tree, c, flex, parts);
+                continue;
+            }
             if self.dom.text(c).is_some() {
                 push_inline(
                     parts,
@@ -381,6 +412,7 @@ impl Builder<'_> {
             if self.dom.tag(c) == Some("br") && !flex {
                 push_inline(parts, Item::Break { node: c });
             } else if block_level {
+                self.in_block = !flex;
                 let child = self.build(tree, c);
                 parts.push(Part::Block(child));
             } else if css.display == CDisplay::Inline {
@@ -740,6 +772,199 @@ impl Builder<'_> {
     }
 }
 
+/// A grid line placement (`2`, `-1`, `span 2`, `main`, `auto`).
+fn placement(v: Option<&str>) -> GridPlacement {
+    v.and_then(|v| v.trim().parse::<GridPlacement>().ok())
+        .unwrap_or(GridPlacement::Auto)
+}
+
+/// Splits a value on whitespace at the top level (not inside parentheses,
+/// brackets or quotes).
+fn top_tokens(s: &str) -> Vec<&str> {
+    let (mut out, mut depth, mut start, mut quote) = (Vec::new(), 0i32, None, None);
+    for (i, c) in s.char_indices() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => continue,
+            (None, '"' | '\'') => quote = Some(c),
+            (None, '(' | '[') => depth += 1,
+            (None, ')' | ']') => depth -= 1,
+            _ => {}
+        }
+        if c.is_whitespace() && depth == 0 && quote.is_none() {
+            if let Some(st) = start.take() {
+                out.push(&s[st..i]);
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(st) = start {
+        out.push(&s[st..]);
+    }
+    out
+}
+
+/// One track size, parsed by taffy or, for lengths taffy cannot read
+/// (calc() and friends), by our own value parser.
+fn track(tok: &str) -> Option<TrackSizingFunction> {
+    if let Ok(t) = zero_px(tok).parse::<TrackSizingFunction>() {
+        return Some(t);
+    }
+    let fc = crate::css::values::FontContext {
+        em: 16.0,
+        rem: 16.0,
+        vw: CALC_BASE.with(|b| b.get()),
+        vh: 800.0,
+    };
+    let lp = lp(crate::css::values::dim(tok, fc)?);
+    Some(minmax(lp.into(), lp.into()))
+}
+
+/// Layout-only `overflow: hidden` so an inline-content box establishes a
+/// block formatting context (painting still uses the CSS `overflow`).
+fn avoid_floats(o: Point<TOverflow>) -> Point<TOverflow> {
+    let f = |v: TOverflow| {
+        if v == TOverflow::Visible {
+            TOverflow::Hidden
+        } else {
+            v
+        }
+    };
+    Point {
+        x: f(o.x),
+        y: f(o.y),
+    }
+}
+
+/// Rewrites lengths for taffy's parser, which only knows `px`, `%` and
+/// `fr`: unitless zeros become `0px`, `rem`/`em`/`vw`/`vh`/`pt` become px.
+fn zero_px(v: &str) -> String {
+    let base = CALC_BASE.with(|b| b.get());
+    let mut out = String::with_capacity(v.len() + 8);
+    let mut rest = v;
+    while !rest.is_empty() {
+        let starts_number = rest.as_bytes()[0].is_ascii_digit()
+            || (rest.as_bytes()[0] == b'.'
+                && rest.as_bytes().get(1).is_some_and(u8::is_ascii_digit));
+        let prev = out.as_bytes().last().copied();
+        if starts_number && prev.is_none_or(|p| matches!(p, b'(' | b',' | b' ' | b'-')) {
+            let num_end = rest
+                .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .unwrap_or(rest.len());
+            let unit_end = rest[num_end..]
+                .find(|c: char| !c.is_ascii_alphabetic() && c != '%')
+                .map_or(rest.len(), |e| num_end + e);
+            let n: f32 = rest[..num_end].parse().unwrap_or(0.0);
+            let unit = &rest[num_end..unit_end];
+            let px = match unit {
+                "" if n == 0.0 => Some(0.0),
+                "rem" | "em" => Some(n * 16.0),
+                "vw" => Some(n * base / 100.0),
+                "vh" => Some(n * 8.0),
+                "pt" => Some(n * 4.0 / 3.0),
+                _ => None,
+            };
+            match px {
+                Some(px) => out.push_str(&format!("{px}px")),
+                None => out.push_str(&rest[..unit_end]),
+            }
+            rest = &rest[unit_end..];
+            continue;
+        }
+        let ch = rest.chars().next().unwrap_or(' ');
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
+    }
+    out
+}
+
+/// A `grid-template-columns` / `-rows` track list (line names ignored).
+fn track_list(v: &str) -> Vec<GridTemplateComponent<String>> {
+    if v.trim() == "none" {
+        return Vec::new();
+    }
+    let v = zero_px(v);
+    top_tokens(&v)
+        .into_iter()
+        .filter(|t| !t.starts_with('['))
+        .filter_map(|t| {
+            if t.starts_with("repeat(") {
+                t.parse::<GridTemplateComponent<String>>().ok()
+            } else {
+                track(t).map(GridTemplateComponent::Single)
+            }
+        })
+        .collect()
+}
+
+/// `grid-template-areas: "a a" "b c"`.
+fn template_areas(v: &str) -> Option<taffy::GridTemplateAreas<String>> {
+    let rows: Vec<Vec<&str>> = top_tokens(v)
+        .into_iter()
+        .filter(|t| t.starts_with('"') || t.starts_with('\''))
+        .map(|t| t.trim_matches(['"', '\'']).split_whitespace().collect())
+        .collect();
+    let columns = rows.iter().map(Vec::len).max()?;
+    let mut areas: Vec<taffy::GridTemplateArea<String>> = Vec::new();
+    for (r, row) in rows.iter().enumerate() {
+        for (c, name) in row.iter().enumerate() {
+            if name.chars().all(|ch| ch == '.') {
+                continue;
+            }
+            let (r, c) = (r as u16 + 1, c as u16 + 1);
+            match areas.iter_mut().find(|a| a.name == *name) {
+                Some(a) => {
+                    a.row_start = a.row_start.min(r);
+                    a.row_end = a.row_end.max(r + 1);
+                    a.column_start = a.column_start.min(c);
+                    a.column_end = a.column_end.max(c + 1);
+                }
+                None => areas.push(taffy::GridTemplateArea {
+                    name: name.to_string(),
+                    row_start: r,
+                    row_end: r + 1,
+                    column_start: c,
+                    column_end: c + 1,
+                }),
+            }
+        }
+    }
+    Some(taffy::GridTemplateAreas {
+        areas,
+        row_count: rows.len() as u16,
+        column_count: columns as u16,
+    })
+}
+
+/// Grid container properties.
+fn grid_style(g: &crate::css::style::GridProps, ts: &mut Style) {
+    if let Some(v) = &g.template_columns {
+        ts.grid_template_columns = track_list(v);
+    }
+    if let Some(v) = &g.template_rows {
+        ts.grid_template_rows = track_list(v);
+    }
+    if let Some(v) = &g.template_areas {
+        ts.grid_template_areas = template_areas(v);
+    }
+    let autos = |v: &str| {
+        top_tokens(&zero_px(v))
+            .into_iter()
+            .filter_map(track)
+            .collect::<Vec<_>>()
+    };
+    if let Some(v) = &g.auto_columns {
+        ts.grid_auto_columns = autos(v);
+    }
+    if let Some(v) = &g.auto_rows {
+        ts.grid_auto_rows = autos(v);
+    }
+    if let Some(flow) = g.auto_flow.as_deref().and_then(|v| v.parse().ok()) {
+        ts.grid_auto_flow = flow;
+    }
+}
+
 /// Width of a border given in pixels (taffy stores it as a length).
 fn border_px(l: &LengthPercentage) -> f32 {
     l.into_raw().value()
@@ -896,6 +1121,17 @@ fn convert(s: &Css) -> Style {
         justify_content: justify(s.justify_content),
         align_items: align_items(s.align_items),
         align_self: (s.align_self != Align::Normal).then(|| align_items(s.align_self)),
+        justify_items: align_items(s.justify_items),
+        justify_self: (s.justify_self != Align::Normal).then(|| align_items(s.justify_self)),
+        align_content: justify(s.align_content),
+        grid_row: taffy::Line {
+            start: placement(s.grid.row_start.as_deref()),
+            end: placement(s.grid.row_end.as_deref()),
+        },
+        grid_column: taffy::Line {
+            start: placement(s.grid.column_start.as_deref()),
+            end: placement(s.grid.column_end.as_deref()),
+        },
         gap: Size {
             width: lp(s.column_gap),
             height: lp(s.row_gap),
@@ -1118,6 +1354,54 @@ mod tests {
             .unwrap();
         assert_eq!(b.content_shift, 0.0);
         assert!(b.rect.h >= 50.0, "cells stretch to the row");
+    }
+
+    #[test]
+    fn text_avoids_floats() {
+        let text = "word ".repeat(60);
+        let l = lay(
+            &format!(
+                r#"<style>body{{margin:0}} p{{margin:0}}</style><div style="width:300px">
+                <div id=f style="float:right;width:100px;height:100px"></div>
+                <p id=p>{text}</p></div>"#
+            ),
+            800.0,
+            600.0,
+        );
+        let (f, p) = (l.rect("f"), l.rect("p"));
+        assert_eq!(f.x, 200.0);
+        assert!(p.x + p.w <= 200.5, "text block beside the float: {p:?}");
+    }
+
+    #[test]
+    fn grid_template_areas_and_tracks() {
+        let l = lay(
+            r#"<style>body{margin:0}
+               #g{display:grid;grid-template-columns:100px 1fr 50px;
+                  grid-template-areas:"head head head" "nav main side";gap:10px;width:400px}
+               #h{grid-area:head;height:20px} #n{grid-area:nav} #m{grid-area:main} #s{grid-area:side}
+               #r{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:300px}
+               </style>
+               <div id=g><div id=m>m</div><div id=s>s</div><div id=h></div><div id=n>n</div></div>
+               <div id=r><div id=r1>1</div><div id=r2>2</div><div id=r3>3</div><div id=r4>4</div></div>"#,
+            800.0,
+            600.0,
+        );
+        let (h, n, m, s) = (l.rect("h"), l.rect("n"), l.rect("m"), l.rect("s"));
+        assert_eq!((h.x, h.w), (0.0, 400.0));
+        assert_eq!((n.x, n.w), (0.0, 100.0));
+        assert_eq!(m.x, 110.0);
+        assert_eq!(s.x, 350.0);
+        assert!(n.y > h.y);
+        assert_eq!(l.rect("r2").x, 100.0);
+        assert_eq!(
+            zero_px("minmax(0,59.25rem) min-content"),
+            "minmax(0px,948px) min-content"
+        );
+        assert!(
+            l.rect("r4").y > l.rect("r1").y,
+            "auto-placed into the next row"
+        );
     }
 
     #[test]

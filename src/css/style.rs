@@ -16,6 +16,10 @@ pub enum Display {
     Flex,
     InlineFlex,
     ListItem,
+    Grid,
+    InlineGrid,
+    /// `display: contents`: the box is replaced by its children.
+    Contents,
     Table,
     TableRowGroup,
     TableRow,
@@ -28,7 +32,7 @@ impl Display {
     pub fn is_inline_level(&self) -> bool {
         matches!(
             self,
-            Display::Inline | Display::InlineBlock | Display::InlineFlex
+            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
         )
     }
 }
@@ -204,6 +208,21 @@ pub enum Align {
     SpaceEvenly,
 }
 
+/// Grid properties as written (with `var()` already substituted).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GridProps {
+    pub template_columns: Option<String>,
+    pub template_rows: Option<String>,
+    pub template_areas: Option<String>,
+    pub auto_columns: Option<String>,
+    pub auto_rows: Option<String>,
+    pub auto_flow: Option<String>,
+    pub row_start: Option<String>,
+    pub row_end: Option<String>,
+    pub column_start: Option<String>,
+    pub column_end: Option<String>,
+}
+
 /// Index into four-sided properties.
 pub const TOP: usize = 0;
 pub const RIGHT: usize = 1;
@@ -257,6 +276,12 @@ pub struct Style {
     /// `background-position` as fractions (0 = left/top, 1 = right/bottom)
     /// or pixel offsets.
     pub background_position: (Dim, Dim),
+    /// Grid container and item properties, kept as CSS text and parsed at
+    /// layout time.
+    pub grid: Rc<GridProps>,
+    pub justify_items: Align,
+    pub justify_self: Align,
+    pub align_content: Align,
     // Inherited:
     pub text_transform: TextTransform,
     pub border_spacing: f32,
@@ -324,6 +349,10 @@ impl Default for Style {
             background_size: BackgroundSize::Auto,
             background_repeat: Repeat(true, true),
             background_position: (Dim::Percent(0.0), Dim::Percent(0.0)),
+            grid: Rc::default(),
+            justify_items: Align::Normal,
+            justify_self: Align::Normal,
+            align_content: Align::Normal,
             text_transform: TextTransform::None,
             border_spacing: 0.0,
             border_collapse: false,
@@ -451,8 +480,11 @@ impl Style {
                     "table-column" | "table-column-group" => Display::None,
                     "inline" => Display::Inline,
                     "inline-block" => Display::InlineBlock,
-                    "flex" => Display::Flex,
-                    "inline-flex" => Display::InlineFlex,
+                    "flex" | "-webkit-flex" => Display::Flex,
+                    "inline-flex" | "-webkit-inline-flex" => Display::InlineFlex,
+                    "grid" => Display::Grid,
+                    "inline-grid" => Display::InlineGrid,
+                    "contents" => Display::Contents,
                     "list-item" => Display::ListItem,
                     _ => return,
                 }
@@ -657,9 +689,35 @@ impl Style {
                 }
             }
             "justify-content" => set(&mut self.justify_content, align(v)),
+            "justify-items" => set(
+                &mut self.justify_items,
+                align(v.trim_start_matches("legacy ")),
+            ),
+            "justify-self" => set(&mut self.justify_self, align(v)),
+            "align-content" => set(&mut self.align_content, align(v)),
+            "place-items" | "place-self" | "place-content" => {
+                let t = tokens(v);
+                let a = t.first().copied().unwrap_or("");
+                let j = t.get(1).or(t.first()).copied().unwrap_or("");
+                match name {
+                    "place-items" => {
+                        set(&mut self.align_items, align(a));
+                        set(&mut self.justify_items, align(j));
+                    }
+                    "place-self" => {
+                        set(&mut self.align_self, align(a));
+                        set(&mut self.justify_self, align(j));
+                    }
+                    _ => {
+                        set(&mut self.align_content, align(a));
+                        set(&mut self.justify_content, align(j));
+                    }
+                }
+            }
+            n if n.starts_with("grid") && !n.ends_with("gap") => self.grid_property(n, value),
             "align-items" => set(&mut self.align_items, align(v)),
             "align-self" => set(&mut self.align_self, align(v)),
-            "gap" => {
+            "gap" | "grid-gap" => {
                 let t: Vec<_> = tokens(v).into_iter().filter_map(dim).collect();
                 match t[..] {
                     [g] => (self.row_gap, self.column_gap) = (g, g),
@@ -667,8 +725,8 @@ impl Style {
                     _ => {}
                 }
             }
-            "row-gap" => set(&mut self.row_gap, dim(v)),
-            "column-gap" => set(&mut self.column_gap, dim(v)),
+            "row-gap" | "grid-row-gap" => set(&mut self.row_gap, dim(v)),
+            "column-gap" | "grid-column-gap" => set(&mut self.column_gap, dim(v)),
             "flex-grow" => set(&mut self.flex_grow, values::number(v)),
             "flex-shrink" => set(&mut self.flex_shrink, values::number(v)),
             "flex-basis" => set(&mut self.flex_basis, dim(v)),
@@ -756,6 +814,82 @@ impl Style {
                 }
             }
             "border-collapse" => self.border_collapse = v == "collapse",
+            _ => {}
+        }
+    }
+
+    fn grid_property(&mut self, name: &str, value: &str) {
+        let g = Rc::make_mut(&mut self.grid);
+        let v = Some(value.trim().to_string());
+        let parts: Vec<String> = value.split('/').map(|p| p.trim().to_string()).collect();
+        // A bare name (`grid-row: main`) also sets the end to that name.
+        let is_name = |s: &str| {
+            s.chars().any(|c| c.is_alphabetic())
+                && !s.starts_with("span")
+                && s != "auto"
+                && !s.contains(' ')
+        };
+        match name {
+            "grid-template-columns" => g.template_columns = v,
+            "grid-template-rows" => g.template_rows = v,
+            "grid-template-areas" => g.template_areas = v,
+            "grid-auto-columns" => g.auto_columns = v,
+            "grid-auto-rows" => g.auto_rows = v,
+            "grid-auto-flow" => g.auto_flow = v,
+            "grid-row-start" => g.row_start = v,
+            "grid-row-end" => g.row_end = v,
+            "grid-column-start" => g.column_start = v,
+            "grid-column-end" => g.column_end = v,
+            "grid-row" | "grid-column" => {
+                let start = parts.first().cloned();
+                let end = parts
+                    .get(1)
+                    .cloned()
+                    .or_else(|| start.clone().filter(|s| is_name(s)));
+                if name == "grid-row" {
+                    (g.row_start, g.row_end) = (start, end);
+                } else {
+                    (g.column_start, g.column_end) = (start, end);
+                }
+            }
+            "grid-area" => {
+                let first = parts.first().cloned();
+                let named = first.clone().filter(|s| is_name(s));
+                g.row_start = first;
+                g.column_start = parts.get(1).cloned().or(named.clone());
+                g.row_end = parts.get(2).cloned().or(named.clone());
+                g.column_end = parts.get(3).cloned().or(named);
+            }
+            "grid-template" => {
+                if value.contains('"') {
+                    // "areas" row-size … / columns
+                    let (rows_part, cols) = match value.rsplit_once('/') {
+                        Some((r, c)) if !c.contains('"') => (r, Some(c.trim().to_string())),
+                        _ => (value, None),
+                    };
+                    let (mut areas, mut sizes) = (Vec::new(), Vec::new());
+                    let mut rest = rows_part.trim();
+                    while let Some(start) = rest.find('"') {
+                        let size = rest[..start].trim();
+                        if !areas.is_empty() {
+                            sizes.push(if size.is_empty() { "auto" } else { size }.to_string());
+                        }
+                        let end = rest[start + 1..]
+                            .find('"')
+                            .map_or(rest.len() - 1, |e| start + 1 + e);
+                        areas.push(rest[start..=end].to_string());
+                        rest = &rest[end + 1..];
+                    }
+                    let last = rest.trim();
+                    sizes.push(if last.is_empty() { "auto" } else { last }.to_string());
+                    g.template_areas = Some(areas.join(" "));
+                    g.template_rows = Some(sizes.join(" "));
+                    g.template_columns = cols;
+                } else if let Some((r, c)) = value.split_once('/') {
+                    g.template_rows = Some(r.trim().to_string());
+                    g.template_columns = Some(c.trim().to_string());
+                }
+            }
             _ => {}
         }
     }
