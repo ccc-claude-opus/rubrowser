@@ -134,6 +134,9 @@ impl Painter<'_> {
         let Some(style) = self.style(b.style_node) else {
             return;
         };
+        if style.clipped_away {
+            return;
+        }
         let (tx, ty) = b.translation(style);
         let r = RectF {
             x: ox + b.rect.x + tx,
@@ -1021,7 +1024,7 @@ impl Painter<'_> {
                         let Some(st) = self.style(*node) else {
                             continue;
                         };
-                        if !st.visible {
+                        if !st.visible || st.clipped_away {
                             continue;
                         }
                         let m = self.fonts.line_metrics(st.font(), st.font_size);

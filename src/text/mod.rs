@@ -288,10 +288,28 @@ impl Fonts {
         Some(Rc::from(key.data()))
     }
 
-    /// Shapes a right-to-left run with the face that has its first
-    /// right-to-left character. `None` if no such face's data is known.
+    /// Whether `text` should be shaped: right-to-left text, or text in a
+    /// web font that has all its characters (ligatures such as icon fonts'
+    /// `arrow_drop_down`, and kerning).
+    fn needs_shaping(&self, key: FontKey, text: &str) -> bool {
+        if has_rtl(text) {
+            return true;
+        }
+        matches!(key.family, Family::Web(_))
+            && text.chars().any(|c| c.is_ascii_alphabetic())
+            && self.web_face(key).is_some_and(|(_, f)| {
+                text.chars()
+                    .all(|c| c.is_whitespace() || f.lookup_glyph_index(c) != 0)
+            })
+    }
+
+    /// Shapes a run with the face that draws its first right-to-left (or
+    /// else first) character. `None` if that face's data is not known.
     fn shape(&self, key: FontKey, size: f32, text: &str) -> Option<Rc<Shaped>> {
-        let first = text.chars().find(|&c| is_rtl(c))?;
+        let rtl = has_rtl(text);
+        let first = text
+            .chars()
+            .find(|&c| if rtl { is_rtl(c) } else { !c.is_whitespace() })?;
         let (face, _) = self.face_for(key, first);
         let size_q = (size * 4.0).round() as u32;
         let cache_key = (face, text.to_string(), size_q);
@@ -302,7 +320,11 @@ impl Fonts {
         let rb_face = rustybuzz::Face::from_slice(&bytes, 0)?;
         let mut buffer = rustybuzz::UnicodeBuffer::new();
         buffer.push_str(text);
-        buffer.set_direction(rustybuzz::Direction::RightToLeft);
+        buffer.set_direction(if rtl {
+            rustybuzz::Direction::RightToLeft
+        } else {
+            rustybuzz::Direction::LeftToRight
+        });
         buffer.guess_segment_properties();
         let out = rustybuzz::shape(&rb_face, &[], buffer);
         let scale = size / rb_face.units_per_em() as f32;
@@ -424,7 +446,7 @@ impl Fonts {
 
     /// Width of `text` at `size`.
     pub fn measure(&self, key: FontKey, size: f32, text: &str) -> f32 {
-        if has_rtl(text)
+        if self.needs_shaping(key, text)
             && let Some(s) = self.shape(key, size, text)
         {
             return s.glyphs.iter().map(|g| g.1).sum();
@@ -446,7 +468,7 @@ impl Fonts {
         color: Color,
     ) -> f32 {
         let size_q = (size * 4.0).round() as u32;
-        if has_rtl(text)
+        if self.needs_shaping(key, text)
             && let Some(shaped) = self.shape(key, size, text)
             && let Some(font) = self.font_at(shaped.face)
         {

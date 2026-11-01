@@ -307,6 +307,9 @@ pub struct Style {
     pub translate: (Dim, Dim),
     /// `aspect-ratio` (width / height).
     pub aspect_ratio: Option<f32>,
+    /// `clip` / `clip-path` that leave nothing visible (the usual
+    /// "visually hidden" pattern): the box and its contents are not drawn.
+    pub clipped_away: bool,
     pub z_index: Option<i32>,
     pub float: Float,
     /// `clear`: (left, right).
@@ -397,6 +400,7 @@ impl Default for Style {
             opacity: 1.0,
             translate: (Dim::Px(0.0), Dim::Px(0.0)),
             aspect_ratio: None,
+            clipped_away: false,
             z_index: None,
             float: Float::None,
             clear: (false, false),
@@ -458,6 +462,8 @@ impl Style {
             cursor: parent.cursor,
             list_style: parent.list_style,
             rtl: parent.rtl,
+            // Clipping to nothing hides everything inside too.
+            clipped_away: parent.clipped_away,
             visible: parent.visible,
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
@@ -764,6 +770,24 @@ impl Style {
                     }
                 }
                 self.box_shadow = out.into();
+            }
+            "clip" => {
+                // rect(0 0 0 0), rect(1px, 1px, 1px, 1px): an empty area.
+                self.clipped_away = v.strip_prefix("rect(").is_some_and(|r| {
+                    let n: Vec<f32> = r
+                        .trim_end_matches(')')
+                        .split([',', ' '])
+                        .filter(|t| !t.is_empty())
+                        .filter_map(|t| values::px(t, fc))
+                        .collect();
+                    n.len() == 4 && (n[2] - n[0] <= 1.0 || n[1] - n[3] <= 1.0)
+                });
+            }
+            "clip-path" => {
+                self.clipped_away = v.starts_with("inset(50%")
+                    || v.starts_with("inset(100%")
+                    || v.replace(' ', "") == "polygon(0000,0000,0000)"
+                    || v.replace(' ', "").starts_with("circle(0");
             }
             "aspect-ratio" => {
                 // `auto`, `16 / 9`, `1.5`, `auto 4 / 3`
