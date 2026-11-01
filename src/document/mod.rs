@@ -1098,6 +1098,17 @@ pub fn button_label(dom: &Dom, node: NodeId, kind: Control) -> String {
         })
 }
 
+/// Whether `RUBROWSER_PROFILE` is set (prints style/layout timings).
+fn profiling() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RUBROWSER_PROFILE").is_some())
+    }
+    #[cfg(target_arch = "wasm32")]
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1180,15 +1191,4 @@ mod tests {
         assert_eq!(c.pixels()[99 * 100 + 99], 0x00ff00);
         assert!(c.pixels().contains(&0));
     }
-}
-
-/// Whether `RUBROWSER_PROFILE` is set (prints style/layout timings).
-fn profiling() -> bool {
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ON.get_or_init(|| std::env::var_os("RUBROWSER_PROFILE").is_some())
-    }
-    #[cfg(target_arch = "wasm32")]
-    false
 }
