@@ -1015,6 +1015,7 @@ impl Painter<'_> {
                         width,
                         text,
                         shift,
+                        ..
                     } => {
                         let baseline = baseline + shift;
                         let Some(st) = self.style(*node) else {

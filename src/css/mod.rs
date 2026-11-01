@@ -959,6 +959,22 @@ fn presentational_hints(dom: &Dom, id: NodeId) -> Vec<(&'static str, String)> {
         };
         out.push(("text-align", a));
     }
+    // dir=rtl|ltr|auto (auto: from the first strong character).
+    if let Some(d) = dom.attr(id, "dir") {
+        let rtl = match d.trim().to_ascii_lowercase().as_str() {
+            "rtl" => Some(true),
+            "ltr" => Some(false),
+            "auto" => dom
+                .text_content(id)
+                .chars()
+                .find(|c| c.is_alphabetic())
+                .map(crate::text::is_rtl),
+            _ => None,
+        };
+        if let Some(rtl) = rtl {
+            out.push(("direction", if rtl { "rtl" } else { "ltr" }.into()));
+        }
+    }
     if matches!(tag, "table" | "img" | "iframe")
         && let Some(a) = dom.attr(id, "align")
     {

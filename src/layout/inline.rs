@@ -62,6 +62,8 @@ pub enum Placed {
         text: String,
         /// Vertical offset from the line's baseline (`sub` / `super`).
         shift: f32,
+        /// Width of the trailing spaces included in `width`.
+        space: f32,
     },
     /// `y` is the top of the atomic box relative to the line top.
     Atomic {
@@ -193,6 +195,15 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                                 word.clear();
                                 pending_space = false;
                             }
+                            // CJK text breaks between characters (but not
+                            // before closing punctuation).
+                            if (is_cjk(c) || word.chars().last().is_some_and(is_cjk))
+                                && !word.is_empty()
+                                && !no_break_before(c)
+                            {
+                                push_word(&mut out, &word, "");
+                                word.clear();
+                            }
                             word.push(c);
                             after_space = false;
                         }
@@ -241,6 +252,7 @@ pub fn layout(
     styles: &[Option<Style>],
     fonts: &Fonts,
 ) -> InlineLayout {
+    let rtl_para = style(styles, content.owner).rtl;
     if content.is_blank(styles) {
         return InlineLayout::default();
     }
@@ -260,11 +272,14 @@ pub fn layout(
                   trailing: &mut f32,
                   lines: &mut Vec<Line>| {
         // Trailing spaces hang: they do not count toward the line width.
-        if let Some(Placed::Text { width, text, .. }) = line.items.last_mut()
+        if let Some(Placed::Text {
+            width, text, space, ..
+        }) = line.items.last_mut()
             && text.ends_with(' ')
         {
             *width -= *trailing;
             *text = text.trim_end_matches(' ').to_string();
+            *space = 0.0;
         }
         *trailing = 0.0;
         line.width = line.items.iter().map(right_edge).fold(0.0, f32::max);
@@ -298,7 +313,15 @@ pub fn layout(
                 if at_line_start && text.trim().is_empty() {
                     continue; // collapsible space at line start
                 }
-                if !at_line_start && wraps && breakable && x + width - space > max_width + 0.01 {
+                let cjk_start = text
+                    .chars()
+                    .next()
+                    .is_some_and(|c| is_cjk(c) && !no_break_before(c));
+                if !at_line_start
+                    && wraps
+                    && (breakable || cjk_start)
+                    && x + width - space > max_width + 0.01
+                {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                     if text.trim().is_empty() {
                         continue;
@@ -313,12 +336,17 @@ pub fn layout(
                     node: n,
                     width: w,
                     text: t,
+                    space: sp,
                     ..
                 }) = line.items.last_mut()
                     && *n == node
+                    && !rtl_para
+                    && !crate::text::has_rtl(t)
+                    && !crate::text::has_rtl(&text)
                 {
                     t.push_str(&text);
                     *w += width;
+                    *sp = space;
                 } else {
                     line.items.push(Placed::Text {
                         node,
@@ -326,11 +354,13 @@ pub fn layout(
                         width,
                         text,
                         shift,
+                        space,
                     });
                 }
                 x += width;
                 trailing = space;
-                breakable = space > 0.0;
+                // After a space, or between CJK characters.
+                breakable = space > 0.0 || text_ends_cjk(line.items.last());
             }
             Piece::Atomic {
                 index,
@@ -425,11 +455,16 @@ fn extents(st: &Style, fonts: &Fonts) -> (f32, f32) {
 }
 
 /// Shifts lines horizontally for `text-align` within `width`.
-pub fn align(layout: &mut InlineLayout, align: TextAlign, width: f32) {
-    let factor = match align {
-        TextAlign::Left => return,
-        TextAlign::Right => 1.0,
-        TextAlign::Center | TextAlign::WebkitCenter => 0.5,
+pub fn align(layout: &mut InlineLayout, align: TextAlign, width: f32, rtl: bool) {
+    if rtl || layout.lines.iter().any(|l| l.items.iter().any(item_rtl)) {
+        for line in &mut layout.lines {
+            reorder(line, rtl);
+        }
+    }
+    let factor = match (align, rtl) {
+        (TextAlign::Left, _) | (TextAlign::Start, false) | (TextAlign::End, true) => return,
+        (TextAlign::Right, _) | (TextAlign::Start, true) | (TextAlign::End, false) => 1.0,
+        (TextAlign::Center | TextAlign::WebkitCenter, _) => 0.5,
     };
     for line in &mut layout.lines {
         let dx = ((width - line.width) * factor).max(0.0);
@@ -441,10 +476,200 @@ pub fn align(layout: &mut InlineLayout, align: TextAlign, width: f32) {
     }
 }
 
+/// Whether `c` is Chinese, Japanese or Korean text (lines may break
+/// between such characters).
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x1100..=0x11FF | 0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3040..=0x30FF
+        | 0x3100..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F
+        | 0xAC00..=0xD7AF | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFFEF
+        | 0x20000..=0x2FA1F)
+}
+
+/// Closing punctuation that may not start a line.
+fn no_break_before(c: char) -> bool {
+    "，。、！？：；）」』】》〉…・ー,.!?:;)]}%".contains(c)
+}
+
+fn text_ends_cjk(item: Option<&Placed>) -> bool {
+    matches!(item, Some(Placed::Text { text, .. }) if text.chars().last().is_some_and(is_cjk))
+}
+
+fn item_rtl(item: &Placed) -> bool {
+    matches!(item, Placed::Text { text, .. } if crate::text::has_rtl(text))
+}
+
+/// Bidirectional reordering of one line (simplified Unicode bidi, word by
+/// word): items get embedding levels from their direction and are reversed
+/// per rule L2; they then sit side by side from the line start.
+fn reorder(line: &mut Line, rtl: bool) {
+    // Direction of each item: Some(true) RTL, Some(false) LTR, None neutral.
+    let dir = |item: &Placed| match item {
+        Placed::Text { text, .. } => {
+            if crate::text::has_rtl(text) {
+                Some(true)
+            } else if text.chars().any(char::is_alphanumeric) {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Placed::Atomic { .. } => Some(false),
+    };
+    // Trailing spaces become separate (neutral) items so they land between
+    // words of either direction.
+    let mut items = Vec::with_capacity(line.items.len() * 2);
+    for item in std::mem::take(&mut line.items) {
+        match item {
+            Placed::Text {
+                node,
+                x,
+                width,
+                text,
+                shift,
+                space,
+            } if space > 0.0 && text.ends_with(' ') && text.trim_end().len() < text.len() => {
+                let word = text.trim_end().to_string();
+                let spaces = text[word.len()..].to_string();
+                items.push(Placed::Text {
+                    node,
+                    x,
+                    width: width - space,
+                    text: word,
+                    shift,
+                    space: 0.0,
+                });
+                items.push(Placed::Text {
+                    node,
+                    x: x + width - space,
+                    width: space,
+                    text: spaces,
+                    shift,
+                    space,
+                });
+            }
+            other => items.push(other),
+        }
+    }
+    line.items = items;
+    let dirs: Vec<Option<bool>> = line.items.iter().map(dir).collect();
+    let n = dirs.len();
+    // Neutrals take the direction of their neighbors when both agree,
+    // else the paragraph's.
+    let resolved: Vec<bool> = (0..n)
+        .map(|i| {
+            dirs[i].unwrap_or_else(|| {
+                let before = dirs[..i].iter().rev().find_map(|d| *d);
+                let after = dirs[i + 1..].iter().find_map(|d| *d);
+                match (before, after) {
+                    (Some(a), Some(b)) if a == b => a,
+                    _ => rtl,
+                }
+            })
+        })
+        .collect();
+    // Embedding levels: the paragraph's is 0 (LTR) or 1 (RTL); RTL items
+    // get the next odd level, LTR items in an RTL paragraph level 2.
+    let levels: Vec<u8> = resolved
+        .iter()
+        .map(|&r| match (rtl, r) {
+            (false, false) => 0,
+            (_, true) => 1,
+            (true, false) => 2,
+        })
+        .collect();
+    // Rule L2: from the highest level down to the lowest odd one, reverse
+    // every run at that level or higher.
+    let mut order: Vec<usize> = (0..n).collect();
+    let max = levels.iter().copied().max().unwrap_or(0);
+    for level in (1..=max).rev() {
+        let mut k = 0;
+        while k < n {
+            if levels[order[k]] >= level {
+                let j = (k..n).find(|&m| levels[order[m]] < level).unwrap_or(n);
+                order[k..j].reverse();
+                k = j;
+            } else {
+                k += 1;
+            }
+        }
+    }
+    let start = line
+        .items
+        .iter()
+        .map(|it| match it {
+            Placed::Text { x, .. } | Placed::Atomic { x, .. } => *x,
+        })
+        .fold(f32::INFINITY, f32::min);
+    let start = if start.is_finite() { start } else { 0.0 };
+    let old = std::mem::take(&mut line.items);
+    let mut slots: Vec<Option<Placed>> = old.into_iter().map(Some).collect();
+    let mut x = start;
+    for idx in order {
+        let Some(mut item) = slots[idx].take() else {
+            continue;
+        };
+        match &mut item {
+            Placed::Text { x: ix, width, .. } | Placed::Atomic { x: ix, width, .. } => {
+                *ix = x;
+                x += *width;
+            }
+        }
+        line.items.push(item);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::css::style::WhiteSpace;
+
+    fn words(line: &Line) -> Vec<String> {
+        line.items
+            .iter()
+            .filter_map(|i| match i {
+                Placed::Text { text, .. } if !text.trim().is_empty() => {
+                    Some(text.trim().to_string())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn line_of(texts: &[&str]) -> Line {
+        let mut x = 0.0;
+        let items = texts
+            .iter()
+            .map(|t| {
+                let p = Placed::Text {
+                    node: 0,
+                    x,
+                    width: 10.0,
+                    text: t.to_string(),
+                    shift: 0.0,
+                    space: if t.ends_with(' ') { 2.0 } else { 0.0 },
+                };
+                x += 10.0;
+                p
+            })
+            .collect();
+        Line {
+            items,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn bidi_reordering() {
+        // LTR paragraph: the Hebrew run is reversed in place.
+        let mut l = line_of(&["a ", "אב ", "גד ", "b"]);
+        reorder(&mut l, false);
+        assert_eq!(words(&l), ["a", "גד", "אב", "b"]);
+        // RTL paragraph: the line flips, the Latin run keeps its order.
+        let mut l = line_of(&["אב ", "Rust ", "1.86 ", "גד"]);
+        reorder(&mut l, true);
+        assert_eq!(words(&l), ["גד", "Rust", "1.86", "אב"]);
+    }
 
     fn setup(text: &str, ws: WhiteSpace) -> (Content, Vec<Option<Style>>) {
         let st = Style {
@@ -553,7 +778,7 @@ mod tests {
         let mut l = layout(&c, 200.0, &s, &f);
         assert_eq!(l.height, 30.0);
         let w = l.width;
-        align(&mut l, TextAlign::Center, 200.0);
+        align(&mut l, TextAlign::Center, 200.0, false);
         match &l.lines[0].items[0] {
             Placed::Text { x, .. } => assert!((x - (200.0 - w) / 2.0).abs() < 0.01),
             _ => unreachable!(),

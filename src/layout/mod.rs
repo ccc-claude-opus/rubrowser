@@ -694,7 +694,7 @@ impl Builder<'_> {
             }
             let mut il = inline::layout(content, w.max(0.0), self.styles, self.fonts);
             if let Some(owner) = self.style(content.owner) {
-                inline::align(&mut il, owner.text_align, w);
+                inline::align(&mut il, owner.text_align, w, owner.rtl);
             }
             il
         });

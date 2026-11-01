@@ -153,7 +153,10 @@ impl Overflow {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TextAlign {
+    /// `start`: left, or right in right-to-left text.
     #[default]
+    Start,
+    End,
     Left,
     Right,
     Center,
@@ -345,6 +348,8 @@ pub struct Style {
     pub line_through: bool,
     pub cursor: Cursor,
     pub list_style: ListStyle,
+    /// `direction: rtl` (inherited).
+    pub rtl: bool,
     pub visible: bool,
     /// Custom properties (`--name`), inherited.
     pub vars: Rc<BTreeMap<String, String>>,
@@ -419,12 +424,13 @@ impl Default for Style {
             italic: false,
             family: Family::Sans,
             line_height: LineHeight::Normal,
-            text_align: TextAlign::Left,
+            text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             underline: false,
             line_through: false,
             cursor: Cursor::Auto,
             list_style: ListStyle::Disc,
+            rtl: false,
             visible: true,
             vars: Rc::default(),
             has_rules: false,
@@ -451,6 +457,7 @@ impl Style {
             line_through: parent.line_through,
             cursor: parent.cursor,
             list_style: parent.list_style,
+            rtl: parent.rtl,
             visible: parent.visible,
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
@@ -921,8 +928,10 @@ impl Style {
             "line-height" => set(&mut self.line_height, line_height(v, fc)),
             "text-align" => {
                 self.text_align = match v {
-                    "left" | "start" | "justify" => TextAlign::Left,
-                    "right" | "end" => TextAlign::Right,
+                    "start" | "justify" => TextAlign::Start,
+                    "end" => TextAlign::End,
+                    "left" => TextAlign::Left,
+                    "right" => TextAlign::Right,
                     "center" => TextAlign::Center,
                     "-webkit-center" | "-moz-center" => TextAlign::WebkitCenter,
                     _ => return,
@@ -966,6 +975,11 @@ impl Style {
                 }
             }
             "visibility" => self.visible = v != "hidden" && v != "collapse",
+            "direction" => match v {
+                "rtl" => self.rtl = true,
+                "ltr" => self.rtl = false,
+                _ => {}
+            },
             "content" => self.content = Some(value.into()),
             "counter-reset" => self.counter_reset = Some(value.into()),
             "counter-increment" => self.counter_increment = Some(value.into()),
@@ -1214,6 +1228,7 @@ impl Style {
             }
             "cursor" => self.cursor = from.cursor,
             "list-style" | "list-style-type" => self.list_style = from.list_style,
+            "direction" => self.rtl = from.rtl,
             "visibility" => self.visible = from.visible,
             "vertical-align" => self.vertical_align = from.vertical_align,
             "border-spacing" => self.border_spacing = from.border_spacing,
@@ -1319,6 +1334,7 @@ fn is_inherited(name: &str) -> bool {
                 | "list-style"
                 | "list-style-type"
                 | "visibility"
+                | "direction"
                 | "border-spacing"
                 | "border-collapse"
                 | "text-transform"

@@ -5,6 +5,7 @@
 
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use fontdue::{Font, FontSettings};
 
@@ -163,6 +164,28 @@ pub struct Fonts {
     /// Downloaded web font faces (see [`Fonts::add_web_font`]).
     web: WebSlots,
     web_count: Cell<usize>,
+    /// Raw font data by glyph-cache face index, for shaping.
+    face_bytes: RefCell<HashMap<usize, Rc<[u8]>>>,
+    /// Shaped right-to-left runs: (face, text, size in 1/4 px) → glyphs.
+    shaped: RefCell<HashMap<(usize, String, u32), Rc<Shaped>>>,
+}
+
+/// A shaped run: the face that draws it and its glyphs in visual order.
+struct Shaped {
+    face: usize,
+    /// (glyph id, advance, x offset, y offset), in pixels at the size.
+    glyphs: Vec<(u16, f32, f32, f32)>,
+}
+
+/// Whether `c` is written right to left (Hebrew, Arabic, Syriac, Thaana,
+/// N'Ko and their presentation forms).
+pub fn is_rtl(c: char) -> bool {
+    matches!(c as u32, 0x0590..=0x08FF | 0xFB1D..=0xFDFF | 0xFE70..=0xFEFF)
+}
+
+/// Whether `text` contains right-to-left characters.
+pub fn has_rtl(text: &str) -> bool {
+    text.chars().any(is_rtl)
 }
 
 const MAX_CACHED_GLYPHS: usize = 8192;
@@ -190,7 +213,10 @@ impl Fonts {
         let Some(font) = decode_font(bytes) else {
             return false;
         };
-        let _ = self.web[slot].set(font);
+        let _ = self.web[slot].set(font.0);
+        self.face_bytes
+            .borrow_mut()
+            .insert(Self::WEB_BASE + slot, font.1.into());
         self.web_count.set(slot + 1);
         let name = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
         WEB_FAMILIES.with(|w| {
@@ -227,12 +253,93 @@ impl Fonts {
         let key = key.bundled_key();
         self.faces[key.index()].get_or_init(|| {
             if self.system
-                && let Some(f) = system_face(key)
+                && let Some((f, bytes)) = system_face(key)
             {
+                self.face_bytes
+                    .borrow_mut()
+                    .insert(key.index(), bytes.into());
                 return f;
             }
             Font::from_bytes(key.data(), FontSettings::default()).expect("bundled font is valid")
         })
+    }
+
+    /// Font data of glyph-cache face `index` (see [`Fonts::face_for`]).
+    fn bytes_of(&self, index: usize) -> Option<Rc<[u8]>> {
+        if let Some(b) = self.face_bytes.borrow().get(&index) {
+            return Some(b.clone());
+        }
+        // Bundled faces: their static data.
+        let local = match index {
+            i if i < Self::FALLBACK && !self.system => i,
+            i if i > Self::FALLBACK && i <= Self::FALLBACK + 12 => i - Self::FALLBACK - 1,
+            _ => return None,
+        };
+        let family = match local / 4 {
+            0 => Family::Sans,
+            1 => Family::Mono,
+            _ => Family::Serif,
+        };
+        let key = FontKey {
+            family,
+            bold: local & 2 != 0,
+            italic: local & 1 != 0,
+        };
+        Some(Rc::from(key.data()))
+    }
+
+    /// Shapes a right-to-left run with the face that has its first
+    /// right-to-left character. `None` if no such face's data is known.
+    fn shape(&self, key: FontKey, size: f32, text: &str) -> Option<Rc<Shaped>> {
+        let first = text.chars().find(|&c| is_rtl(c))?;
+        let (face, _) = self.face_for(key, first);
+        let size_q = (size * 4.0).round() as u32;
+        let cache_key = (face, text.to_string(), size_q);
+        if let Some(s) = self.shaped.borrow().get(&cache_key) {
+            return Some(s.clone());
+        }
+        let bytes = self.bytes_of(face)?;
+        let rb_face = rustybuzz::Face::from_slice(&bytes, 0)?;
+        let mut buffer = rustybuzz::UnicodeBuffer::new();
+        buffer.push_str(text);
+        buffer.set_direction(rustybuzz::Direction::RightToLeft);
+        buffer.guess_segment_properties();
+        let out = rustybuzz::shape(&rb_face, &[], buffer);
+        let scale = size / rb_face.units_per_em() as f32;
+        let glyphs = out
+            .glyph_infos()
+            .iter()
+            .zip(out.glyph_positions())
+            .map(|(i, p)| {
+                (
+                    i.glyph_id as u16,
+                    p.x_advance as f32 * scale,
+                    p.x_offset as f32 * scale,
+                    p.y_offset as f32 * scale,
+                )
+            })
+            .collect();
+        let shaped = Rc::new(Shaped { face, glyphs });
+        let mut cache = self.shaped.borrow_mut();
+        if cache.len() > 4096 {
+            cache.clear();
+        }
+        cache.insert(cache_key, shaped.clone());
+        Some(shaped)
+    }
+
+    /// The font behind glyph-cache face `index`.
+    fn font_at(&self, index: usize) -> Option<&Font> {
+        if index >= Self::WEB_BASE {
+            return self.web[index - Self::WEB_BASE].get();
+        }
+        if index == Self::FALLBACK {
+            return self.fallback();
+        }
+        if index > Self::FALLBACK {
+            return self.bundled[index - Self::FALLBACK - 1].get();
+        }
+        self.faces[index].get()
     }
 
     /// Index used for the fallback face in the glyph cache; bundled faces
@@ -317,6 +424,11 @@ impl Fonts {
 
     /// Width of `text` at `size`.
     pub fn measure(&self, key: FontKey, size: f32, text: &str) -> f32 {
+        if has_rtl(text)
+            && let Some(s) = self.shape(key, size, text)
+        {
+            return s.glyphs.iter().map(|g| g.1).sum();
+        }
         self.advances(key, size, text).iter().sum()
     }
 
@@ -334,6 +446,36 @@ impl Fonts {
         color: Color,
     ) -> f32 {
         let size_q = (size * 4.0).round() as u32;
+        if has_rtl(text)
+            && let Some(shaped) = self.shape(key, size, text)
+            && let Some(font) = self.font_at(shaped.face)
+        {
+            // Shaped glyphs, already in visual order.
+            let mut cache = self.glyphs.borrow_mut();
+            if cache.len() > MAX_CACHED_GLYPHS {
+                cache.clear();
+            }
+            let mut pen = x;
+            for &(gid, adv, dx, dy) in &shaped.glyphs {
+                // Glyph ids are cached under private-use code points.
+                let id = char::from_u32(0xF0000 + gid as u32).unwrap_or('\u{FFFD}');
+                let g = cache.entry((shaped.face, id, size_q)).or_insert_with(|| {
+                    let (m, coverage) = font.rasterize_indexed(gid, size);
+                    Glyph {
+                        xmin: m.xmin,
+                        ymin: m.ymin,
+                        width: m.width,
+                        height: m.height,
+                        coverage,
+                    }
+                });
+                let gx = (pen + dx).round() as i32 + g.xmin;
+                let gy = (baseline - dy).round() as i32 - g.ymin - g.height as i32;
+                canvas.draw_mask(gx, gy, g.width, g.height, &g.coverage, color);
+                pen += adv;
+            }
+            return pen - x;
+        }
         let advances = self.advances(key, size, text);
         let mut pen = x;
         let mut cache = self.glyphs.borrow_mut();
@@ -363,19 +505,21 @@ impl Fonts {
     }
 }
 
-/// Parses font bytes, unwrapping WOFF / WOFF2.
-fn decode_font(bytes: &[u8]) -> Option<Font> {
+/// Parses font bytes, unwrapping WOFF / WOFF2. Returns the font and its
+/// (unwrapped) data.
+fn decode_font(bytes: &[u8]) -> Option<(Font, Vec<u8>)> {
     let data = match bytes.get(..4)? {
         b"wOFF" => wuff::decompress_woff1(bytes).ok()?,
         b"wOF2" => wuff::decompress_woff2(bytes).ok()?,
         _ => bytes.to_vec(),
     };
-    Font::from_bytes(data, FontSettings::default()).ok()
+    let font = Font::from_bytes(&data[..], FontSettings::default()).ok()?;
+    Some((font, data))
 }
 
 /// An installed face metric-compatible with what other browsers use for
 /// `key` (Arial for sans-serif, Georgia for serif).
-fn system_face(key: FontKey) -> Option<Font> {
+fn system_face(key: FontKey) -> Option<(Font, Vec<u8>)> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let style = key.bold as usize * 2 + key.italic as usize;
@@ -424,9 +568,9 @@ fn system_face(key: FontKey) -> Option<Font> {
         };
         for set in candidates {
             if let Ok(bytes) = std::fs::read(set[style])
-                && let Ok(font) = Font::from_bytes(bytes, FontSettings::default())
+                && let Ok(font) = Font::from_bytes(&bytes[..], FontSettings::default())
             {
-                return Some(font);
+                return Some((font, bytes));
             }
         }
     }
