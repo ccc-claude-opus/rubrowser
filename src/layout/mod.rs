@@ -244,12 +244,18 @@ impl Builder<'_> {
             return self.build_table(tree, id, &css, tstyle);
         }
 
-        if self.dom.tag(id) == Some("input") {
+        if matches!(self.dom.tag(id), Some("input" | "textarea" | "select")) {
+            // Form controls are drawn by the browser: replaced elements.
+            let size = self
+                .replaced
+                .get(&id)
+                .copied()
+                .unwrap_or((0.0, css.line_height_px()));
             let ctx = Ctx {
                 node: Some(id),
                 style_node: id,
                 inline: None,
-                intrinsic: Some((0.0, css.line_height_px())),
+                intrinsic: Some(size),
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }

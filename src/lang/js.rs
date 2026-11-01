@@ -296,6 +296,25 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
         ("eventInt", 1, |_, a, c| {
             Ok(unsafe { ffi::event_int(int(a, 0, c)?) }.into())
         }),
+        ("getChecked", 1, |_, a, c| {
+            Ok((unsafe { ffi::get_checked(int(a, 0, c)?) } != 0).into())
+        }),
+        ("setChecked", 2, |_, a, c| {
+            let on = a.get_or_undefined(1).to_boolean();
+            unsafe { ffi::set_checked(int(a, 0, c)?, on as i32) };
+            Ok(JsValue::undefined())
+        }),
+        ("getSelected", 1, |_, a, c| {
+            Ok(unsafe { ffi::get_selected(int(a, 0, c)?) }.into())
+        }),
+        ("setSelected", 2, |_, a, c| {
+            unsafe { ffi::set_selected(int(a, 0, c)?, int(a, 1, c)?) };
+            Ok(JsValue::undefined())
+        }),
+        ("formAction", 2, |_, a, c| {
+            unsafe { ffi::form_action(int(a, 0, c)?, int(a, 1, c)?) };
+            Ok(JsValue::undefined())
+        }),
         ("eventPos", 1, |_, a, c| {
             Ok(unsafe { ffi::event_pos(int(a, 0, c)?) }.into())
         }),

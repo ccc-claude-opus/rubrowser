@@ -233,6 +233,22 @@
     set innerText(v) { this.textContent = v; }
     get value() { return rb.getValue(this.__h); }
     set value(v) { rb.setValue(this.__h, String(v)); }
+    get checked() { return rb.getChecked(this.__h); }
+    set checked(v) { rb.setChecked(this.__h, !!v); }
+    get selectedIndex() { return rb.getSelected(this.__h); }
+    set selectedIndex(i) { rb.setSelected(this.__h, Number(i)); }
+    get options() { return this.querySelectorAll('option'); }
+    get form() { return this.closest('form'); }
+    get name() { return this.getAttribute('name') || ''; }
+    set name(v) { this.setAttribute('name', v); }
+    get type() {
+      const t = this.getAttribute('type');
+      if (t) return t.toLowerCase();
+      return this.localName === 'button' ? 'submit' : this.localName === 'input' ? 'text' : '';
+    }
+    get elements() { return this.querySelectorAll('input, select, textarea, button'); }
+    submit() { rb.formAction(this.__h, 0); }
+    reset() { rb.formAction(this.__h, 1); }
     get hidden() { return this.hasAttribute('hidden'); }
     set hidden(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
     get disabled() { return this.hasAttribute('disabled'); }
@@ -460,7 +476,56 @@
     error: (...a) => rb.log('error: ' + format(a)),
   };
 
+  function parseUrl() {
+    const href = rb.location();
+    const m = /^([a-z][a-z0-9+.-]*:)(\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(href) || [];
+    return {
+      protocol: m[1] || '',
+      host: m[3] || '',
+      pathname: m[4] || '',
+      search: m[5] && m[5].length > 1 ? m[5] : '',
+      hash: m[6] && m[6].length > 1 ? m[6] : '',
+    };
+  }
+
+  class URLSearchParams {
+    constructor(init) {
+      this._pairs = [];
+      if (typeof init === 'string') {
+        for (const part of init.replace(/^\?/, '').split('&')) {
+          if (!part) continue;
+          const i = part.indexOf('=');
+          const dec = (s) => decodeURIComponent(s.replace(/\+/g, ' '));
+          this._pairs.push(i < 0 ? [dec(part), ''] : [dec(part.slice(0, i)), dec(part.slice(i + 1))]);
+        }
+      } else if (init && typeof init === 'object') {
+        for (const [k, v] of Object.entries(init)) this._pairs.push([String(k), String(v)]);
+      }
+    }
+    get(k) { const p = this._pairs.find(([n]) => n === k); return p ? p[1] : null; }
+    getAll(k) { return this._pairs.filter(([n]) => n === k).map(([, v]) => v); }
+    has(k) { return this._pairs.some(([n]) => n === k); }
+    set(k, v) { this.delete(k); this._pairs.push([k, String(v)]); }
+    append(k, v) { this._pairs.push([k, String(v)]); }
+    delete(k) { this._pairs = this._pairs.filter(([n]) => n !== k); }
+    entries() { return this._pairs[Symbol.iterator](); }
+    keys() { return this._pairs.map(([k]) => k)[Symbol.iterator](); }
+    forEach(fn) { this._pairs.forEach(([k, v]) => fn(v, k, this)); }
+    [Symbol.iterator]() { return this.entries(); }
+    toString() {
+      const enc = (s) => encodeURIComponent(s).replace(/%20/g, '+');
+      return this._pairs.map(([k, v]) => enc(k) + '=' + enc(v)).join('&');
+    }
+  }
+
   const location = {
+    get protocol() { return parseUrl().protocol; },
+    get host() { return parseUrl().host; },
+    get hostname() { return parseUrl().host.replace(/:\d+$/, ''); },
+    get pathname() { return parseUrl().pathname; },
+    get search() { return parseUrl().search; },
+    get hash() { return parseUrl().hash; },
+    get origin() { const u = parseUrl(); return u.host ? u.protocol + '//' + u.host : 'null'; },
     get href() { return rb.location(); },
     set href(v) { rb.navigate(String(v)); },
     assign(v) { rb.navigate(String(v)); },
@@ -493,6 +558,7 @@
     Document,
     Event,
     EventTarget,
+    URLSearchParams,
     setTimeout: (fn, ms, ...args) => addTimer(fn, ms, args, false),
     setInterval: (fn, ms, ...args) => addTimer(fn, ms, args, true),
     clearTimeout: clearTimer,

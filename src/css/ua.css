@@ -73,7 +73,33 @@ input, button, textarea, select {
 }
 
 input { cursor: text; width: 150px; }
-textarea { cursor: text; }
+textarea { cursor: text; font-family: monospace; white-space: pre; overflow: hidden; }
+select { padding: 2px 4px; border-radius: 3px; cursor: default; }
+option, optgroup { display: none; }
+input[type="hidden"] { display: none; }
+input[type="checkbox"], input[type="radio"] {
+  width: 13px;
+  height: 13px;
+  margin: 3px 4px;
+  padding: 0;
+  border: none;
+  background-color: transparent;
+  cursor: default;
+}
+input[type="submit"], input[type="button"], input[type="reset"], input[type="image"] {
+  width: auto;
+  padding: 2px 8px;
+  border-radius: 3px;
+  background-color: #e9e9ed;
+  cursor: default;
+}
+input[type="submit"]:hover, input[type="button"]:hover, input[type="reset"]:hover {
+  background-color: #d0d0d7;
+}
+input[disabled], textarea[disabled], select[disabled], button[disabled] { color: #9aa0a6; }
+label { cursor: default; }
+fieldset { margin: 0 2px; padding: 6px 12px 10px; border: 2px groove #c0c0c0; }
+legend { padding: 0 2px; }
 
 button {
   padding: 2px 8px;
@@ -85,4 +111,4 @@ button {
 
 button:hover { background-color: #d0d0d7; }
 button:active { background-color: #b1b1b9; }
-input:focus { border-color: #0060df; }
+input:focus, textarea:focus, select:focus { border-color: #0060df; }

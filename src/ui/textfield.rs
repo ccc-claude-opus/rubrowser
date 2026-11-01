@@ -1,4 +1,5 @@
-//! A single-line text field: caret, selection, scrolling, clipboard.
+//! An editable text field: caret, selection, scrolling, clipboard.
+//! Single-line for `<input>`, multi-line for `<textarea>`.
 
 use crate::abi::key;
 use crate::input::{Host, Modifiers};
@@ -24,9 +25,102 @@ pub struct TextField {
     anchor: usize,
     /// Horizontal scroll in logical pixels.
     scroll: f32,
+    /// Vertical scroll in logical pixels (multi-line only).
+    scroll_y: f32,
+    multiline: bool,
 }
 
 impl TextField {
+    /// A multi-line field (`<textarea>`): Enter inserts a newline and
+    /// Up/Down move between lines.
+    pub fn multiline() -> Self {
+        TextField {
+            multiline: true,
+            ..Default::default()
+        }
+    }
+
+    pub fn is_multiline(&self) -> bool {
+        self.multiline
+    }
+
+    /// Char ranges `start..end` of each line (without the newline).
+    pub fn lines(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut start = 0;
+        for (i, &c) in self.chars.iter().enumerate() {
+            if c == '\n' {
+                out.push((start, i));
+                start = i + 1;
+            }
+        }
+        out.push((start, self.chars.len()));
+        out
+    }
+
+    /// (line, column) of char position `pos`.
+    pub fn line_col(&self, pos: usize) -> (usize, usize) {
+        let lines = self.lines();
+        let line = lines
+            .iter()
+            .position(|&(s, e)| pos >= s && pos <= e)
+            .unwrap_or(lines.len() - 1);
+        (line, pos - lines[line].0)
+    }
+
+    fn line_bounds(&self, pos: usize) -> (usize, usize) {
+        let (line, _) = self.line_col(pos);
+        self.lines()[line]
+    }
+
+    /// Vertical scroll in logical pixels.
+    pub fn scroll_y(&self) -> f32 {
+        self.scroll_y
+    }
+
+    /// Keeps the caret's line visible in a box `height` tall.
+    pub fn scroll_to_caret_y(&mut self, height: f32, line_height: f32) {
+        let (line, _) = self.line_col(self.caret);
+        let top = line as f32 * line_height;
+        if top < self.scroll_y {
+            self.scroll_y = top;
+        }
+        if top + line_height > self.scroll_y + height {
+            self.scroll_y = top + line_height - height;
+        }
+        let max = (self.lines().len() as f32 * line_height - height).max(0.0);
+        self.scroll_y = self.scroll_y.clamp(0.0, max);
+    }
+
+    /// Moves the caret to `line`, keeping the column where possible.
+    fn move_line(&mut self, delta: isize, extend: bool) {
+        let (line, col) = self.line_col(self.caret);
+        let lines = self.lines();
+        let target = line as isize + delta;
+        let pos = if target < 0 {
+            0
+        } else if target as usize >= lines.len() {
+            self.chars.len()
+        } else {
+            let (s, e) = lines[target as usize];
+            (s + col).min(e)
+        };
+        self.move_to(pos, extend);
+    }
+
+    /// Char index at `line`, nearest to `x` (positions of that line).
+    pub fn click_line(&mut self, line: usize, x: f32, xs: &[f32], extend: bool) {
+        let lines = self.lines();
+        let (s, e) = lines[line.min(lines.len() - 1)];
+        let x = x + self.scroll;
+        let mut best = 0;
+        for (i, &px) in xs.iter().enumerate().take(e - s + 1) {
+            if (px - x).abs() < (xs[best] - x).abs() {
+                best = i;
+            }
+        }
+        self.move_to(s + best, extend);
+    }
     pub fn text(&self) -> String {
         self.chars.iter().collect()
     }
@@ -71,7 +165,11 @@ impl TextField {
     /// Replaces the selection with `text` (control characters dropped).
     pub fn insert(&mut self, text: &str) {
         self.delete_selection();
-        let new: Vec<char> = text.chars().filter(|c| !c.is_control()).collect();
+        let multiline = self.multiline;
+        let new: Vec<char> = text
+            .chars()
+            .filter(|&c| !c.is_control() || (multiline && c == '\n'))
+            .collect();
         let n = new.len();
         self.chars.splice(self.caret..self.caret, new);
         self.caret += n;
@@ -113,6 +211,7 @@ impl TextField {
         let word = mods.alt || (mods.ctrl && !mods.meta);
         let line = mods.meta;
         match code {
+            key::ENTER if self.multiline && !mods.command() => self.insert("\n"),
             key::ENTER => return Action::Submit,
             key::ESCAPE => return Action::Cancel,
             key::LEFT => {
@@ -140,6 +239,16 @@ impl TextField {
                     self.caret + 1
                 };
                 self.move_to(to, shift);
+            }
+            key::UP if self.multiline => self.move_line(-1, shift),
+            key::DOWN if self.multiline => self.move_line(1, shift),
+            key::HOME if self.multiline && !line => {
+                let (s, _) = self.line_bounds(self.caret);
+                self.move_to(s, shift)
+            }
+            key::END if self.multiline && !line => {
+                let (_, e) = self.line_bounds(self.caret);
+                self.move_to(e, shift)
             }
             key::HOME | key::UP => self.move_to(0, shift),
             key::END | key::DOWN => self.move_to(self.chars.len(), shift),
@@ -180,7 +289,11 @@ impl TextField {
             c if mods.command() && c == 'V' as i32 => {
                 // A host without clipboard access delivers pastes as text events.
                 if let Some(text) = host.clipboard_get() {
-                    self.insert(text.lines().next().unwrap_or(""));
+                    if self.multiline {
+                        self.insert(&text.replace("\r\n", "\n"));
+                    } else {
+                        self.insert(text.lines().next().unwrap_or(""));
+                    }
                 }
             }
             _ => return Action::Ignored,
@@ -357,6 +470,25 @@ mod tests {
         f.key(key::HOME, NONE, &mut TestHost::default());
         f.scroll_to_caret(50.0, &xs);
         assert_eq!(f.scroll(), 0.0);
+    }
+
+    #[test]
+    fn multiline_editing() {
+        let mut h = TestHost::default();
+        let mut f = TextField::multiline();
+        f.insert("ab");
+        f.key(key::ENTER, NONE, &mut h);
+        f.insert("cdef");
+        assert_eq!(f.text(), "ab\ncdef");
+        assert_eq!(f.line_col(f.caret()), (1, 4));
+        f.key(key::UP, NONE, &mut h);
+        assert_eq!(f.caret(), 2, "column clamps to the shorter line");
+        f.key(key::DOWN, NONE, &mut h);
+        assert_eq!(f.line_col(f.caret()), (1, 2));
+        f.key(key::HOME, NONE, &mut h);
+        assert_eq!(f.caret(), 3);
+        f.scroll_to_caret_y(10.0, 20.0);
+        assert_eq!(f.scroll_y(), 30.0);
     }
 
     #[test]

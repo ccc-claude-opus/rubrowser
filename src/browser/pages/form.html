@@ -1,0 +1,68 @@
+<!doctype html>
+<html>
+<head>
+<title>Form</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 32px 48px; background: #f6f7f9; color: #202124; }
+  form { max-width: 520px; padding: 20px 24px; background: #fff; border: 1px solid #dadce0; border-radius: 12px; }
+  h1 { font-size: 22px; margin: 0 0 16px 0; }
+  .field { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; }
+  .field > label:first-child { width: 90px; color: #5f6368; }
+  input[type="text"], input[type="password"], textarea, select { font-size: 14px; }
+  #name, #pw { width: 240px; }
+  textarea { width: 340px; }
+  .row { display: flex; gap: 16px; }
+  .actions { display: flex; gap: 8px; margin-top: 16px; }
+  #send { background: #1a73e8; color: #fff; border: none; padding: 6px 16px; border-radius: 6px; font-size: 14px; }
+  #send:hover { background: #1765cc; }
+  #result { margin-top: 20px; max-width: 520px; padding: 12px 16px; background: #e6f4ea; border-radius: 8px; display: none; }
+  #result.show { display: block; }
+  #result table { border-collapse: collapse; }
+  #result td { padding: 2px 12px 2px 0; }
+</style>
+</head>
+<body>
+  <form id="f" action="about:form">
+    <h1>Sign up</h1>
+    <div class="field"><label for="name">Name</label><input id="name" name="name" type="text" placeholder="Ada Lovelace"></div>
+    <div class="field"><label for="pw">Password</label><input id="pw" name="pw" type="password"></div>
+    <div class="field"><label>Plan</label>
+      <select id="plan" name="plan">
+        <option value="free">Free</option>
+        <option value="pro" selected>Pro</option>
+        <option value="team">Team</option>
+      </select>
+    </div>
+    <div class="field"><label>Size</label>
+      <div class="row">
+        <label><input type="radio" name="size" value="s"> Small</label>
+        <label><input type="radio" name="size" value="m" checked> Medium</label>
+        <label><input type="radio" name="size" value="l"> Large</label>
+      </div>
+    </div>
+    <div class="field"><label>Notes</label><textarea id="notes" name="notes" rows="3"></textarea></div>
+    <div class="field"><label></label><label><input id="news" type="checkbox" name="news" value="yes"> Send me news</label></div>
+    <div class="actions">
+      <button id="send" type="submit">Submit</button>
+      <input type="reset" value="Reset">
+    </div>
+  </form>
+  <div id="result"><b>Submitted:</b><table id="data"></table></div>
+<script>
+  // Show what the form sent (it submits to this same page with GET).
+  const params = new URLSearchParams(location.search);
+  const rows = [...params].map(([k, v]) => `<tr><td>${k}</td><td>${v.replace(/</g, '&lt;')}</td></tr>`);
+  if (rows.length) {
+    document.getElementById('data').innerHTML = rows.join('');
+    document.getElementById('result').classList.add('show');
+  }
+  document.getElementById('f').addEventListener('submit', (e) => {
+    if (!document.getElementById('name').value.trim()) {
+      e.preventDefault();
+      document.getElementById('name').style.borderColor = '#c5221f';
+      console.log('name is required');
+    }
+  });
+</script>
+</body>
+</html>

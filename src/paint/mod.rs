@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use crate::css::Style;
 use crate::css::style::{self as cs, Display, ListStyle};
 use crate::css::values::Rgba;
-use crate::document::{ImageState, Images};
+use crate::document::{
+    Control, FormState, ImageState, Images, button_label, control, option_label, options,
+};
 use crate::dom::{Dom, NodeId};
 use crate::gfx::{Canvas, Rect};
 use crate::layout::inline::Placed;
@@ -33,6 +35,7 @@ pub struct Painter<'a> {
     /// Whether the blinking caret is currently shown.
     pub caret: bool,
     pub images: &'a Images,
+    pub forms: &'a FormState,
 }
 
 const SELECTION: Rgba = Rgba::new(51, 132, 255, 90);
@@ -164,9 +167,21 @@ impl Painter<'_> {
             }
         }
         if let Some(node) = b.node
-            && self.dom.tag(node) == Some("input")
+            && self.dom.tag(node) != Some("button")
+            && style.visible
+            && let Some(kind) = control(self.dom, node)
         {
-            self.input(c, b, node, style, r);
+            match kind {
+                Control::Text | Control::Password => self.input(c, b, node, style, r),
+                Control::TextArea => self.textarea(c, b, node, style, r),
+                Control::Checkbox | Control::Radio => self.check(c, b, node, kind, r),
+                Control::Select => self.select(c, b, node, style, r),
+                Control::Submit | Control::Reset | Control::Button => {
+                    let label = button_label(self.dom, node, kind);
+                    self.centered_label(c, b, style, r, &label);
+                }
+                Control::Hidden => {}
+            }
         }
         if let Some(node) = b.node.filter(|&n| self.dom.tag(n) == Some("img"))
             && style.visible
@@ -175,6 +190,187 @@ impl Painter<'_> {
         }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);
+        }
+        c.set_clip(saved);
+    }
+
+    /// Content box of `b` placed at `r`.
+    fn content_area(b: &LBox, r: RectF) -> RectF {
+        let (cx, cy) = b.content_offset();
+        RectF {
+            x: r.x + cx,
+            y: r.y + cy,
+            w: (r.w - cx - b.border[cs::RIGHT] - b.padding[cs::RIGHT]).max(0.0),
+            h: (r.h - cy - b.border[cs::BOTTOM] - b.padding[cs::BOTTOM]).max(0.0),
+        }
+    }
+
+    /// Baseline for one line of `style` text centered in `area`.
+    fn centered_baseline(&self, style: &Style, area: RectF) -> f32 {
+        let m = self.fonts.line_metrics(style.font(), style.font_size);
+        area.y + (area.h - (m.ascent + m.descent)) / 2.0 + m.ascent
+    }
+
+    fn centered_label(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF, label: &str) {
+        let area = Self::content_area(b, r);
+        let w = self.fonts.measure(style.font(), style.font_size, label);
+        let baseline = self.centered_baseline(style, area);
+        self.text(
+            c,
+            style,
+            area.x + (area.w - w) / 2.0,
+            baseline,
+            label,
+            style.color,
+        );
+    }
+
+    /// A checkbox or radio button.
+    fn check(&self, c: &mut Canvas, b: &LBox, node: NodeId, kind: Control, r: RectF) {
+        let area = Self::content_area(b, r);
+        let s = self.scale;
+        let size = area.w.min(area.h).max(8.0);
+        let (x, y) = (
+            area.x + (area.w - size) / 2.0,
+            area.y + (area.h - size) / 2.0,
+        );
+        let on = self.forms.checked(self.dom, node);
+        let disabled = self.dom.attr(node, "disabled").is_some();
+        let accent = if disabled { 0x9aa0a6 } else { 0x0060df };
+        let round = if kind == Control::Radio {
+            size / 2.0
+        } else {
+            2.5
+        };
+        let outer = (x * s, y * s, size * s, size * s, round * s);
+        let t = s.max(1.0);
+        let inner = (
+            outer.0 + t,
+            outer.1 + t,
+            outer.2 - 2.0 * t,
+            outer.3 - 2.0 * t,
+            (round * s - t).max(0.0),
+        );
+        let filled = on && kind == Control::Checkbox;
+        c.fill_rounded(outer, None, if filled { accent } else { 0xffffff }, 255);
+        let edge = if on { accent } else { 0x767676 };
+        c.fill_rounded(outer, Some(inner), edge, 255);
+        if on && kind == Control::Checkbox {
+            let p = |fx: f32, fy: f32| (((x + fx * size) * s) as i32, ((y + fy * size) * s) as i32);
+            let (a, m, z) = (p(0.22, 0.52), p(0.42, 0.72), p(0.78, 0.3));
+            let w = (size * s / 7.0).max(1.5) as i32;
+            c.line(a.0, a.1, m.0, m.1, w, 0xffffff);
+            c.line(m.0, m.1, z.0, z.1, w, 0xffffff);
+        } else if on {
+            let d = size * 0.5;
+            let dot = (
+                (x + (size - d) / 2.0) * s,
+                (y + (size - d) / 2.0) * s,
+                d * s,
+                d * s,
+                d * s / 2.0,
+            );
+            c.fill_rounded(dot, None, accent, 255);
+        }
+    }
+
+    /// A `<select>`: the chosen option and a drop-down arrow.
+    fn select(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
+        let area = Self::content_area(b, r);
+        let label = self
+            .forms
+            .selected_index(self.dom, node)
+            .map(|i| option_label(self.dom, options(self.dom, node)[i]))
+            .unwrap_or_default();
+        let baseline = self.centered_baseline(style, area);
+        let saved = c.clip();
+        c.set_clip(self.phys(area).intersect(&saved));
+        self.text(c, style, area.x, baseline, &label, style.color);
+        c.set_clip(saved);
+        let arrow_w = self
+            .fonts
+            .measure(style.font(), style.font_size, "\u{25be}");
+        self.text(
+            c,
+            style,
+            area.x + area.w - arrow_w,
+            baseline,
+            "\u{25be}",
+            style.color,
+        );
+    }
+
+    /// A multi-line `<textarea>` with selection and caret.
+    fn textarea(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
+        let area = Self::content_area(b, r);
+        let field = self.inputs.get(&node);
+        let text = field.map_or_else(
+            || {
+                let t = self.dom.text_content(node);
+                t.strip_prefix('\n').unwrap_or(&t).to_string()
+            },
+            TextField::text,
+        );
+        let chars: Vec<char> = text.chars().collect();
+        let lh = style.line_height_px();
+        let m = self.fonts.line_metrics(style.font(), style.font_size);
+        let scroll_y = field.map_or(0.0, TextField::scroll_y);
+        let focused = self.focus == Some(node);
+        let (sel_s, sel_e) = field.map_or((0, 0), TextField::selection);
+        let caret = field.map_or(chars.len(), TextField::caret);
+        let saved = c.clip();
+        c.set_clip(
+            self.phys(RectF {
+                x: area.x - 1.0,
+                w: area.w + 2.0,
+                ..area
+            })
+            .intersect(&saved),
+        );
+        if chars.is_empty() && !focused {
+            if let Some(ph) = self.dom.attr(node, "placeholder") {
+                let baseline = area.y + (lh - (m.ascent + m.descent)) / 2.0 + m.ascent;
+                self.text(c, style, area.x, baseline, ph, PLACEHOLDER);
+            }
+        }
+        let mut start = 0;
+        for (i, line) in text.split('\n').enumerate() {
+            let n = line.chars().count();
+            let top = area.y - scroll_y + i as f32 * lh;
+            let baseline = top + (lh - (m.ascent + m.descent)) / 2.0 + m.ascent;
+            if top + lh >= area.y && top <= area.y + area.h {
+                let xs =
+                    TextField::positions(&self.fonts.advances(style.font(), style.font_size, line));
+                if focused && sel_s != sel_e {
+                    let (a, z) = (sel_s.max(start), sel_e.min(start + n));
+                    if a < z || (sel_s <= start + n && sel_e > start + n) {
+                        let x0 = xs[a.saturating_sub(start).min(n)];
+                        let x1 = if sel_e > start + n {
+                            xs[n] + 4.0
+                        } else {
+                            xs[z - start]
+                        };
+                        let sel = RectF {
+                            x: area.x + x0,
+                            y: top,
+                            w: x1 - x0,
+                            h: lh,
+                        };
+                        self.fill(c, sel, SELECTION);
+                    }
+                }
+                self.text(c, style, area.x, baseline, line, style.color);
+                if focused && self.caret && caret >= start && caret <= start + n {
+                    let bar = RectF {
+                        x: area.x + xs[caret - start],
+                        y: baseline - m.ascent,
+                        w: 1.0,
+                        h: m.ascent + m.descent,
+                    };
+                    self.fill(c, bar, style.color);
+                }
+            }
+            start += n + 1;
         }
         c.set_clip(saved);
     }
@@ -531,5 +727,73 @@ pub fn display_value(dom: &Dom, node: NodeId, value: &str) -> String {
         "\u{2022}".repeat(value.chars().count())
     } else {
         value.to_string()
+    }
+}
+
+/// Draws the option list of an open `<select>` over the page.
+#[allow(clippy::too_many_arguments)]
+pub fn select_popup(
+    c: &mut Canvas,
+    fonts: &Fonts,
+    scale: f32,
+    origin: (f32, f32),
+    rect: RectF,
+    items: &[String],
+    selected: Option<usize>,
+    hover: Option<usize>,
+    style: &Style,
+) {
+    let s = scale;
+    let r = RectF {
+        x: rect.x + origin.0,
+        y: rect.y + origin.1,
+        ..rect
+    };
+    let px = |v: RectF| (v.x * s, v.y * s, v.w * s, v.h * s);
+    let (x, y, w, h) = px(r);
+    // Soft shadow, frame, background.
+    c.fill_rounded(
+        (x + 1.0 * s, y + 2.0 * s, w, h, 4.0 * s),
+        None,
+        0x000000,
+        40,
+    );
+    c.fill_rounded((x, y, w, h, 4.0 * s), None, 0x8f8f9d, 255);
+    c.fill_rounded(
+        (x + s, y + s, w - 2.0 * s, h - 2.0 * s, 3.0 * s),
+        None,
+        0xffffff,
+        255,
+    );
+    let row = (r.h - 2.0) / items.len().max(1) as f32;
+    let m = fonts.line_metrics(style.font(), style.font_size);
+    for (i, label) in items.iter().enumerate() {
+        let top = r.y + 1.0 + i as f32 * row;
+        let bg = if hover == Some(i) {
+            Some(0xd2e3fc)
+        } else if selected == Some(i) {
+            Some(0xe8f0fe)
+        } else {
+            None
+        };
+        if let Some(bg) = bg {
+            let (bx, by, bw, bh) = px(RectF {
+                x: r.x + 1.0,
+                y: top,
+                w: r.w - 2.0,
+                h: row,
+            });
+            c.fill_rect(bx as i32, by as i32, bw.ceil() as i32, bh.ceil() as i32, bg);
+        }
+        let baseline = top + (row - (m.ascent + m.descent)) / 2.0 + m.ascent;
+        fonts.draw(
+            c,
+            style.font(),
+            style.font_size * s,
+            (r.x + 8.0) * s,
+            baseline * s,
+            label,
+            style.color.rgb(),
+        );
     }
 }

@@ -13,8 +13,12 @@ use crate::text::Fonts;
 use crate::ui::TextField;
 use std::collections::HashMap;
 
+mod forms;
 mod image;
 
+pub use forms::{
+    Control, FormState, control, form_of, label_target, option_label, options, urlencode,
+};
 pub use image::{Bitmap, ImageState, Images};
 
 /// Result of a hit test.
@@ -43,7 +47,10 @@ pub struct Document {
     inputs: HashMap<NodeId, TextField>,
     /// Whether the caret is in its visible blink phase.
     pub caret_on: bool,
+    /// Option under the pointer in the open `<select>` list.
+    pub popup_hover: Option<usize>,
     pub images: Images,
+    pub forms: FormState,
 }
 
 impl Document {
@@ -61,7 +68,9 @@ impl Document {
             needs_layout: true,
             inputs: HashMap::new(),
             caret_on: true,
+            popup_hover: None,
             images: Images::default(),
+            forms: FormState::default(),
         }
     }
 
@@ -163,8 +172,65 @@ impl Document {
             focus: self.state.focus,
             caret: self.caret_on,
             images: &self.images,
+            forms: &self.forms,
         }
         .paint(canvas, origin);
+        if let Some((rect, items)) = self.select_popup(fonts) {
+            let open = self.forms.open_select.unwrap_or(Dom::ROOT);
+            let selected = self.forms.selected_index(&self.dom, open);
+            let style = self.style(open).cloned().unwrap_or_default();
+            let hover = self.popup_hover;
+            crate::paint::select_popup(
+                canvas, fonts, scale, origin, rect, &items, selected, hover, &style,
+            );
+        }
+    }
+
+    /// The open `<select>`'s option list: its rectangle (viewport
+    /// coordinates) and option labels.
+    pub fn select_popup(&self, fonts: &Fonts) -> Option<(RectF, Vec<String>)> {
+        let select = self.forms.open_select?;
+        let (border, _) = self.box_rects(select)?;
+        let st = self.style(select)?;
+        let items: Vec<String> = options(&self.dom, select)
+            .into_iter()
+            .map(|o| option_label(&self.dom, o))
+            .collect();
+        let row = st.line_height_px() + 6.0;
+        let widest = items
+            .iter()
+            .map(|t| fonts.measure(st.font(), st.font_size, t))
+            .fold(0.0, f32::max);
+        let w = border.w.max(widest + 24.0);
+        let h = row * items.len() as f32 + 2.0;
+        // Below the control, or above it if that does not fit.
+        let below = border.y + border.h;
+        let y = if below + h > self.size.1 && border.y - h >= 0.0 {
+            border.y - h
+        } else {
+            below
+        };
+        Some((
+            RectF {
+                x: border.x,
+                y,
+                w,
+                h,
+            },
+            items,
+        ))
+    }
+
+    /// Which option of the open popup is at `(x, y)`: `Some(Some(i))` on an
+    /// option, `Some(None)` elsewhere inside it, `None` outside.
+    pub fn popup_hit(&self, x: f32, y: f32, fonts: &Fonts) -> Option<Option<usize>> {
+        let (r, items) = self.select_popup(fonts)?;
+        if !r.contains(x, y) {
+            return None;
+        }
+        let row = (r.h - 2.0) / items.len().max(1) as f32;
+        let i = ((y - r.y - 1.0) / row).floor();
+        Some((i >= 0.0 && (i as usize) < items.len()).then_some(i as usize))
     }
 
     /// Natural sizes of images: the bitmap's, or room for the `alt` text
@@ -172,6 +238,10 @@ impl Document {
     fn replaced_sizes(&self, fonts: &Fonts) -> Replaced {
         let mut out = Replaced::new();
         for n in self.dom.descendants(Dom::ROOT) {
+            if let Some(size) = self.control_size(n, fonts) {
+                out.insert(n, size);
+                continue;
+            }
             if self.dom.tag(n) != Some("img") {
                 continue;
             }
@@ -189,6 +259,42 @@ impl Document {
             out.insert(n, size);
         }
         out
+    }
+
+    /// Content size of a form control drawn by the browser.
+    fn control_size(&self, n: NodeId, fonts: &Fonts) -> Option<(f32, f32)> {
+        let kind = control(&self.dom, n)?;
+        if self.dom.tag(n) == Some("button") {
+            return None; // laid out from its children
+        }
+        let st = self.style(n)?;
+        let lh = st.line_height_px();
+        let num = |attr: &str, default: f32| {
+            self.dom
+                .attr(n, attr)
+                .and_then(|v| v.trim().parse::<f32>().ok())
+                .filter(|v| *v > 0.0)
+                .unwrap_or(default)
+        };
+        Some(match kind {
+            Control::Text | Control::Password | Control::Hidden => (0.0, lh),
+            Control::TextArea => (
+                num("cols", 20.0) * fonts.measure(st.font(), st.font_size, "n"),
+                num("rows", 2.0) * lh,
+            ),
+            Control::Checkbox | Control::Radio => (13.0, 13.0),
+            Control::Select => {
+                let widest = options(&self.dom, n)
+                    .into_iter()
+                    .map(|o| fonts.measure(st.font(), st.font_size, &option_label(&self.dom, o)))
+                    .fold(0.0, f32::max);
+                (widest + 18.0, lh)
+            }
+            Control::Submit | Control::Reset | Control::Button => (
+                fonts.measure(st.font(), st.font_size, &button_label(&self.dom, n, kind)),
+                lh,
+            ),
+        })
     }
 
     /// `<img>` elements whose `src` has not been requested yet: marks them
@@ -227,45 +333,115 @@ impl Document {
         self.needs_layout = true;
     }
 
-    /// The editing state of input `node`, initialized from its `value`.
+    /// The editing state of text control `node`, initialized from its
+    /// `value` (or, for `<textarea>`, its text).
     pub fn input(&mut self, node: NodeId) -> &mut TextField {
         let dom = &self.dom;
         self.inputs.entry(node).or_insert_with(|| {
-            let mut f = TextField::default();
-            f.set_text(dom.attr(node, "value").unwrap_or(""));
-            f
+            if dom.tag(node) == Some("textarea") {
+                let mut f = TextField::multiline();
+                let text = dom.text_content(node);
+                // A newline right after <textarea> is not part of the value.
+                f.set_text(text.strip_prefix('\n').unwrap_or(&text));
+                f
+            } else {
+                let mut f = TextField::default();
+                f.set_text(dom.attr(node, "value").unwrap_or(""));
+                f
+            }
         })
     }
 
+    /// The current value of a form control.
     pub fn input_value(&self, node: NodeId) -> String {
-        self.inputs.get(&node).map_or_else(
-            || self.dom.attr(node, "value").unwrap_or("").to_string(),
-            TextField::text,
-        )
+        match control(&self.dom, node) {
+            Some(Control::Select) => self
+                .forms
+                .selected_index(&self.dom, node)
+                .map(|i| forms::option_value(&self.dom, options(&self.dom, node)[i]))
+                .unwrap_or_default(),
+            Some(Control::TextArea) if !self.inputs.contains_key(&node) => {
+                let text = self.dom.text_content(node);
+                text.strip_prefix('\n').unwrap_or(&text).to_string()
+            }
+            Some(Control::Checkbox | Control::Radio) => {
+                self.dom.attr(node, "value").unwrap_or("on").to_string()
+            }
+            _ => self.inputs.get(&node).map_or_else(
+                || self.dom.attr(node, "value").unwrap_or("").to_string(),
+                TextField::text,
+            ),
+        }
     }
 
     pub fn set_input_value(&mut self, node: NodeId, value: &str) {
-        self.input(node).set_text(value);
+        match control(&self.dom, node) {
+            Some(Control::Select) => {
+                let found = options(&self.dom, node)
+                    .into_iter()
+                    .position(|o| forms::option_value(&self.dom, o) == value);
+                if let Some(i) = found {
+                    self.forms.set_selected(node, i);
+                }
+            }
+            Some(k) if k.is_text() => self.input(node).set_text(value),
+            _ => {
+                if let Some(e) = self.dom_mut().element_mut(node) {
+                    e.set_attr("value", value);
+                }
+            }
+        }
+        self.needs_layout = true;
     }
 
     pub fn is_text_input(&self, node: NodeId) -> bool {
-        self.dom.tag(node) == Some("input")
-            && !self.dom.attr(node, "type").is_some_and(|t| {
-                matches!(
-                    t.to_ascii_lowercase().as_str(),
-                    "button" | "submit" | "checkbox" | "radio" | "hidden"
-                )
-            })
+        control(&self.dom, node).is_some_and(Control::is_text)
+            && self.dom.attr(node, "disabled").is_none()
     }
 
     /// Whether `node` can take keyboard focus.
     pub fn is_focusable(&self, node: NodeId) -> bool {
+        if let Some(kind) = control(&self.dom, node) {
+            return kind != Control::Hidden && self.dom.attr(node, "disabled").is_none();
+        }
         match self.dom.tag(node) {
-            Some("input") | Some("button") => self.dom.attr(node, "disabled").is_none(),
             Some("a") => self.dom.attr(node, "href").is_some(),
             Some(_) => self.dom.attr(node, "tabindex").is_some(),
             None => false,
         }
+    }
+
+    /// Name/value pairs a form submits (with the button that submitted it).
+    pub fn form_data(&self, form: NodeId, submitter: Option<NodeId>) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for n in self.dom.descendants(form) {
+            let (Some(kind), Some(name)) = (control(&self.dom, n), self.dom.attr(n, "name")) else {
+                continue;
+            };
+            if name.is_empty() || self.dom.attr(n, "disabled").is_some() {
+                continue;
+            }
+            let include = match kind {
+                Control::Checkbox | Control::Radio => self.forms.checked(&self.dom, n),
+                Control::Submit | Control::Reset | Control::Button => {
+                    Some(n) == submitter && kind == Control::Submit
+                }
+                _ => true,
+            };
+            if include {
+                out.push((name.to_string(), self.input_value(n)));
+            }
+        }
+        out
+    }
+
+    /// Restores the controls of `form` to their initial values.
+    pub fn reset_form(&mut self, form: NodeId) {
+        self.forms.reset(&self.dom, form);
+        for n in self.dom.descendants(form) {
+            self.inputs.remove(&n);
+        }
+        self.needs_layout = true;
     }
 
     /// The nearest focusable element at or above `node`.
@@ -300,7 +476,18 @@ impl Document {
     /// Absolute content box of element `node` (viewport coordinates,
     /// scrolling applied), if it is laid out.
     pub fn content_box(&self, node: NodeId) -> Option<RectF> {
-        fn walk(d: &Document, i: usize, ox: f32, oy: f32, target: NodeId) -> Option<RectF> {
+        self.box_rects(node).map(|(_, content)| content)
+    }
+
+    /// Absolute border box and content box of element `node`.
+    pub fn box_rects(&self, node: NodeId) -> Option<(RectF, RectF)> {
+        fn walk(
+            d: &Document,
+            i: usize,
+            ox: f32,
+            oy: f32,
+            target: NodeId,
+        ) -> Option<(RectF, RectF)> {
             let b = &d.tree.boxes[i];
             let r = RectF {
                 x: ox + b.rect.x,
@@ -309,12 +496,13 @@ impl Document {
             };
             let (cx, cy) = b.content_offset();
             if b.node == Some(target) {
-                return Some(RectF {
+                let content = RectF {
                     x: r.x + cx,
                     y: r.y + cy,
                     w: (r.w - cx - b.border[1] - b.padding[1]).max(0.0),
                     h: (r.h - cy - b.border[2] - b.padding[2]).max(0.0),
-                });
+                };
+                return Some((r, content));
             }
             let clips = b.node.is_some()
                 && d.style(b.style_node)
@@ -355,9 +543,31 @@ impl Document {
         Some((xs, self.content_box(node)?))
     }
 
-    /// Places the caret of input `node` at viewport point `x` (mouse press
-    /// or drag).
-    pub fn input_pointer(&mut self, node: NodeId, x: f32, drag: bool, extend: bool, fonts: &Fonts) {
+    /// Places the caret of text control `node` at viewport point `(x, y)`
+    /// (mouse press or drag).
+    pub fn input_pointer(
+        &mut self,
+        node: NodeId,
+        x: f32,
+        y: f32,
+        drag: bool,
+        extend: bool,
+        fonts: &Fonts,
+    ) {
+        if self.dom.tag(node) == Some("textarea") {
+            let (Some(st), Some(area)) = (self.style(node).cloned(), self.content_box(node)) else {
+                return;
+            };
+            let lh = st.line_height_px();
+            let f = self.input(node);
+            let line = ((y - area.y + f.scroll_y()) / lh).floor().max(0.0) as usize;
+            let lines = f.lines();
+            let (s, e) = lines[line.min(lines.len() - 1)];
+            let text: String = f.text().chars().skip(s).take(e - s).collect();
+            let xs = TextField::positions(&fonts.advances(st.font(), st.font_size, &text));
+            f.click_line(line, x - area.x, &xs, drag || extend);
+            return;
+        }
         let Some((xs, area)) = self.input_geometry(node, fonts) else {
             return;
         };
@@ -369,10 +579,17 @@ impl Document {
         }
     }
 
-    /// Scrolls every input so its caret is visible.
+    /// Scrolls every text control so its caret is visible.
     pub fn scroll_inputs(&mut self, fonts: &Fonts) {
         let nodes: Vec<NodeId> = self.inputs.keys().copied().collect();
         for n in nodes {
+            if self.dom.tag(n) == Some("textarea") {
+                if let (Some(st), Some(area)) = (self.style(n).cloned(), self.content_box(n)) {
+                    // Lines are clipped, not scrolled sideways.
+                    self.input(n).scroll_to_caret_y(area.h, st.line_height_px());
+                }
+                continue;
+            }
             if let Some((xs, area)) = self.input_geometry(n, fonts) {
                 self.input(n).scroll_to_caret(area.w, &xs);
             }
@@ -575,6 +792,20 @@ impl Document {
             }
         }
     }
+}
+
+/// The label of an `<input>` push button.
+pub fn button_label(dom: &Dom, node: NodeId, kind: Control) -> String {
+    dom.attr(node, "value")
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            match kind {
+                Control::Submit => "Submit",
+                Control::Reset => "Reset",
+                _ => "",
+            }
+            .to_string()
+        })
 }
 
 #[cfg(test)]

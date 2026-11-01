@@ -96,6 +96,11 @@ imports! {
     fn event_pos(which: i32) -> f64;
     fn location(p: *mut u8, cap: usize) -> i32;
     fn history_go(delta: i32);
+    fn get_checked(h: i32) -> i32;
+    fn set_checked(h: i32, v: i32);
+    fn get_selected(h: i32) -> i32;
+    fn set_selected(h: i32, i: i32);
+    fn form_action(h: i32, op: i32);
 }
 
 /// Reads a string the browser writes into a buffer, growing it if needed.
@@ -360,6 +365,34 @@ impl Element {
 
     pub fn set_value(self, value: &str) {
         unsafe { ffi::set_value(self.0, value.as_ptr(), value.len()) }
+    }
+
+    /// Whether a checkbox or radio button is checked.
+    pub fn checked(self) -> bool {
+        unsafe { ffi::get_checked(self.0) != 0 }
+    }
+
+    pub fn set_checked(self, on: bool) {
+        unsafe { ffi::set_checked(self.0, on as i32) }
+    }
+
+    /// Index of the chosen `<option>` of a `<select>`.
+    pub fn selected_index(self) -> Option<usize> {
+        usize::try_from(unsafe { ffi::get_selected(self.0) }).ok()
+    }
+
+    pub fn set_selected_index(self, index: usize) {
+        unsafe { ffi::set_selected(self.0, index as i32) }
+    }
+
+    /// Submits a `<form>` (without firing its `submit` event).
+    pub fn submit(self) {
+        unsafe { ffi::form_action(self.0, 0) }
+    }
+
+    /// Resets a `<form>`'s controls.
+    pub fn reset(self) {
+        unsafe { ffi::form_action(self.0, 1) }
     }
 
     /// Appends `child` (moving it if it is already in the document).

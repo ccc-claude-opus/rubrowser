@@ -69,6 +69,8 @@ pub struct Output {
     pub cleared: Vec<i32>,
     /// History steps requested (`history.back()` is -1).
     pub history: i32,
+    /// A form the script submitted with `form.submit()`.
+    pub submit: Option<NodeId>,
 }
 
 /// The event being dispatched, readable through the `event_*` imports.
@@ -828,6 +830,46 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
     )?;
     l.func_wrap("rb", "history_go", |mut c: C, delta: i32| {
         c.data_mut().out.history = delta.clamp(-100, 100);
+    })?;
+
+    // ----- ABI v1: form controls -------------------------------------------
+    l.func_wrap("rb", "get_checked", |c: C, h: i32| -> i32 {
+        let doc = &c.data().doc;
+        element(doc, h).is_some_and(|e| doc.forms.checked(&doc.dom, e)) as i32
+    })?;
+    l.func_wrap("rb", "set_checked", |mut c: C, h: i32, v: i32| {
+        let doc = &mut c.data_mut().doc;
+        if let Some(e) = element(doc, h) {
+            doc.forms.set_checked(&doc.dom, e, v != 0);
+            doc.dom_changed();
+        }
+    })?;
+    l.func_wrap("rb", "get_selected", |c: C, h: i32| -> i32 {
+        let doc = &c.data().doc;
+        element(doc, h)
+            .and_then(|e| doc.forms.selected_index(&doc.dom, e))
+            .map_or(-1, |i| i as i32)
+    })?;
+    l.func_wrap("rb", "set_selected", |mut c: C, h: i32, i: i32| {
+        let doc = &mut c.data_mut().doc;
+        if let (Some(e), Ok(i)) = (element(doc, h), usize::try_from(i)) {
+            if i < crate::document::options(&doc.dom, e).len() {
+                doc.forms.set_selected(e, i);
+                doc.dom_changed();
+            }
+        }
+    })?;
+    l.func_wrap("rb", "form_action", |mut c: C, h: i32, op: i32| {
+        // op: 0 submit, 1 reset.
+        let s = c.data_mut();
+        let Some(form) = element(&s.doc, h).filter(|&e| s.doc.dom.tag(e) == Some("form")) else {
+            return;
+        };
+        if op == 0 {
+            s.out.submit = Some(form);
+        } else {
+            s.doc.reset_form(form);
+        }
     })?;
     Ok(l)
 }

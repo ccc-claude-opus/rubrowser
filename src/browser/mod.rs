@@ -27,6 +27,8 @@ const DOUBLE_CLICK_MS: f64 = 400.0;
 
 /// Pages and files built into the browser, served as `about:NAME`.
 fn builtin(name: &str) -> Option<&'static [u8]> {
+    // about:form?x=1 is the page about:form (the query is for its scripts).
+    let name = name.split(['?', '#']).next().unwrap_or(name);
     Some(match name {
         "home" => HOME_HTML.as_bytes(),
         "blank" => b"",
@@ -40,6 +42,7 @@ fn builtin(name: &str) -> Option<&'static [u8]> {
         "events.wasm" => include_bytes!("pages/events.wasm"),
         "js-todo" => include_bytes!("pages/js-todo.html"),
         "calc" => include_bytes!("pages/calc.html"),
+        "form" => include_bytes!("pages/form.html"),
         _ => return None,
     })
 }
@@ -625,6 +628,24 @@ impl Browser {
             self.navigate(&target, host);
         } else if out.history != 0 && i == self.active {
             self.go(out.history as isize, host);
+        } else if let Some(form) = out.submit.filter(|_| i == self.active) {
+            // form.submit() skips the submit event, as in browsers.
+            let doc = &self.tabs[i].doc;
+            let data = doc.form_data(form, None);
+            let action = doc
+                .dom
+                .attr(form, "action")
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let base = if action.is_empty() {
+                doc.url.clone()
+            } else {
+                url::resolve(&doc.url, &action)
+            };
+            let base = base.split(['?', '#']).next().unwrap_or("").to_string();
+            let target = format!("{base}?{}", crate::document::urlencode(&data));
+            self.navigate(&target, host);
         }
         (out.prevent_default, out.stop_propagation)
     }
@@ -910,18 +931,30 @@ impl Browser {
         }) = self.press
         {
             let vp = self.viewport_rect();
-            let lx = if target == Target::Page { x - vp.x } else { x };
+            let (lx, ly) = if target == Target::Page {
+                (x - vp.x, y - vp.y)
+            } else {
+                (x, y)
+            };
             let fonts = &self.fonts;
             match target {
-                Target::Chrome => self.chrome.input_pointer(n, lx, true, false, fonts),
+                Target::Chrome => self.chrome.input_pointer(n, lx, ly, true, false, fonts),
                 Target::Page => self.tabs[self.active]
                     .doc
-                    .input_pointer(n, lx, true, false, fonts),
+                    .input_pointer(n, lx, ly, true, false, fonts),
             }
             self.dirty = true;
             return;
         }
         let (t, lx, ly) = self.target_at(x, y);
+        if t == Target::Page {
+            let doc = &mut self.tabs[self.active].doc;
+            let hover = doc.popup_hit(lx, ly, &self.fonts).flatten();
+            if doc.popup_hover != hover {
+                doc.popup_hover = hover;
+                self.dirty = true;
+            }
+        }
         let hit = self.doc(t).hit_test(lx, ly);
         let other = if t == Target::Chrome {
             Target::Page
@@ -1000,6 +1033,23 @@ impl Browser {
 
     fn mouse_down(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         let (t, lx, ly) = self.target_at(x, y);
+        // An open <select> list takes the click first.
+        if self.tabs[self.active].doc.forms.open_select.is_some() {
+            let hit = (t == Target::Page)
+                .then(|| self.tabs[self.active].doc.popup_hit(lx, ly, &self.fonts))
+                .flatten();
+            match hit {
+                Some(Some(i)) => {
+                    self.choose_option(i, host);
+                    return;
+                }
+                Some(None) => return,
+                None => {
+                    self.tabs[self.active].doc.forms.open_select = None;
+                    self.dirty = true;
+                }
+            }
+        }
         let hit = self.doc(t).hit_test(lx, ly);
         if t == Target::Page
             && let Some(e) = hit.element
@@ -1035,10 +1085,10 @@ impl Browser {
                 let shift = self.mods.shift;
                 let fonts = &self.fonts;
                 match t {
-                    Target::Chrome => self.chrome.input_pointer(f, lx, false, shift, fonts),
+                    Target::Chrome => self.chrome.input_pointer(f, lx, ly, false, shift, fonts),
                     Target::Page => self.tabs[self.active]
                         .doc
-                        .input_pointer(f, lx, false, shift, fonts),
+                        .input_pointer(f, lx, ly, false, shift, fonts),
                 }
                 input = Some(f);
             }
@@ -1114,13 +1164,141 @@ impl Browser {
                 if self.dispatch(node, "click", self.page_pointer(), host) {
                     return;
                 }
-                let doc = &self.tabs[self.active].doc;
-                if let Some(href) = doc.link(node) {
-                    let target = url::resolve(&doc.url, &href);
-                    self.navigate(&target, host);
-                }
+                self.activate(node, host);
             }
         }
+    }
+
+    /// The default action of a click on page element `node`: follow a
+    /// link, toggle a checkbox, open a select, submit a form, …
+    fn activate(&mut self, node: NodeId, host: &mut dyn Host) {
+        use crate::document::{Control, control, label_target};
+        let doc = &self.tabs[self.active].doc;
+        // The innermost control or label around the clicked node.
+        let mut n = Some(node);
+        while let Some(id) = n {
+            if doc.dom.attr(id, "disabled").is_some() && control(&doc.dom, id).is_some() {
+                return;
+            }
+            if let Some(kind) = control(&doc.dom, id) {
+                return self.activate_control(id, kind, host);
+            }
+            if doc.dom.tag(id) == Some("label") {
+                if let Some(target) = label_target(&doc.dom, id) {
+                    let kind = control(&doc.dom, target);
+                    if kind.is_some_and(|k| k.is_text()) || kind == Some(Control::Select) {
+                        self.focus_page(Some(target), host);
+                        self.dirty = true;
+                        return;
+                    }
+                    // Clicking a label clicks its control.
+                    if !self.dispatch(target, "click", self.page_pointer(), host) {
+                        self.activate(target, host);
+                    }
+                }
+                return;
+            }
+            if let Some(href) = doc.link(id) {
+                let target = url::resolve(&doc.url, &href);
+                return self.navigate(&target, host);
+            }
+            n = doc.dom.parent(id);
+        }
+    }
+
+    fn activate_control(
+        &mut self,
+        node: NodeId,
+        kind: crate::document::Control,
+        host: &mut dyn Host,
+    ) {
+        use crate::document::{Control, form_of};
+        let doc = &mut self.tabs[self.active].doc;
+        match kind {
+            Control::Checkbox => {
+                let on = !doc.forms.checked(&doc.dom, node);
+                doc.forms.set_checked(&doc.dom, node, on);
+            }
+            Control::Radio => {
+                if doc.forms.checked(&doc.dom, node) {
+                    return;
+                }
+                doc.forms.set_checked(&doc.dom, node, true);
+            }
+            Control::Select => {
+                let open = doc.forms.open_select == Some(node);
+                doc.forms.open_select = (!open).then_some(node);
+                doc.popup_hover = None;
+                self.dirty = true;
+                return;
+            }
+            Control::Submit => {
+                if let Some(form) = form_of(&doc.dom, node) {
+                    self.submit_form(form, Some(node), host);
+                }
+                return;
+            }
+            Control::Reset => {
+                if let Some(form) = form_of(&doc.dom, node) {
+                    doc.reset_form(form);
+                    self.dirty = true;
+                }
+                return;
+            }
+            _ => return,
+        }
+        doc.dom_changed();
+        self.dirty = true;
+        self.dispatch(node, "input", EventInit::default(), host);
+        self.dispatch(node, "change", EventInit::default(), host);
+    }
+
+    /// Picks option `i` of the open `<select>`.
+    fn choose_option(&mut self, i: usize, host: &mut dyn Host) {
+        let doc = &mut self.tabs[self.active].doc;
+        let Some(select) = doc.forms.open_select.take() else {
+            return;
+        };
+        let changed = doc.forms.selected_index(&doc.dom, select) != Some(i);
+        doc.forms.set_selected(select, i);
+        doc.dom_changed();
+        self.dirty = true;
+        self.focus_page(Some(select), host);
+        if changed {
+            self.dispatch(select, "input", EventInit::default(), host);
+            self.dispatch(select, "change", EventInit::default(), host);
+        }
+    }
+
+    /// Submits `form` with a GET request (after its `submit` event).
+    fn submit_form(&mut self, form: NodeId, submitter: Option<NodeId>, host: &mut dyn Host) {
+        if self.dispatch(form, "submit", EventInit::default(), host) {
+            return;
+        }
+        let doc = &self.tabs[self.active].doc;
+        let data = doc.form_data(form, submitter);
+        let action = doc
+            .dom
+            .attr(form, "action")
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let method = doc
+            .dom
+            .attr(form, "method")
+            .unwrap_or("get")
+            .to_ascii_lowercase();
+        if method == "post" {
+            host.log("form method=post is not supported; submitting with GET");
+        }
+        let base = if action.is_empty() {
+            doc.url.clone()
+        } else {
+            url::resolve(&doc.url, &action)
+        };
+        let base = base.split(['?', '#']).next().unwrap_or("").to_string();
+        let target = format!("{base}?{}", crate::document::urlencode(&data));
+        self.navigate(&target, host);
     }
 
     fn command(&mut self, action: &str, tab: Option<usize>, host: &mut dyn Host) {
@@ -1186,6 +1364,14 @@ impl Browser {
                 return;
             }
         }
+        if t == Target::Page
+            && let Some(n) = focus
+            && crate::document::control(&self.doc(t).dom, n)
+                == Some(crate::document::Control::Select)
+            && self.select_key(n, code, host)
+        {
+            return;
+        }
         if let Some(n) = focus {
             if self.doc(t).is_text_input(n) {
                 let before = self.doc(t).input_value(n);
@@ -1205,6 +1391,51 @@ impl Browser {
         }
     }
 
+    /// Keyboard on a focused `<select>`; returns whether the key was used.
+    fn select_key(&mut self, select: NodeId, code: i32, host: &mut dyn Host) -> bool {
+        let doc = &mut self.tabs[self.active].doc;
+        let count = crate::document::options(&doc.dom, select).len();
+        let current = doc.forms.selected_index(&doc.dom, select).unwrap_or(0);
+        let open = doc.forms.open_select == Some(select);
+        let step = match code {
+            key::UP => -1,
+            key::DOWN => 1,
+            key::ENTER | key::SPACE => {
+                if open {
+                    let i = doc.popup_hover.unwrap_or(current);
+                    doc.forms.open_select = Some(select);
+                    self.choose_option(i, host);
+                } else {
+                    doc.forms.open_select = Some(select);
+                    doc.popup_hover = Some(current);
+                }
+                self.dirty = true;
+                return true;
+            }
+            key::ESCAPE if open => {
+                doc.forms.open_select = None;
+                self.dirty = true;
+                return true;
+            }
+            _ => return false,
+        };
+        if count == 0 {
+            return true;
+        }
+        if open {
+            let h = doc.popup_hover.unwrap_or(current) as isize + step;
+            doc.popup_hover = Some(h.clamp(0, count as isize - 1) as usize);
+            self.dirty = true;
+        } else {
+            let next = (current as isize + step).clamp(0, count as isize - 1) as usize;
+            if next != current {
+                doc.forms.open_select = Some(select);
+                self.choose_option(next, host);
+            }
+        }
+        true
+    }
+
     fn focused_text_input(&self) -> Option<NodeId> {
         self.focused()
             .filter(|&(t, n)| self.doc(t).is_text_input(n))
@@ -1221,6 +1452,13 @@ impl Browser {
             }
             Action::Submit if t == Target::Page => {
                 self.dispatch(n, "change", EventInit::key(key::ENTER, 0), host);
+                // Enter in a text field submits its form.
+                let doc = &self.tabs[self.active].doc;
+                if doc.dom.tag(n) == Some("input")
+                    && let Some(form) = crate::document::form_of(&doc.dom, n)
+                {
+                    self.submit_form(form, None, host);
+                }
             }
             Action::Cancel if is_address => {
                 let current = self.tabs[self.active].url().to_string();
@@ -2071,6 +2309,113 @@ mod tests {
             "{:?}",
             h.logs
         );
+    }
+
+    #[test]
+    fn forms_controls_and_submission() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 800, 1.0);
+        b.navigate("about:form", &mut h);
+        b.render(0.0, &mut h);
+        let el = |b: &Browser, id: &str| page_el(b, id);
+        fn doc(b: &Browser) -> &Document {
+            &b.tabs[b.active].doc
+        }
+
+        // Submitting without a name is cancelled by the page's script.
+        click_page_h(&mut b, &mut h, "send");
+        assert_eq!(b.tabs[b.active].url(), "about:form");
+        assert!(
+            h.logs.contains(&"name is required".to_string()),
+            "{:?}",
+            h.logs
+        );
+
+        click_page_h(&mut b, &mut h, "name");
+        b.event(Event::Text("Ada".into()), 0.0, &mut h);
+        // The select: open with a click, pick "Team" from the list.
+        click_page_h(&mut b, &mut h, "plan");
+        assert!(doc(&b).forms.open_select.is_some());
+        let (popup, items) = doc(&b).select_popup(&b.fonts).unwrap();
+        assert_eq!(items, vec!["Free", "Pro", "Team"]);
+        let vp = b.viewport_rect();
+        let row = popup.h / 3.0;
+        let (x, y) = (
+            (vp.x + popup.x + 10.0) as i32,
+            (vp.y + popup.y + row * 2.5) as i32,
+        );
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        assert_eq!(doc(&b).input_value(el(&b, "plan")), "team");
+        assert!(doc(&b).forms.open_select.is_none());
+        // Keyboard on the focused select.
+        b.event(
+            Event::KeyDown {
+                key: key::UP,
+                mods: Modifiers::default(),
+            },
+            0.0,
+            &mut h,
+        );
+        assert_eq!(doc(&b).input_value(el(&b, "plan")), "pro");
+
+        // The checkbox via its label text, a radio button, the textarea.
+        let label = doc(&b).dom.parent(el(&b, "news")).unwrap();
+        let r = doc(&b).content_box(label).unwrap();
+        click_at(
+            &mut b,
+            &mut h.inner,
+            RectF {
+                x: vp.x + r.x + r.w - 10.0,
+                y: vp.y + r.y,
+                w: 4.0,
+                h: r.h,
+            },
+        );
+        assert!(doc(&b).forms.checked(&doc(&b).dom, el(&b, "news")));
+        let large = doc(&b)
+            .dom
+            .descendants(Dom::ROOT)
+            .into_iter()
+            .find(|&n| doc(&b).dom.attr(n, "value") == Some("l"))
+            .unwrap();
+        let r = doc(&b).content_box(large).unwrap();
+        click_at(
+            &mut b,
+            &mut h.inner,
+            RectF {
+                x: vp.x + r.x,
+                y: vp.y + r.y,
+                ..r
+            },
+        );
+        click_page_h(&mut b, &mut h, "notes");
+        b.event(Event::Text("line one".into()), 0.0, &mut h);
+        b.event(
+            Event::KeyDown {
+                key: key::ENTER,
+                mods: Modifiers::default(),
+            },
+            0.0,
+            &mut h,
+        );
+        b.event(Event::Text("two".into()), 0.0, &mut h);
+        assert_eq!(doc(&b).input_value(el(&b, "notes")), "line one\ntwo");
+
+        click_page_h(&mut b, &mut h, "send");
+        b.render(0.0, &mut h);
+        let url = b.tabs[b.active].url().to_string();
+        assert_eq!(
+            url,
+            "about:form?name=Ada&pw=&plan=pro&size=l&notes=line+one%0Atwo&news=yes"
+        );
+        // The page reads location.search and shows the values.
+        let shown = doc(&b).dom.text_content(el(&b, "data"));
+        assert!(
+            shown.contains("namenAda") || shown.contains("nameAda"),
+            "{shown}"
+        );
+        assert!(shown.contains("line one\ntwo"), "{shown}");
     }
 
     fn click_page_h(b: &mut Browser, h: &mut LogHost, id: &str) {
