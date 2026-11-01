@@ -14,13 +14,19 @@ pub mod browser;
 #[cfg(feature = "core")]
 pub mod css;
 #[cfg(feature = "core")]
+pub mod document;
+#[cfg(feature = "core")]
 pub mod dom;
 #[cfg(feature = "core")]
 pub mod gfx;
 #[cfg(feature = "core")]
 pub mod input;
 #[cfg(feature = "core")]
+pub mod layout;
+#[cfg(feature = "core")]
 pub mod net;
+#[cfg(feature = "core")]
+pub mod paint;
 #[cfg(any(feature = "native", feature = "web"))]
 pub mod platform;
 #[cfg(feature = "core")]

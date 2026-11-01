@@ -188,6 +188,21 @@ impl Canvas {
     }
 }
 
+/// Coverage (0–1) of pixel center `(px, py)` by the rounded rectangle
+/// `(x, y, w, h, radius)`, from its signed distance.
+fn coverage((x, y, w, h, r): (f32, f32, f32, f32, f32), px: f32, py: f32) -> f32 {
+    if w <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
+    let r = r.min(w / 2.0).min(h / 2.0).max(0.0);
+    let (hw, hh) = (w / 2.0, h / 2.0);
+    let qx = (px - (x + hw)).abs() - (hw - r);
+    let qy = (py - (y + hh)).abs() - (hh - r);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let d = outside + qx.max(qy).min(0.0) - r;
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
 /// Mixes `fg` over `bg` with coverage `alpha` (0–255).
 pub fn blend(bg: Color, fg: Color, alpha: u8) -> Color {
     match alpha {
@@ -232,6 +247,41 @@ impl Canvas {
             for col in r.x..r.right() {
                 let a = mask[my * w + (col - x) as usize];
                 if a != 0 {
+                    let p = &mut self.pixels[line + col as usize];
+                    *p = blend(*p, color, a);
+                }
+            }
+        }
+    }
+
+    /// Fills a rounded rectangle (physical pixels, fractional allowed) with
+    /// anti-aliased corners. With `inner`, only the ring between the two
+    /// rounded rectangles is filled (used for rounded borders).
+    pub fn fill_rounded(
+        &mut self,
+        outer: (f32, f32, f32, f32, f32),
+        inner: Option<(f32, f32, f32, f32, f32)>,
+        color: Color,
+        alpha: u8,
+    ) {
+        let (x, y, w, h, _) = outer;
+        let bounds = Rect::new(
+            x.floor() as i32,
+            y.floor() as i32,
+            (x + w).ceil() as i32 - x.floor() as i32,
+            (y + h).ceil() as i32 - y.floor() as i32,
+        )
+        .intersect(&self.clip);
+        for row in bounds.y..bounds.bottom() {
+            let line = row as usize * self.width;
+            for col in bounds.x..bounds.right() {
+                let (px, py) = (col as f32 + 0.5, row as f32 + 0.5);
+                let mut cov = coverage(outer, px, py);
+                if let Some(i) = inner {
+                    cov -= coverage(i, px, py);
+                }
+                if cov > 0.0 {
+                    let a = (cov.min(1.0) * alpha as f32).round() as u8;
                     let p = &mut self.pixels[line + col as usize];
                     *p = blend(*p, color, a);
                 }
@@ -436,6 +486,23 @@ mod tests {
         let mut c = Canvas::new(2, 1);
         c.draw_mask(0, 0, 2, 1, &[255, 0], 0x123456);
         assert_eq!(c.pixels(), &[0x123456, 0]);
+    }
+
+    #[test]
+    fn rounded_corners_are_cut() {
+        let mut c = Canvas::new(10, 10);
+        c.fill_rounded((0.0, 0.0, 10.0, 10.0, 5.0), None, 0xffffff, 255);
+        assert_eq!(c.pixels()[0], 0, "corner is outside");
+        assert_eq!(c.pixels()[5 * 10 + 5], 0xffffff, "center is inside");
+        let mut c = Canvas::new(10, 10);
+        c.fill_rounded(
+            (0.0, 0.0, 10.0, 10.0, 0.0),
+            Some((2.0, 2.0, 6.0, 6.0, 0.0)),
+            0xffffff,
+            255,
+        );
+        assert_eq!(c.pixels()[10 + 1], 0xffffff, "ring");
+        assert_eq!(c.pixels()[5 * 10 + 5], 0, "hole");
     }
 
     #[test]
