@@ -6,6 +6,7 @@
 //! when the index is built. Custom properties are inherited and `var()` is
 //! substituted when a declaration is applied.
 
+pub mod gradient;
 pub mod media;
 pub mod selector;
 pub mod style;

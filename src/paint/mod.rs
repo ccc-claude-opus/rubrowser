@@ -40,6 +40,13 @@ pub struct Painter<'a> {
     pub view_top: std::cell::Cell<f32>,
 }
 
+/// What an image layer paints.
+#[derive(Clone, Copy)]
+enum Layer<'a> {
+    Url(&'a str),
+    Gradient(&'a crate::css::gradient::Gradient),
+}
+
 const SELECTION: Rgba = Rgba::new(51, 132, 255, 90);
 const PLACEHOLDER: Rgba = Rgba::new(117, 117, 117, 255);
 
@@ -357,16 +364,25 @@ impl Painter<'_> {
 
     /// `background-image`, tiled and positioned in the padding box.
     fn background_image(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
-        let Some(url) = &style.background_image else {
-            return;
-        };
         let layer = cs::Mask {
             image: None,
             size: style.background_size,
             repeat: style.background_repeat,
             position: style.background_position,
         };
-        self.image_layer(c, b, r, url, &layer, None);
+        let gradient = style.background_gradient.as_ref();
+        let url = style.background_image.as_deref();
+        // Layers listed first are painted last (on top).
+        let on_top = gradient.is_some_and(|(_, top)| *top);
+        if !on_top && let Some((g, _)) = gradient {
+            self.image_layer(c, b, r, Layer::Gradient(g), &layer, None);
+        }
+        if let Some(url) = url {
+            self.image_layer(c, b, r, Layer::Url(url), &layer, None);
+        }
+        if on_top && let Some((g, _)) = gradient {
+            self.image_layer(c, b, r, Layer::Gradient(g), &layer, None);
+        }
     }
 
     /// Paints image `url` sized, positioned and tiled per `layer` in the
@@ -377,20 +393,26 @@ impl Painter<'_> {
         c: &mut Canvas,
         b: &LBox,
         r: RectF,
-        url: &str,
+        source: Layer,
         layer: &cs::Mask,
         mask: Option<Rgba>,
     ) {
-        let Some(bm) = self.images.urls.get(url).and_then(|s| s.bitmap()) else {
-            return;
-        };
         let pr = b.padding_rect();
         let area = RectF {
             x: r.x + pr.x,
             y: r.y + pr.y,
             ..pr
         };
-        let (iw, ih) = (bm.width as f32, bm.height as f32);
+        // Gradients have no natural size: they fill the area.
+        let (iw, ih) = match source {
+            Layer::Url(url) => {
+                let Some(bm) = self.images.urls.get(url).and_then(|s| s.bitmap()) else {
+                    return;
+                };
+                (bm.width as f32, bm.height as f32)
+            }
+            Layer::Gradient(_) => (area.w, area.h),
+        };
         if iw <= 0.0 || ih <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
             return;
         }
@@ -429,8 +451,12 @@ impl Painter<'_> {
             (tw * s).round().max(1.0) as u32,
             (th * s).round().max(1.0) as u32,
         );
-        let Some(px) = self.images.scaled_url(url, pw, ph) else {
-            return;
+        let px = match source {
+            Layer::Url(url) => match self.images.scaled_url(url, pw, ph) {
+                Some(px) => px,
+                None => return,
+            },
+            Layer::Gradient(g) => self.images.gradient(g, pw, ph, s),
         };
         let saved = c.clip();
         c.set_clip(self.phys(r).intersect(&saved));
@@ -782,11 +808,22 @@ impl Painter<'_> {
         if let Some(url) = &style.mask.image {
             // An icon: the mask shapes the background color.
             if style.background.is_visible() {
-                self.image_layer(c, b, r, url, &style.mask, Some(style.background));
+                self.image_layer(
+                    c,
+                    b,
+                    r,
+                    Layer::Url(url),
+                    &style.mask,
+                    Some(style.background),
+                );
             }
             return;
         }
-        if style.background_image.is_some() && radius <= 0.0 {
+        for shadow in style.box_shadow.iter() {
+            self.box_shadow(c, shadow, r, radius);
+        }
+        let has_layers = style.background_image.is_some() || style.background_gradient.is_some();
+        if has_layers && radius <= 0.0 {
             self.fill(c, r, style.background);
             self.background_image(c, b, style, r);
             return self.borders(c, style, r, bw);
@@ -795,6 +832,12 @@ impl Painter<'_> {
             let outer = (r.x * s, r.y * s, r.w * s, r.h * s, radius * s);
             if style.background.is_visible() {
                 c.fill_rounded(outer, None, style.background.rgb(), style.background.a);
+            }
+            if has_layers {
+                let saved = c.round_clip();
+                c.set_round_clip(Some([outer.0, outer.1, outer.2, outer.3, outer.4]));
+                self.background_image(c, b, style, r);
+                c.set_round_clip(saved);
             }
             if bw[0] > 0.0 && uniform {
                 let w = bw[0];
@@ -815,6 +858,53 @@ impl Painter<'_> {
             self.fill(c, r, style.background);
         }
         self.borders(c, style, r, bw);
+    }
+
+    /// An outer `box-shadow`: the box shape offset and spread, blurred by
+    /// stacking translucent rounded rectangles.
+    fn box_shadow(&self, c: &mut Canvas, sh: &cs::Shadow, r: RectF, radius: f32) {
+        if sh.inset || !sh.color.is_visible() {
+            return;
+        }
+        let s = self.scale;
+        let base = RectF {
+            x: r.x + sh.x - sh.spread,
+            y: r.y + sh.y - sh.spread,
+            w: r.w + 2.0 * sh.spread,
+            h: r.h + 2.0 * sh.spread,
+        };
+        let blur = sh.blur.max(0.0);
+        let steps = if blur < 1.0 {
+            1
+        } else {
+            (blur * s).ceil().min(12.0) as usize
+        };
+        // Each ring adds a little alpha; together they fade out over `blur`.
+        let alpha = sh.color.a as f32 / steps as f32;
+        for i in 0..steps {
+            let grow = if steps == 1 {
+                0.0
+            } else {
+                blur * (i as f32 / (steps - 1) as f32 - 0.5)
+            };
+            let g = RectF {
+                x: base.x - grow,
+                y: base.y - grow,
+                w: base.w + 2.0 * grow,
+                h: base.h + 2.0 * grow,
+            };
+            if g.w <= 0.0 || g.h <= 0.0 {
+                continue;
+            }
+            let rr = (radius + sh.spread + grow).max(0.0);
+            // Shadows only show outside the border box.
+            c.fill_rounded(
+                (g.x * s, g.y * s, g.w * s, g.h * s, rr * s),
+                Some((r.x * s, r.y * s, r.w * s, r.h * s, radius * s)),
+                sh.color.rgb(),
+                alpha.round().max(1.0) as u8,
+            );
+        }
     }
 
     /// Four border sides (square corners).

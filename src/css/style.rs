@@ -91,6 +91,17 @@ pub enum BackgroundSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Repeat(pub bool, pub bool);
 
+/// One `box-shadow`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Shadow {
+    pub x: f32,
+    pub y: f32,
+    pub blur: f32,
+    pub spread: f32,
+    pub color: Rgba,
+    pub inset: bool,
+}
+
 /// `mask-image` and its size, position and repeat (the image's alpha
 /// masks the element's background color; used for icons).
 #[derive(Clone, Debug, PartialEq)]
@@ -302,6 +313,10 @@ pub struct Style {
     pub outline_color: Rgba,
     pub outline_offset: f32,
     pub background_image: Option<String>,
+    /// A gradient background layer, and whether it is listed before (so
+    /// painted above) `background_image`.
+    pub background_gradient: Option<(Rc<super::gradient::Gradient>, bool)>,
+    pub box_shadow: Rc<[Shadow]>,
     pub background_size: BackgroundSize,
     pub background_repeat: Repeat,
     /// `background-position` as fractions (0 = left/top, 1 = right/bottom)
@@ -385,6 +400,8 @@ impl Default for Style {
             outline_color: Rgba::BLACK,
             outline_offset: 0.0,
             background_image: None,
+            background_gradient: None,
+            box_shadow: Rc::new([]),
             background_size: BackgroundSize::Auto,
             background_repeat: Repeat(true, true),
             background_position: (Dim::Percent(0.0), Dim::Percent(0.0)),
@@ -626,13 +643,28 @@ impl Style {
             "background" => {
                 self.background = Rgba::TRANSPARENT;
                 self.background_image = None;
-                let toks = tokens(value);
+                self.background_gradient = None;
+                let toks: Vec<&str> = super::gradient::split_commas(value)
+                    .into_iter()
+                    .flat_map(tokens)
+                    .collect();
                 let mut positions = Vec::new();
                 let mut after_slash = false;
                 for t in &toks {
                     let lt = t.to_ascii_lowercase();
+                    let t = &t.trim_end_matches(',');
+                    let lt = lt.trim_end_matches(',').to_string();
                     if let Some(u) = url_value(t) {
-                        self.background_image = Some(u);
+                        if self.background_image.is_none() {
+                            self.background_image = Some(u);
+                        }
+                    } else if lt.contains("gradient(") {
+                        if self.background_gradient.is_none()
+                            && let Some(g) = super::gradient::parse(t, self.color, fc)
+                        {
+                            let on_top = self.background_image.is_none();
+                            self.background_gradient = Some((Rc::new(g), on_top));
+                        }
                     } else if let Some(r) = repeat(&lt) {
                         self.background_repeat = r;
                     } else if *t == "/" {
@@ -654,7 +686,15 @@ impl Style {
                     }
                 }
             }
-            "background-image" => self.background_image = url_value(value),
+            "background-image" => {
+                let layers: Vec<&str> = super::gradient::split_commas(value);
+                self.background_image = layers.iter().find_map(|t| url_value(t));
+                self.background_gradient = layers.iter().enumerate().find_map(|(i, t)| {
+                    let g = super::gradient::parse(t, self.color, fc)?;
+                    let on_top = !layers[..i].iter().any(|t| url_value(t).is_some());
+                    Some((Rc::new(g), on_top))
+                });
+            }
             "mask-image" | "-webkit-mask-image" => {
                 Rc::make_mut(&mut self.mask).image = url_value(value)
             }
@@ -683,6 +723,40 @@ impl Style {
             "background-position" => {
                 let t = tokens(v);
                 set(&mut self.background_position, background_position(&t, fc));
+            }
+            "box-shadow" => {
+                let mut out = Vec::new();
+                if v != "none" {
+                    for part in super::gradient::split_commas(value) {
+                        let mut sh = Shadow {
+                            x: 0.0,
+                            y: 0.0,
+                            blur: 0.0,
+                            spread: 0.0,
+                            color: self.color,
+                            inset: false,
+                        };
+                        let mut lens = Vec::new();
+                        for t in tokens(part) {
+                            if t.eq_ignore_ascii_case("inset") {
+                                sh.inset = true;
+                            } else if let Some(px) = values::px(t, fc) {
+                                lens.push(px);
+                            } else if let Some(c) = values::color(t, self.color) {
+                                sh.color = c;
+                            }
+                        }
+                        if lens.len() < 2 {
+                            continue;
+                        }
+                        sh.x = lens[0];
+                        sh.y = lens[1];
+                        sh.blur = lens.get(2).copied().unwrap_or(0.0);
+                        sh.spread = lens.get(3).copied().unwrap_or(0.0);
+                        out.push(sh);
+                    }
+                }
+                self.box_shadow = out.into();
             }
             "aspect-ratio" => {
                 // `auto`, `16 / 9`, `1.5`, `auto 4 / 3`
@@ -1487,6 +1561,21 @@ mod tests {
             s.apply(n, v, &parent, 16.0);
         }
         s
+    }
+
+    #[test]
+    fn background_layers() {
+        let s = styled(&[("background", "url(a.png) no-repeat #fff")]);
+        assert_eq!(s.background_image.as_deref(), Some("a.png"));
+        let s = styled(&[("background", "linear-gradient(red, blue),url(b.png)")]);
+        assert_eq!(s.background_image.as_deref(), Some("b.png"));
+        assert!(s.background_gradient.as_ref().is_some_and(|(_, top)| *top));
+        let s = styled(&[(
+            "box-shadow",
+            "0 1px 2px rgba(0,0,0,.2), inset 0 0 0 1px red",
+        )]);
+        assert_eq!(s.box_shadow.len(), 2);
+        assert!(s.box_shadow[1].inset);
     }
 
     #[test]

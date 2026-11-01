@@ -170,6 +170,9 @@ impl ImageState {
     }
 }
 
+/// A rendered gradient: (CSS text, width, height).
+type GradientKey = (String, u32, u32);
+
 /// A resized copy of an image: (width, height, pixels).
 type Scaled = (u32, u32, Rc<Vec<u32>>);
 
@@ -185,6 +188,8 @@ pub struct Images {
     /// Pixel density of the source chosen from `srcset` (natural size is
     /// the bitmap size divided by it).
     pub density: HashMap<NodeId, f32>,
+    /// Rendered gradients by (CSS text, width, height).
+    gradients: RefCell<HashMap<GradientKey, Rc<Vec<u32>>>>,
 }
 
 impl Images {
@@ -218,6 +223,27 @@ impl Images {
         let px = Rc::new(bitmap.resized(w, h));
         cache.insert(url.to_string(), (w, h, px.clone()));
         Some(px)
+    }
+
+    /// Pixels of `g` rendered at `w × h`, cached.
+    pub fn gradient(
+        &self,
+        g: &crate::css::gradient::Gradient,
+        w: u32,
+        h: u32,
+        scale: f32,
+    ) -> Rc<Vec<u32>> {
+        let key = (g.key.clone(), w, h);
+        let mut cache = self.gradients.borrow_mut();
+        if let Some(px) = cache.get(&key) {
+            return px.clone();
+        }
+        if cache.len() > 256 {
+            cache.clear();
+        }
+        let px = Rc::new(g.render(w, h, scale));
+        cache.insert(key, px.clone());
+        px
     }
 
     pub fn set_url(&mut self, url: &str, state: ImageState) {
