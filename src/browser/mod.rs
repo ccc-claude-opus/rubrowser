@@ -255,8 +255,14 @@ impl Browser {
     /// `width` and `height` are physical pixels; `scale` is physical pixels
     /// per logical pixel (the display's DPI factor).
     pub fn new(width: usize, height: usize, scale: f32) -> Self {
+        Self::with_fonts(width, height, scale, Fonts::new())
+    }
+
+    /// Like [`Browser::new`], with the given fonts (e.g.
+    /// [`Fonts::with_system_fonts`]).
+    pub fn with_fonts(width: usize, height: usize, scale: f32, fonts: Fonts) -> Self {
         let mut b = Browser {
-            fonts: Fonts::new(),
+            fonts,
             canvas: Canvas::new(width, height),
             scale: sanitize_scale(scale),
             chrome: Document::from_html(CHROME_HTML, "about:chrome"),

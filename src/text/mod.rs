@@ -70,10 +70,16 @@ struct Glyph {
 #[derive(Default)]
 pub struct Fonts {
     faces: [OnceCell<Font>; 12],
+    /// DejaVu faces when `faces` holds system fonts (for symbols they lack).
+    bundled: [OnceCell<Font>; 12],
     /// A system font for characters DejaVu lacks (CJK…), loaded on first use.
     fallback: OnceCell<Option<Font>>,
     /// (face, char, physical size in 1/4 px) → rasterized glyph.
     glyphs: RefCell<HashMap<(usize, char, u32), Glyph>>,
+    /// Prefer installed Arial / Georgia (or metric-compatible Liberation
+    /// fonts) over DejaVu for sans-serif and serif, so text widths match
+    /// other browsers. Off by default (tests use the bundled fonts).
+    system: bool,
 }
 
 const MAX_CACHED_GLYPHS: usize = 8192;
@@ -83,14 +89,37 @@ impl Fonts {
         Self::default()
     }
 
+    /// Fonts that use the system's Arial / Georgia when installed.
+    pub fn with_system_fonts() -> Self {
+        Fonts {
+            system: true,
+            ..Self::default()
+        }
+    }
+
     fn face(&self, key: FontKey) -> &Font {
         self.faces[key.index()].get_or_init(|| {
+            if self.system
+                && let Some(f) = system_face(key)
+            {
+                return f;
+            }
             Font::from_bytes(key.data(), FontSettings::default()).expect("bundled font is valid")
         })
     }
 
-    /// Index used for the fallback face in the glyph cache.
+    /// Index used for the fallback face in the glyph cache; bundled faces
+    /// standing in for system ones come after it.
     const FALLBACK: usize = 12;
+
+    fn bundled(&self, key: FontKey) -> &Font {
+        if !self.system {
+            return self.face(key);
+        }
+        self.bundled[key.index()].get_or_init(|| {
+            Font::from_bytes(key.data(), FontSettings::default()).expect("bundled font is valid")
+        })
+    }
 
     fn fallback(&self) -> Option<&Font> {
         self.fallback.get_or_init(load_fallback).as_ref()
@@ -107,8 +136,12 @@ impl Fonts {
             family: Family::Sans,
             ..key
         };
-        if key.family != Family::Sans && self.face(sans).lookup_glyph_index(c) != 0 {
-            return (sans.index(), self.face(sans));
+        let offset = if self.system { Self::FALLBACK + 1 } else { 0 };
+        for k in [key, sans] {
+            let f = self.bundled(k);
+            if f.lookup_glyph_index(c) != 0 {
+                return (offset + k.index(), f);
+            }
         }
         match self.fallback().filter(|f| f.lookup_glyph_index(c) != 0) {
             Some(f) => (Self::FALLBACK, f),
@@ -194,6 +227,67 @@ impl Fonts {
         }
         pen - x
     }
+}
+
+/// An installed face metric-compatible with what other browsers use for
+/// `key` (Arial for sans-serif, Georgia for serif).
+fn system_face(key: FontKey) -> Option<Font> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let style = key.bold as usize * 2 + key.italic as usize;
+        let candidates: &[[&str; 4]] = match key.family {
+            Family::Sans => &[
+                [
+                    "/System/Library/Fonts/Supplemental/Arial.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+                ],
+                [
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Italic.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSans-BoldItalic.ttf",
+                ],
+                [
+                    "C:\\Windows\\Fonts\\arial.ttf",
+                    "C:\\Windows\\Fonts\\ariali.ttf",
+                    "C:\\Windows\\Fonts\\arialbd.ttf",
+                    "C:\\Windows\\Fonts\\arialbi.ttf",
+                ],
+            ],
+            Family::Serif => &[
+                [
+                    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+                    "/System/Library/Fonts/Supplemental/Georgia Italic.ttf",
+                    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+                    "/System/Library/Fonts/Supplemental/Georgia Bold Italic.ttf",
+                ],
+                [
+                    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSerif-Italic.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSerif-Bold.ttf",
+                    "/usr/share/fonts/truetype/liberation/LiberationSerif-BoldItalic.ttf",
+                ],
+                [
+                    "C:\\Windows\\Fonts\\georgia.ttf",
+                    "C:\\Windows\\Fonts\\georgiai.ttf",
+                    "C:\\Windows\\Fonts\\georgiab.ttf",
+                    "C:\\Windows\\Fonts\\georgiaz.ttf",
+                ],
+            ],
+            Family::Mono => &[],
+        };
+        for set in candidates {
+            if let Ok(bytes) = std::fs::read(set[style])
+                && let Ok(font) = Font::from_bytes(bytes, FontSettings::default())
+            {
+                return Some(font);
+            }
+        }
+    }
+    let _ = key;
+    None
 }
 
 /// Loads the first available system font with wide Unicode (CJK)

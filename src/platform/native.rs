@@ -18,6 +18,7 @@ use crate::abi::key;
 use crate::browser::Browser;
 use crate::input::{Cursor, Event, Host, Modifiers};
 use crate::net::url;
+use crate::text::Fonts;
 
 /// Largest response body the browser accepts.
 const MAX_BODY: u64 = 32 << 20;
@@ -236,7 +237,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         (shot.width as f32 * shot.scale) as usize,
         (shot.height as f32 * shot.scale) as usize,
     );
-    let mut browser = Browser::new(pw, ph, shot.scale);
+    let mut browser = Browser::with_fonts(pw, ph, shot.scale, Fonts::with_system_fonts());
     let start = Instant::now();
     let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
     browser.navigate(&url::from_input(url), &mut host);
@@ -305,7 +306,12 @@ impl ApplicationHandler<Fetched> for App {
         let surface = Surface::new(&context, window.clone()).expect("create softbuffer surface");
         let size = window.inner_size();
         let scale = window.scale_factor();
-        let mut browser = Browser::new(size.width as usize, size.height as usize, scale as f32);
+        let mut browser = Browser::with_fonts(
+            size.width as usize,
+            size.height as usize,
+            scale as f32,
+            Fonts::with_system_fonts(),
+        );
         let mut host = NativeHost {
             window: window.clone(),
             proxy: self.proxy.clone(),

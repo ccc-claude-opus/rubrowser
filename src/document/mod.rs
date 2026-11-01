@@ -239,6 +239,8 @@ impl Document {
 
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
+        let profile = profiling();
+        let t0 = profile.then(std::time::Instant::now);
         if self.needs_style {
             let sheets = self.author_sheets();
             let env = MediaEnv {
@@ -276,6 +278,12 @@ impl Document {
             }
             self.needs_style = false;
             self.sync_inline_svgs();
+            if let Some(t) = t0 {
+                eprintln!(
+                    "[profile] style {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
         if self.needs_layout {
             let replaced = self.replaced_sizes(fonts);
@@ -290,6 +298,12 @@ impl Document {
             );
             self.needs_layout = false;
             self.clamp_scroll();
+            if let Some(t) = t0 {
+                eprintln!(
+                    "[profile] style+layout {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
         }
     }
 
@@ -1166,4 +1180,15 @@ mod tests {
         assert_eq!(c.pixels()[99 * 100 + 99], 0x00ff00);
         assert!(c.pixels().contains(&0));
     }
+}
+
+/// Whether `RUBROWSER_PROFILE` is set (prints style/layout timings).
+fn profiling() -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("RUBROWSER_PROFILE").is_some())
+    }
+    #[cfg(target_arch = "wasm32")]
+    false
 }

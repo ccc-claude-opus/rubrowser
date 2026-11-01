@@ -681,7 +681,7 @@ fn presentational_hints(dom: &Dom, id: NodeId) -> Vec<(&'static str, String)> {
     };
     if matches!(
         tag,
-        "img" | "video" | "canvas" | "iframe" | "table" | "td" | "th" | "col"
+        "img" | "video" | "canvas" | "iframe" | "table" | "td" | "th" | "col" | "svg"
     ) {
         for dim in ["width", "height"] {
             if let Some(v) = dom.attr(id, dim).and_then(length) {
