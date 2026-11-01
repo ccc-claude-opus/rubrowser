@@ -48,6 +48,8 @@ pub struct Document {
     imported: HashMap<String, Rc<Sheet>>,
     /// `@import` URLs already requested.
     requested_imports: std::collections::HashSet<String>,
+    /// `@font-face` sources already requested.
+    requested_fonts: std::collections::HashSet<String>,
     /// The cascade index for the current sheets and viewport.
     cascade: Option<(Vec<*const Sheet>, MediaEnv, Rc<Cascade>)>,
     styles: Vec<Option<Style>>,
@@ -85,6 +87,7 @@ impl Document {
             inline_css: HashMap::new(),
             imported: HashMap::new(),
             requested_imports: Default::default(),
+            requested_fonts: Default::default(),
             cascade: None,
             styles: Vec::new(),
             pseudo: HashMap::new(),
@@ -172,6 +175,45 @@ impl Document {
         self.imported
             .insert(url.to_string(), Rc::new(parse_stylesheet(&css, Some(url))));
         self.needs_style = true;
+    }
+
+    /// `@font-face` faces not requested yet that this page can use.
+    pub fn font_requests(&mut self) -> Vec<FontRequest> {
+        let env = MediaEnv {
+            width: self.size.0,
+            height: self.size.1,
+            scale: 1.0,
+            dark: false,
+        };
+        fn walk(rules: &[Rule], env: &MediaEnv, out: &mut Vec<FontRequest>) {
+            for r in rules {
+                match r {
+                    Rule::FontFace(decls) => out.extend(FontRequest::from_decls(decls)),
+                    Rule::Media(m, inner) if m.matches(env) => walk(inner, env, out),
+                    Rule::Layer(_, inner) => walk(inner, env, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut all = Vec::new();
+        for (sheet, media) in self.author_sheets() {
+            if media.matches(&env) {
+                walk(&sheet.rules, &env, &mut all);
+            }
+        }
+        all.into_iter()
+            .filter(|f| {
+                self.requested_fonts
+                    .insert(format!("{}|{}", f.family, f.url))
+            })
+            .collect()
+    }
+
+    /// A web font loaded (or failed): styles may now resolve to it.
+    pub fn fonts_changed(&mut self) {
+        self.needs_style = true;
+        // A new face of a known family changes text widths, not styles.
+        self.needs_layout = true;
     }
 
     /// `@import` URLs of loaded sheets not requested yet.
@@ -1291,6 +1333,81 @@ pub fn button_label(dom: &Dom, node: NodeId, kind: Control) -> String {
         })
 }
 
+/// One `@font-face` to download.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontRequest {
+    pub family: String,
+    pub url: String,
+    /// `font-weight` (the low end of a range).
+    pub weight: u16,
+    pub italic: bool,
+}
+
+impl FontRequest {
+    /// The face described by `@font-face` descriptors, if it has a usable
+    /// source and covers Latin text (subsets for other scripts are skipped).
+    fn from_decls(decls: &[crate::css::syntax::Decl]) -> Option<FontRequest> {
+        let get = |name: &str| {
+            decls
+                .iter()
+                .rev()
+                .find(|d| d.name == name)
+                .map(|d| d.value.trim().to_string())
+        };
+        let family = get("font-family")?.trim_matches(['"', '\'']).to_string();
+        if let Some(range) = get("unicode-range") {
+            let covers_latin = range.split(',').any(|r| {
+                let r = r
+                    .trim()
+                    .trim_start_matches(['U', 'u'])
+                    .trim_start_matches('+');
+                let (lo, hi) = match r.split_once('-') {
+                    Some((a, b)) => (a.to_string(), b.to_string()),
+                    None if r.contains('?') => (r.replace('?', "0"), r.replace('?', "F")),
+                    None => (r.to_string(), r.to_string()),
+                };
+                let parse = |h: &str| u32::from_str_radix(h, 16).unwrap_or(0);
+                (parse(&lo)..=parse(&hi)).contains(&0x61)
+            });
+            if !covers_latin {
+                return None;
+            }
+        }
+        // The first source in a supported format.
+        let url = crate::css::gradient::split_commas(&get("src")?)
+            .into_iter()
+            .find_map(|src| {
+                let lower = src.to_ascii_lowercase();
+                let url_start = lower.find("url(")?;
+                let rest = &src[url_start + 4..];
+                let url = rest[..rest.find(')')?].trim().trim_matches(['"', '\'']);
+                let ok = match lower.find("format(") {
+                    Some(i) => ["woff2", "woff", "truetype", "opentype"]
+                        .iter()
+                        .any(|f| lower[i..].contains(f) && !lower[i..].contains("embedded")),
+                    None => true,
+                };
+                ok.then(|| url.to_string())
+            })?;
+        let weight = get("font-weight").unwrap_or_default();
+        let weight = match weight.split_whitespace().next() {
+            Some("bold" | "bolder") => 700,
+            Some(n) => n
+                .parse::<f32>()
+                .map_or(400, |w| w.clamp(1.0, 1000.0) as u16),
+            None => 400,
+        };
+        let italic =
+            get("font-style").is_some_and(|s| s.contains("italic") || s.contains("oblique"));
+        Some(FontRequest {
+            family,
+            url,
+            weight,
+            italic,
+        })
+    }
+}
+
 /// Whether `RUBROWSER_PROFILE` is set (prints style/layout timings).
 fn profiling() -> bool {
     #[cfg(not(target_arch = "wasm32"))]
@@ -1312,6 +1429,28 @@ mod tests {
         d.set_viewport(w, h);
         d.update(&fonts);
         (d, fonts)
+    }
+
+    #[test]
+    fn font_face_requests() {
+        let html = r#"<style>
+            @font-face { font-family: "Inter"; src: local(Inter), url(inter.eot) format("embedded-opentype"), url(inter.woff2) format("woff2"); font-weight: 600 }
+            @font-face { font-family: Inter; src: url(cyr.woff2); unicode-range: U+0400-045F }
+            @font-face { font-family: Icons; font-style: italic; src: url(i.ttf) }
+            </style>"#;
+        let (mut d, _) = doc(html, 400.0, 300.0);
+        let reqs = d.font_requests();
+        assert_eq!(reqs.len(), 2, "{reqs:?}");
+        assert_eq!(
+            (
+                reqs[0].family.as_str(),
+                reqs[0].url.as_str(),
+                reqs[0].weight
+            ),
+            ("Inter", "inter.woff2", 600)
+        );
+        assert!(reqs[1].italic);
+        assert!(d.font_requests().is_empty(), "requested once");
     }
 
     #[test]

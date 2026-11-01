@@ -34,6 +34,8 @@ pub enum Rule {
     LayerOrder(Vec<String>),
     /// `@property --name { initial-value: … }`.
     Property(String, String),
+    /// `@font-face { … }` descriptors.
+    FontFace(Rc<[Decl]>),
 }
 
 /// A parsed stylesheet.
@@ -224,6 +226,10 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                 "layer" => out.push(Rule::LayerOrder(
                     prelude.split(',').map(|n| n.trim().to_string()).collect(),
                 )),
+                "font-face" if has_block => {
+                    let (decls, _) = parse_block(body, base);
+                    out.push(Rule::FontFace(decls.into()));
+                }
                 "property" if has_block => {
                     let (decls, _) = parse_block(body, base);
                     if let Some(d) = decls.iter().rev().find(|d| d.name == "initial-value") {
@@ -405,7 +411,10 @@ mod tests {
                         out.push((format!("{} selector(s)", selectors.len()), decls.to_vec()))
                     }
                     Rule::Media(_, inner) | Rule::Layer(_, inner) => walk(inner, out),
-                    Rule::Import(..) | Rule::LayerOrder(_) | Rule::Property(..) => {}
+                    Rule::Import(..)
+                    | Rule::LayerOrder(_)
+                    | Rule::Property(..)
+                    | Rule::FontFace(_) => {}
                 }
             }
         }

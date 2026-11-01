@@ -203,7 +203,7 @@ impl Cascade {
                 Rule::Property(name, value) => {
                     self.initial_vars.insert(name.clone(), value.clone());
                 }
-                Rule::Import(..) => {}
+                Rule::Import(..) | Rule::FontFace(_) => {}
             }
         }
     }

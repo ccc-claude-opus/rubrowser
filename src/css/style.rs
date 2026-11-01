@@ -1524,6 +1524,9 @@ fn font_family(v: &str) -> Family {
     ];
     for name in v.split(',') {
         let name = name.trim().trim_matches(|c| c == '"' || c == '\'');
+        if let Some(web) = crate::text::web_family(name) {
+            return web;
+        }
         if mono.iter().any(|m| name.contains(m)) {
             return Family::Mono;
         }

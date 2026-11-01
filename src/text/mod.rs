@@ -3,7 +3,7 @@
 //! Sizes passed in are logical pixels; drawing rasterizes at the physical
 //! size (`size × scale`) so text stays sharp on HiDPI displays.
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 
 use fontdue::{Font, FontSettings};
@@ -17,6 +17,68 @@ pub enum Family {
     Sans,
     Mono,
     Serif,
+    /// A downloaded `@font-face` family (index in the web font registry).
+    Web(u16),
+}
+
+/// Most web font faces kept (they are never unloaded).
+const MAX_WEB_FACES: usize = 128;
+
+/// Fixed slots for web font faces (a `Vec` that never grows, so
+/// references to its fonts stay valid).
+struct WebSlots(Vec<OnceCell<Font>>);
+
+impl Default for WebSlots {
+    fn default() -> Self {
+        WebSlots((0..MAX_WEB_FACES).map(|_| OnceCell::new()).collect())
+    }
+}
+
+impl std::ops::Index<usize> for WebSlots {
+    type Output = OnceCell<Font>;
+    fn index(&self, i: usize) -> &OnceCell<Font> {
+        &self.0[i]
+    }
+}
+
+/// One loaded `@font-face` face: its style and slot in [`Fonts`].
+#[derive(Clone, Copy, Debug)]
+struct WebFace {
+    /// `font-weight` (100–900).
+    weight: u16,
+    italic: bool,
+    slot: usize,
+}
+
+thread_local! {
+    /// Web font families by lowercase name, in registration order.
+    static WEB_FAMILIES: RefCell<Vec<(String, Vec<WebFace>)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The registered web font family called `name`, if any face of it loaded.
+pub fn web_family(name: &str) -> Option<Family> {
+    let name = name.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+    WEB_FAMILIES.with(|w| {
+        w.borrow()
+            .iter()
+            .position(|(n, _)| *n == name)
+            .map(|i| Family::Web(i as u16))
+    })
+}
+
+/// The slot of the face of web family `g` closest to `bold` / `italic`.
+fn web_slot(g: u16, bold: bool, italic: bool) -> Option<usize> {
+    WEB_FAMILIES.with(|w| {
+        let w = w.borrow();
+        let faces = &w.get(g as usize)?.1;
+        faces
+            .iter()
+            .min_by_key(|f| {
+                let want: i32 = if bold { 700 } else { 400 };
+                ((f.italic != italic) as i32 * 1000) + (f.weight as i32 - want).abs()
+            })
+            .map(|f| f.slot)
+    })
 }
 
 /// Selects one of the bundled font faces.
@@ -29,12 +91,29 @@ pub struct FontKey {
 
 impl FontKey {
     fn index(&self) -> usize {
-        (self.family as usize) * 4 + (self.bold as usize) * 2 + self.italic as usize
+        let family = match self.family {
+            Family::Sans => 0,
+            Family::Mono => 1,
+            Family::Serif => 2,
+            Family::Web(_) => 0, // drawn by `Fonts::web` slots (see face_for)
+        };
+        family * 4 + (self.bold as usize) * 2 + self.italic as usize
+    }
+
+    /// The same style in a bundled family (web fonts → sans-serif).
+    fn bundled_key(self) -> FontKey {
+        match self.family {
+            Family::Web(_) => FontKey {
+                family: Family::Sans,
+                ..self
+            },
+            _ => self,
+        }
     }
 
     fn data(&self) -> &'static [u8] {
         use dejavu::{sans, sans_mono, serif};
-        match (self.family, self.bold, self.italic) {
+        match (self.bundled_key().family, self.bold, self.italic) {
             (Family::Sans, false, false) => sans::regular(),
             (Family::Sans, true, false) => sans::bold(),
             (Family::Sans, false, true) => sans::oblique(),
@@ -47,6 +126,7 @@ impl FontKey {
             (Family::Serif, true, false) => serif::bold(),
             (Family::Serif, false, true) => serif::italic(),
             (Family::Serif, true, true) => serif::bold_italic(),
+            (Family::Web(_), ..) => unreachable!("bundled_key maps web fonts"),
         }
     }
 }
@@ -80,6 +160,9 @@ pub struct Fonts {
     /// fonts) over DejaVu for sans-serif and serif, so text widths match
     /// other browsers. Off by default (tests use the bundled fonts).
     system: bool,
+    /// Downloaded web font faces (see [`Fonts::add_web_font`]).
+    web: WebSlots,
+    web_count: Cell<usize>,
 }
 
 const MAX_CACHED_GLYPHS: usize = 8192;
@@ -97,7 +180,51 @@ impl Fonts {
         }
     }
 
+    /// Registers a downloaded font (TTF, OTF, WOFF or WOFF2 bytes) as a
+    /// face of `family`. Returns false if it cannot be used.
+    pub fn add_web_font(&self, family: &str, weight: u16, italic: bool, bytes: &[u8]) -> bool {
+        let slot = self.web_count.get();
+        if slot >= MAX_WEB_FACES {
+            return false;
+        }
+        let Some(font) = decode_font(bytes) else {
+            return false;
+        };
+        let _ = self.web[slot].set(font);
+        self.web_count.set(slot + 1);
+        let name = family.trim().trim_matches(['"', '\'']).to_ascii_lowercase();
+        WEB_FAMILIES.with(|w| {
+            let mut w = w.borrow_mut();
+            let face = WebFace {
+                weight,
+                italic,
+                slot,
+            };
+            match w.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, faces)) => faces.push(face),
+                None => w.push((name, vec![face])),
+            }
+        });
+        true
+    }
+
+    /// The web font face for `key`, if it is a loaded web family.
+    fn web_face(&self, key: FontKey) -> Option<(usize, &Font)> {
+        let Family::Web(g) = key.family else {
+            return None;
+        };
+        let slot = web_slot(g, key.bold, key.italic)?;
+        Some((Self::WEB_BASE + slot, self.web[slot].get()?))
+    }
+
+    /// Glyph-cache index of web font slot 0.
+    const WEB_BASE: usize = 1000;
+
     fn face(&self, key: FontKey) -> &Font {
+        if let Some((_, f)) = self.web_face(key) {
+            return f;
+        }
+        let key = key.bundled_key();
         self.faces[key.index()].get_or_init(|| {
             if self.system
                 && let Some(f) = system_face(key)
@@ -116,6 +243,7 @@ impl Fonts {
         if !self.system {
             return self.face(key);
         }
+        let key = key.bundled_key();
         self.bundled[key.index()].get_or_init(|| {
             Font::from_bytes(key.data(), FontSettings::default()).expect("bundled font is valid")
         })
@@ -128,6 +256,12 @@ impl Fonts {
     /// The face that draws `c`: the requested one, else regular DejaVu Sans
     /// (same weight/style), else the system fallback font.
     fn face_for(&self, key: FontKey, c: char) -> (usize, &Font) {
+        if let Some((index, font)) = self.web_face(key)
+            && (c.is_whitespace() || c.is_control() || font.lookup_glyph_index(c) != 0)
+        {
+            return (index, font);
+        }
+        let key = key.bundled_key();
         let font = self.face(key);
         if c.is_whitespace() || c.is_control() || font.lookup_glyph_index(c) != 0 {
             return (key.index(), font);
@@ -229,6 +363,16 @@ impl Fonts {
     }
 }
 
+/// Parses font bytes, unwrapping WOFF / WOFF2.
+fn decode_font(bytes: &[u8]) -> Option<Font> {
+    let data = match bytes.get(..4)? {
+        b"wOFF" => wuff::decompress_woff1(bytes).ok()?,
+        b"wOF2" => wuff::decompress_woff2(bytes).ok()?,
+        _ => bytes.to_vec(),
+    };
+    Font::from_bytes(data, FontSettings::default()).ok()
+}
+
 /// An installed face metric-compatible with what other browsers use for
 /// `key` (Arial for sans-serif, Georgia for serif).
 fn system_face(key: FontKey) -> Option<Font> {
@@ -276,7 +420,7 @@ fn system_face(key: FontKey) -> Option<Font> {
                     "C:\\Windows\\Fonts\\georgiaz.ttf",
                 ],
             ],
-            Family::Mono => &[],
+            Family::Mono | Family::Web(_) => &[],
         };
         for set in candidates {
             if let Ok(bytes) = std::fs::read(set[style])

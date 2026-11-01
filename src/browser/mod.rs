@@ -89,6 +89,11 @@ enum Request {
         node: Option<NodeId>,
         src: String,
     },
+    Font {
+        tab: u64,
+        serial: u64,
+        font: crate::document::FontRequest,
+    },
 }
 
 /// Languages a `<script>` can be written in. Every one runs as wasm: Rust
@@ -732,6 +737,29 @@ impl Browser {
                     .filter(|&i| self.tabs[i].serial == serial)
                 {
                     self.tabs[i].doc.image_loaded(node, &src, result);
+                    self.dirty = true;
+                }
+            }
+            Request::Font { tab, serial, font } => {
+                if std::env::var_os("RUBROWSER_PROFILE").is_some() {
+                    eprintln!(
+                        "[profile] font {} weight={} italic={} {}: {:?}",
+                        font.family,
+                        font.weight,
+                        font.italic,
+                        font.url,
+                        result.as_ref().map(Vec::len)
+                    );
+                }
+                if let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                    && let Ok(bytes) = result
+                    && self
+                        .fonts
+                        .add_web_font(&font.family, font.weight, font.italic, &bytes)
+                {
+                    self.tabs[i].doc.fonts_changed();
                     self.dirty = true;
                 }
             }
@@ -1710,6 +1738,16 @@ impl Browser {
                 serial,
                 link: None,
                 url: url.clone(),
+            };
+            self.fetch(req, &url, host);
+        }
+        let tab = &mut self.tabs[self.active];
+        for font in tab.doc.font_requests() {
+            let url = url::resolve(&base, &font.url);
+            let req = Request::Font {
+                tab: id,
+                serial,
+                font,
             };
             self.fetch(req, &url, host);
         }
