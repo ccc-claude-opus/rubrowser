@@ -488,7 +488,7 @@ impl Document {
             if nested {
                 continue; // drawn as part of the outer <svg>
             }
-            let markup = image::svg_markup(&self.dom, n, color);
+            let markup = image::svg_markup(&self.dom, &self.styles, n, color);
             if self.images.get(n).is_some_and(|s| s.src() == markup) {
                 continue;
             }

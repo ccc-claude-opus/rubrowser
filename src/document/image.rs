@@ -434,8 +434,20 @@ const SVG_NAMES: &[&str] = &[
 
 /// Serializes inline `<svg>` element `id` as a standalone SVG document,
 /// with `currentColor` resolved to `color`.
-pub fn svg_markup(dom: &Dom, id: NodeId, color: Rgba) -> String {
-    fn write(dom: &Dom, id: NodeId, out: &mut String, root: bool, color: Rgba) {
+pub fn svg_markup(
+    dom: &Dom,
+    styles: &[Option<crate::css::style::Style>],
+    id: NodeId,
+    color: Rgba,
+) -> String {
+    fn write(
+        dom: &Dom,
+        styles: &[Option<crate::css::style::Style>],
+        id: NodeId,
+        out: &mut String,
+        root: bool,
+        color: Rgba,
+    ) {
         if let Some(t) = dom.text(id) {
             out.push_str(&crate::dom::escape(t, false));
             return;
@@ -446,12 +458,40 @@ pub fn svg_markup(dom: &Dom, id: NodeId, color: Rgba) -> String {
             .find(|n| n.eq_ignore_ascii_case(&e.name))
             .copied()
             .unwrap_or(&e.name);
+        // CSS fill / stroke set on this element (not just inherited from
+        // its parent) override presentation attributes.
+        let style = styles.get(id).and_then(Option::as_ref);
+        let parent_style = dom
+            .parent(id)
+            .and_then(|p| styles.get(p))
+            .and_then(Option::as_ref);
+        let own = |pick: fn(&crate::css::style::Style) -> &Option<std::rc::Rc<str>>| {
+            let v = style.and_then(|s| pick(s).clone())?;
+            let inherited = parent_style.is_some_and(|p| pick(p).as_deref() == Some(&*v));
+            (!inherited || root).then_some(v)
+        };
+        let css = [
+            ("fill", own(|s| &s.svg_fill)),
+            ("stroke", own(|s| &s.svg_stroke)),
+        ];
         out.push('<');
         out.push_str(name);
         for (n, v) in &e.attrs {
             if root && (n == "xmlns" || n == "color") {
                 continue;
             }
+            if css.iter().any(|(c, v)| c == n && v.is_some()) {
+                continue;
+            }
+            // Presentation attributes may use CSS variables.
+            let resolved;
+            let v = match style.filter(|_| v.contains("var(")) {
+                Some(st) => {
+                    resolved = crate::css::substitute_vars(v, &st.vars, 0).unwrap_or_default();
+                    &resolved
+                }
+                None => v,
+            };
             out.push(' ');
             out.push_str(if n == "href" { "xlink:href" } else { n });
             out.push_str("=\"");
@@ -464,16 +504,28 @@ pub fn svg_markup(dom: &Dom, id: NodeId, color: Rgba) -> String {
                 color.rgb()
             ));
         }
+        if let Some(st) = style {
+            let hex = |c: Rgba| format!("#{:06x}", c.rgb());
+            for (name, v) in &css {
+                let Some(v) = v else { continue };
+                let v = if v.eq_ignore_ascii_case("currentcolor") {
+                    hex(st.color)
+                } else {
+                    crate::css::values::color(v, st.color).map_or_else(|| v.to_string(), hex)
+                };
+                out.push_str(&format!(" {name}=\"{}\"", crate::dom::escape(&v, true)));
+            }
+        }
         out.push('>');
         for &c in dom.children(id) {
-            write(dom, c, out, false, color);
+            write(dom, styles, c, out, false, color);
         }
         out.push_str("</");
         out.push_str(name);
         out.push('>');
     }
     let mut out = String::new();
-    write(dom, id, &mut out, true, color);
+    write(dom, styles, id, &mut out, true, color);
     out
 }
 

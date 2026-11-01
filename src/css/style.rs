@@ -353,6 +353,10 @@ pub struct Style {
     pub list_style: ListStyle,
     /// `direction: rtl` (inherited).
     pub rtl: bool,
+    /// SVG `fill` and `stroke` set by CSS (inherited), as written;
+    /// `currentColor` is resolved when the SVG is drawn.
+    pub svg_fill: Option<Rc<str>>,
+    pub svg_stroke: Option<Rc<str>>,
     pub visible: bool,
     /// Custom properties (`--name`), inherited.
     pub vars: Rc<BTreeMap<String, String>>,
@@ -435,6 +439,8 @@ impl Default for Style {
             cursor: Cursor::Auto,
             list_style: ListStyle::Disc,
             rtl: false,
+            svg_fill: None,
+            svg_stroke: None,
             visible: true,
             vars: Rc::default(),
             has_rules: false,
@@ -462,6 +468,8 @@ impl Style {
             cursor: parent.cursor,
             list_style: parent.list_style,
             rtl: parent.rtl,
+            svg_fill: parent.svg_fill.clone(),
+            svg_stroke: parent.svg_stroke.clone(),
             // Clipping to nothing hides everything inside too.
             clipped_away: parent.clipped_away,
             visible: parent.visible,
@@ -1005,6 +1013,8 @@ impl Style {
                 _ => {}
             },
             "content" => self.content = Some(value.into()),
+            "fill" => self.svg_fill = Some(value.into()),
+            "stroke" => self.svg_stroke = Some(value.into()),
             "counter-reset" => self.counter_reset = Some(value.into()),
             "counter-increment" => self.counter_increment = Some(value.into()),
             "vertical-align" => {
@@ -1253,6 +1263,8 @@ impl Style {
             "cursor" => self.cursor = from.cursor,
             "list-style" | "list-style-type" => self.list_style = from.list_style,
             "direction" => self.rtl = from.rtl,
+            "fill" => self.svg_fill = from.svg_fill.clone(),
+            "stroke" => self.svg_stroke = from.svg_stroke.clone(),
             "visibility" => self.visible = from.visible,
             "vertical-align" => self.vertical_align = from.vertical_align,
             "border-spacing" => self.border_spacing = from.border_spacing,
@@ -1359,6 +1371,8 @@ fn is_inherited(name: &str) -> bool {
                 | "list-style-type"
                 | "visibility"
                 | "direction"
+                | "fill"
+                | "stroke"
                 | "border-spacing"
                 | "border-collapse"
                 | "text-transform"
