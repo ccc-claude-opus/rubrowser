@@ -1,0 +1,37 @@
+<!doctype html>
+<html>
+<head>
+<title>DOM events</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 32px; background: #f6f7f9; color: #202124; }
+  h1 { font-size: 22px; margin: 0 0 16px 0; }
+  .row { display: flex; gap: 12px; margin-bottom: 12px; }
+  .card { flex: 1; padding: 12px 16px; background: #fff; border: 1px solid #dadce0; border-radius: 8px; }
+  .card.hot { border-color: #1a73e8; background: #eef3fd; }
+  #outer { padding: 12px; background: #fde7e9; border-radius: 8px; }
+  #inner { display: inline-block; padding: 6px 12px; background: #fff; border-radius: 6px; }
+  #dbl { padding: 8px; border: 1px dashed #9aa0a6; border-radius: 6px; }
+  #dbl.on { background: #fff3c4; }
+  #log { font-family: monospace; font-size: 13px; background: #202124; color: #e8eaed;
+         padding: 8px 12px; border-radius: 8px; min-height: 120px; }
+</style>
+</head>
+<body>
+  <h1>DOM events</h1>
+  <div class="row">
+    <div class="card"><b>Hover</b> me (mouseover / mouseout)</div>
+    <div class="card"><b>Hover</b> me too</div>
+  </div>
+  <div class="row">
+    <div id="outer" class="card">Outer box <span id="inner">inner (stops propagation)</span></div>
+    <div id="dbl" class="card">Double-click me</div>
+  </div>
+  <div class="row">
+    <div class="card"><button id="fill">Fill list via innerHTML</button><ul id="list"></ul></div>
+    <div class="card">Name: <input id="name" placeholder="type"> <p id="hello">Hello!</p>
+      Ticks: <span id="ticks">0</span></div>
+  </div>
+  <div id="log"></div>
+  <script type="application/wasm" src="events.wasm"></script>
+</body>
+</html>

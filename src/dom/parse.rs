@@ -6,13 +6,28 @@ use std::rc::Rc;
 
 use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::tree_builder::{ElementFlags, NodeOrText, QuirksMode, TreeSink};
-use html5ever::{Attribute, LocalName, Namespace, QualName, parse_document};
+use html5ever::{Attribute, LocalName, Namespace, QualName, ns, parse_document, parse_fragment};
 
 use super::{Dom, Element, NodeId};
 
 /// Parses an HTML document. Never fails: html5ever recovers from any input.
 pub fn parse_html(html: &str) -> Dom {
     parse_document(Sink::default(), Default::default()).one(html)
+}
+
+/// Parses `html` as the contents of a `<context>` element (for
+/// `innerHTML`). Returns the parsed tree and the top-level nodes.
+pub fn parse_html_fragment(html: &str, context: &str) -> (Dom, Vec<NodeId>) {
+    let name = QualName::new(None, ns!(html), LocalName::from(context));
+    let dom =
+        parse_fragment(Sink::default(), Default::default(), name, Vec::new(), false).one(html);
+    // html5ever puts the fragment's nodes under a synthetic <html> root.
+    let top = dom
+        .children(Dom::ROOT)
+        .first()
+        .map(|&h| dom.children(h).to_vec())
+        .unwrap_or_default();
+    (dom, top)
 }
 
 /// A node id plus, for elements, the qualified name html5ever asks back for.
@@ -210,6 +225,15 @@ mod tests {
         // Adoption agency: "3" ends up in an <i> outside the <b>.
         let last = *d.children(body).last().unwrap();
         assert_eq!(d.tag(last), Some("i"));
+    }
+
+    #[test]
+    fn fragments() {
+        let (d, top) = parse_html_fragment("a<b>bold</b><li>x", "ul");
+        assert_eq!(top.len(), 3);
+        assert_eq!(d.text(top[0]), Some("a"));
+        assert_eq!(d.tag(top[1]), Some("b"));
+        assert_eq!(d.tag(top[2]), Some("li"));
     }
 
     #[test]

@@ -60,3 +60,37 @@ pub mod key {
     pub const LEFT_BRACKET: i32 = 219;
     pub const RIGHT_BRACKET: i32 = 221;
 }
+
+/// DOM-style `KeyboardEvent.key` name for a key code.
+pub fn key_name(code: i32, shift: bool) -> String {
+    let named = match code {
+        0 => "",
+        key::BACKSPACE => "Backspace",
+        key::TAB => "Tab",
+        key::ENTER => "Enter",
+        key::ESCAPE => "Escape",
+        key::SPACE => " ",
+        key::PAGE_UP => "PageUp",
+        key::PAGE_DOWN => "PageDown",
+        key::END => "End",
+        key::HOME => "Home",
+        key::LEFT => "ArrowLeft",
+        key::UP => "ArrowUp",
+        key::RIGHT => "ArrowRight",
+        key::DOWN => "ArrowDown",
+        key::DELETE => "Delete",
+        key::F5 => "F5",
+        key::LEFT_BRACKET => "[",
+        key::RIGHT_BRACKET => "]",
+        c => {
+            return match char::from_u32(c as u32) {
+                Some(ch) if ch.is_ascii_alphabetic() && !shift => {
+                    ch.to_ascii_lowercase().to_string()
+                }
+                Some(ch) if ch.is_ascii_alphanumeric() => ch.to_string(),
+                _ => "Unidentified".to_string(),
+            };
+        }
+    };
+    named.to_string()
+}

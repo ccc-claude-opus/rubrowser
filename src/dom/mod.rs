@@ -5,7 +5,13 @@
 
 mod parse;
 
-pub use parse::parse_html;
+pub use parse::{parse_html, parse_html_fragment};
+
+/// Elements that never have children or an end tag.
+const VOID: &[&str] = &[
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
+    "wbr",
+];
 
 pub type NodeId = usize;
 
@@ -290,6 +296,91 @@ impl Dom {
         }
     }
 
+    /// Copies node `node` of `src` (with its subtree) into this tree,
+    /// detached. Returns the new node.
+    pub fn import(&mut self, src: &Dom, node: NodeId) -> NodeId {
+        let copy = self.create(src.nodes[node].data.clone());
+        for &c in &src.nodes[node].children {
+            let child = self.import(src, c);
+            self.append(copy, child);
+        }
+        copy
+    }
+
+    /// Serializes `id` as HTML: its children only (`innerHTML`), or with
+    /// the element itself (`outerHTML`).
+    pub fn to_html(&self, id: NodeId, outer: bool) -> String {
+        let mut out = String::new();
+        if outer {
+            self.write_html(id, &mut out);
+        } else {
+            for &c in &self.nodes[id].children {
+                self.write_html(c, &mut out);
+            }
+        }
+        out
+    }
+
+    fn write_html(&self, id: NodeId, out: &mut String) {
+        match &self.nodes[id].data {
+            NodeData::Document => {
+                for &c in &self.nodes[id].children {
+                    self.write_html(c, out);
+                }
+            }
+            NodeData::Text(t) => {
+                let raw = self
+                    .parent(id)
+                    .and_then(|p| self.tag(p))
+                    .is_some_and(|t| matches!(t, "style" | "script"));
+                if raw {
+                    out.push_str(t);
+                } else {
+                    out.push_str(&escape(t, false));
+                }
+            }
+            NodeData::Comment(t) => {
+                out.push_str("<!--");
+                out.push_str(t);
+                out.push_str("-->");
+            }
+            NodeData::Element(e) => {
+                out.push('<');
+                out.push_str(&e.name);
+                for (n, v) in &e.attrs {
+                    out.push(' ');
+                    out.push_str(n);
+                    out.push_str("=\"");
+                    out.push_str(&escape(v, true));
+                    out.push('"');
+                }
+                out.push('>');
+                if VOID.contains(&e.name.as_str()) {
+                    return;
+                }
+                for &c in &self.nodes[id].children {
+                    self.write_html(c, out);
+                }
+                out.push_str("</");
+                out.push_str(&e.name);
+                out.push('>');
+            }
+        }
+    }
+
+    /// Replaces the children of `id` with nodes parsed from `html`.
+    pub fn set_inner_html(&mut self, id: NodeId, html: &str) {
+        let context = self.tag(id).unwrap_or("body").to_string();
+        let (frag, top) = parse_html_fragment(html, &context);
+        for c in self.nodes[id].children.clone() {
+            self.detach(c);
+        }
+        for t in top {
+            let n = self.import(&frag, t);
+            self.append(id, n);
+        }
+    }
+
     /// The `<html>`, `<head>` and `<body>` elements, if present.
     pub fn html(&self) -> Option<NodeId> {
         self.children(Self::ROOT)
@@ -323,9 +414,38 @@ impl Dom {
     }
 }
 
+fn escape(s: &str, attr: bool) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' if !attr => out.push_str("&lt;"),
+            '>' if !attr => out.push_str("&gt;"),
+            '"' if attr => out.push_str("&quot;"),
+            '\u{a0}' => out.push_str("&nbsp;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialize_and_inner_html() {
+        let mut d = parse_html("<div id=a class=\"x\">1 &lt; 2<br><i>it</i></div>");
+        let a = d.element_by_id("a").unwrap();
+        assert_eq!(d.to_html(a, false), "1 &lt; 2<br><i>it</i>");
+        assert_eq!(
+            d.to_html(a, true),
+            "<div id=\"a\" class=\"x\">1 &lt; 2<br><i>it</i></div>"
+        );
+        d.set_inner_html(a, "<b>new</b> text");
+        assert_eq!(d.to_html(a, false), "<b>new</b> text");
+        assert_eq!(d.text_content(a), "new text");
+    }
 
     #[test]
     fn tree_operations() {

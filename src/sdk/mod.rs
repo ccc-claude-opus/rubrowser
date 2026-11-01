@@ -71,11 +71,30 @@ imports! {
     fn insert(parent: i32, child: i32, before: i32) -> i32;
     fn remove(h: i32);
     fn listen(h: i32, p: *const u8, n: usize, id: i32);
+    fn unlisten(h: i32, p: *const u8, n: usize, id: i32);
     fn prevent_default();
+    fn stop_propagation();
     fn set_timeout(ms: f64, id: i32);
+    fn clear_timeout(id: i32);
     fn navigate(p: *const u8, n: usize);
     fn log(p: *const u8, n: usize);
     fn now() -> f64;
+    fn node_type(h: i32) -> i32;
+    fn tag_name(h: i32, p: *mut u8, cap: usize) -> i32;
+    fn relative(h: i32, which: i32) -> i32;
+    fn child_count(h: i32) -> i32;
+    fn child_at(h: i32, i: i32) -> i32;
+    fn special(which: i32) -> i32;
+    fn matches(h: i32, p: *const u8, n: usize) -> i32;
+    fn get_html(h: i32, outer: i32, p: *mut u8, cap: usize) -> i32;
+    fn set_html(h: i32, p: *const u8, n: usize);
+    fn attr_count(h: i32) -> i32;
+    fn attr_name_at(h: i32, i: i32, p: *mut u8, cap: usize) -> i32;
+    fn event_string(which: i32, p: *mut u8, cap: usize) -> i32;
+    fn event_int(which: i32) -> i32;
+    fn event_pos(which: i32) -> f64;
+    fn location(p: *mut u8, cap: usize) -> i32;
+    fn history_go(delta: i32);
 }
 
 /// Reads a string the browser writes into a buffer, growing it if needed.
@@ -95,9 +114,50 @@ fn read_string(mut get: impl FnMut(*mut u8, usize) -> i32) -> Option<String> {
     }
 }
 
-/// A DOM element (or text node) of the page.
+/// A DOM node of the page: usually an element, but also text nodes and
+/// the document (see [`Element::node_type`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Element(i32);
+
+/// [`Element::node_type`] values, as in the DOM.
+pub mod node_type {
+    pub const ELEMENT: i32 = 1;
+    pub const TEXT: i32 = 3;
+    pub const COMMENT: i32 = 8;
+    pub const DOCUMENT: i32 = 9;
+}
+
+fn handle(h: i32) -> Option<Element> {
+    (h >= 0).then_some(Element(h))
+}
+
+/// The document node (listen here for events anywhere on the page).
+pub fn document() -> Element {
+    Element(unsafe { ffi::special(0) })
+}
+
+/// The `<html>` element.
+pub fn document_element() -> Option<Element> {
+    handle(unsafe { ffi::special(1) })
+}
+
+pub fn head() -> Option<Element> {
+    handle(unsafe { ffi::special(2) })
+}
+
+pub fn body() -> Option<Element> {
+    handle(unsafe { ffi::special(3) })
+}
+
+/// The page's URL.
+pub fn location() -> String {
+    read_string(|p, cap| unsafe { ffi::location(p, cap) }).unwrap_or_default()
+}
+
+/// Moves through the tab's history (`-1` is back).
+pub fn history_go(delta: i32) {
+    unsafe { ffi::history_go(delta) }
+}
 
 /// The first element matching a CSS selector.
 pub fn query(selector: &str) -> Option<Element> {
@@ -136,9 +196,96 @@ impl Element {
         self.0
     }
 
+    /// The parent element.
     pub fn parent(self) -> Option<Element> {
-        let h = unsafe { ffi::parent(self.0) };
-        (h >= 0).then_some(Element(h))
+        handle(unsafe { ffi::parent(self.0) })
+    }
+
+    /// The parent node (may be the document).
+    pub fn parent_node(self) -> Option<Element> {
+        handle(unsafe { ffi::relative(self.0, 0) })
+    }
+
+    pub fn first_child(self) -> Option<Element> {
+        handle(unsafe { ffi::relative(self.0, 1) })
+    }
+
+    pub fn last_child(self) -> Option<Element> {
+        handle(unsafe { ffi::relative(self.0, 2) })
+    }
+
+    pub fn next_sibling(self) -> Option<Element> {
+        handle(unsafe { ffi::relative(self.0, 3) })
+    }
+
+    pub fn previous_sibling(self) -> Option<Element> {
+        handle(unsafe { ffi::relative(self.0, 4) })
+    }
+
+    /// All child nodes (elements, text, comments).
+    pub fn child_nodes(self) -> Vec<Element> {
+        let n = unsafe { ffi::child_count(self.0) }.max(0);
+        (0..n)
+            .filter_map(|i| handle(unsafe { ffi::child_at(self.0, i) }))
+            .collect()
+    }
+
+    /// Child elements only.
+    pub fn children(self) -> Vec<Element> {
+        self.child_nodes()
+            .into_iter()
+            .filter(|c| c.node_type() == node_type::ELEMENT)
+            .collect()
+    }
+
+    /// See [`node_type`]; -1 for an invalid handle.
+    pub fn node_type(self) -> i32 {
+        unsafe { ffi::node_type(self.0) }
+    }
+
+    /// Lowercase tag name (empty for non-elements).
+    pub fn tag(self) -> String {
+        read_string(|p, cap| unsafe { ffi::tag_name(self.0, p, cap) }).unwrap_or_default()
+    }
+
+    /// Whether the element matches a CSS selector.
+    pub fn matches(self, selector: &str) -> bool {
+        unsafe { ffi::matches(self.0, selector.as_ptr(), selector.len()) != 0 }
+    }
+
+    /// The nearest inclusive ancestor matching `selector`.
+    pub fn closest(self, selector: &str) -> Option<Element> {
+        let mut e = Some(self);
+        while let Some(x) = e {
+            if x.matches(selector) {
+                return Some(x);
+            }
+            e = x.parent();
+        }
+        None
+    }
+
+    /// The element's contents as HTML.
+    pub fn inner_html(self) -> String {
+        read_string(|p, cap| unsafe { ffi::get_html(self.0, 0, p, cap) }).unwrap_or_default()
+    }
+
+    /// Replaces the element's contents with parsed `html`.
+    pub fn set_inner_html(self, html: &str) {
+        unsafe { ffi::set_html(self.0, html.as_ptr(), html.len()) }
+    }
+
+    /// The element and its contents as HTML.
+    pub fn outer_html(self) -> String {
+        read_string(|p, cap| unsafe { ffi::get_html(self.0, 1, p, cap) }).unwrap_or_default()
+    }
+
+    /// Names of the element's attributes.
+    pub fn attr_names(self) -> Vec<String> {
+        let n = unsafe { ffi::attr_count(self.0) }.max(0);
+        (0..n)
+            .filter_map(|i| read_string(|p, cap| unsafe { ffi::attr_name_at(self.0, i, p, cap) }))
+            .collect()
     }
 
     /// All text inside the element.
@@ -236,41 +383,118 @@ impl Element {
     }
 
     /// Calls `handler` for `event` on this element or its descendants
-    /// (events bubble). Events: `click`, `input`, `change`, `keydown`.
-    pub fn on(self, event: &str, handler: impl FnMut(&Event) + 'static) {
+    /// (events bubble). Returns a handle for [`Element::off`].
+    ///
+    /// Events: `click`, `dblclick`, `mousedown`, `mouseup`, `mouseover`,
+    /// `mouseout`, `input`, `change`, `keydown`, `focus`, `blur`.
+    pub fn on(self, event: &str, handler: impl FnMut(&Event) + 'static) -> Listener {
         let id = register(Callback::Listener(Box::new(handler)));
-        unsafe { ffi::listen(self.0, event.as_ptr(), event.len(), id) }
+        unsafe { ffi::listen(self.0, event.as_ptr(), event.len(), id) };
+        Listener {
+            element: self,
+            event: event.to_string(),
+            id,
+        }
+    }
+
+    /// Removes a listener added with [`Element::on`].
+    pub fn off(self, listener: &Listener) {
+        let e = &listener.event;
+        unsafe { ffi::unlisten(self.0, e.as_ptr(), e.len(), listener.id) };
+        take(listener.id);
+    }
+}
+
+/// A registered event listener, for [`Element::off`].
+#[derive(Clone, Debug)]
+pub struct Listener {
+    element: Element,
+    event: String,
+    id: i32,
+}
+
+impl Listener {
+    /// Removes this listener.
+    pub fn remove(&self) {
+        self.element.off(self);
     }
 }
 
 /// An event delivered to a handler.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Event {
+    /// `click`, `keydown`, …
+    pub kind: String,
     /// Where the event happened (may be a descendant of the listener).
     pub target: Element,
+    /// The element whose listener is running.
+    pub current_target: Element,
+    /// DOM-style key name for `keydown`: `"a"`, `"Enter"`, `"ArrowLeft"`…
+    pub key: String,
     /// Key code for `keydown` (see [`key`]); 0 otherwise.
-    pub key: i32,
-    /// Modifier bits for `keydown` (see [`modifier`]).
+    pub key_code: i32,
+    /// Modifier bits (see [`modifier`]).
     pub mods: i32,
+    /// Pointer position for mouse events, in page coordinates.
+    pub x: f64,
+    pub y: f64,
+    pub button: i32,
 }
 
 impl Event {
+    fn current() -> Event {
+        let s =
+            |w| read_string(|p, cap| unsafe { ffi::event_string(w, p, cap) }).unwrap_or_default();
+        let i = |w| unsafe { ffi::event_int(w) };
+        Event {
+            kind: s(0),
+            target: Element(i(0)),
+            current_target: Element(i(1)),
+            key: s(1),
+            key_code: i(2),
+            mods: i(3),
+            x: unsafe { ffi::event_pos(0) },
+            y: unsafe { ffi::event_pos(1) },
+            button: i(4),
+        }
+    }
+
     /// Cancels the browser's default action (e.g. following a link).
     pub fn prevent_default(&self) {
         unsafe { ffi::prevent_default() }
     }
+
+    /// Stops the event from bubbling to ancestors.
+    pub fn stop_propagation(&self) {
+        unsafe { ffi::stop_propagation() }
+    }
 }
 
+/// A pending timer, for [`clear_timeout`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Timer(i32);
+
 /// Runs `f` once after `ms` milliseconds.
-pub fn set_timeout(ms: f64, f: impl FnOnce() + 'static) {
+pub fn set_timeout(ms: f64, f: impl FnOnce() + 'static) -> Timer {
     let id = register(Callback::Timeout(Box::new(f)));
-    unsafe { ffi::set_timeout(ms, id) }
+    unsafe { ffi::set_timeout(ms, id) };
+    Timer(id)
 }
 
 /// Runs `f` every `ms` milliseconds.
-pub fn set_interval(ms: f64, f: impl FnMut() + 'static) {
+pub fn set_interval(ms: f64, f: impl FnMut() + 'static) -> Timer {
     let id = register(Callback::Interval(ms, Box::new(f)));
-    unsafe { ffi::set_timeout(ms, id) }
+    unsafe { ffi::set_timeout(ms, id) };
+    Timer(id)
+}
+
+/// Cancels a timeout or interval.
+pub fn clear_timeout(timer: Timer) {
+    unsafe { ffi::clear_timeout(timer.0) };
+    if take(timer.0).is_none() {
+        // Cleared from inside its own callback, which is running now.
+        CLEARED.with(|c| c.borrow_mut().insert(timer.0));
+    }
 }
 
 /// Opens `url` (relative to the page) in the current tab.
@@ -296,6 +520,9 @@ enum Callback {
 
 thread_local! {
     static CALLBACKS: RefCell<Vec<Option<Callback>>> = const { RefCell::new(Vec::new()) };
+    /// Intervals cleared while their callback was running.
+    static CLEARED: RefCell<std::collections::HashSet<i32>> =
+        RefCell::new(std::collections::HashSet::new());
 }
 
 fn register(cb: Callback) -> i32 {
@@ -320,13 +547,9 @@ fn put_back(id: i32, cb: Callback) {
 }
 
 #[doc(hidden)]
-pub fn __event(id: i32, target: i32, key: i32, mods: i32) {
+pub fn __event(id: i32) {
     if let Some(Callback::Listener(mut f)) = take(id) {
-        f(&Event {
-            target: Element(target),
-            key,
-            mods,
-        });
+        f(&Event::current());
         put_back(id, Callback::Listener(f));
     }
 }
@@ -337,8 +560,12 @@ pub fn __timer(id: i32) {
         Some(Callback::Timeout(f)) => f(),
         Some(Callback::Interval(ms, mut f)) => {
             f();
-            put_back(id, Callback::Interval(ms, f));
-            unsafe { ffi::set_timeout(ms, id) }
+            // The callback may have cleared its own interval.
+            let cleared = CLEARED.with(|c| c.borrow_mut().remove(&id));
+            if !cleared {
+                put_back(id, Callback::Interval(ms, f));
+                unsafe { ffi::set_timeout(ms, id) }
+            }
         }
         other => {
             if let Some(cb) = other {
@@ -359,8 +586,8 @@ macro_rules! script {
         }
 
         #[unsafe(no_mangle)]
-        pub extern "C" fn rb_event(id: i32, target: i32, key: i32, mods: i32) {
-            $crate::sdk::__event(id, target, key, mods)
+        pub extern "C" fn rb_event(id: i32) {
+            $crate::sdk::__event(id)
         }
 
         #[unsafe(no_mangle)]

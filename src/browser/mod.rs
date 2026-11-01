@@ -15,7 +15,7 @@ use crate::gfx::Canvas;
 use crate::input::{Cursor, Event, Host, Modifiers};
 use crate::layout::RectF;
 use crate::net::url;
-use crate::script::Script;
+use crate::script::{EventInfo, Script};
 use crate::text::Fonts;
 use crate::ui::textfield::Action;
 
@@ -23,6 +23,7 @@ const CHROME_HTML: &str = include_str!("chrome.html");
 const HOME_HTML: &str = include_str!("pages/home.html");
 const CARET_BLINK_MS: f64 = 530.0;
 const WHEEL_LINE: f32 = 40.0;
+const DOUBLE_CLICK_MS: f64 = 400.0;
 
 /// Pages and files built into the browser, served as `about:NAME`.
 fn builtin(name: &str) -> Option<&'static [u8]> {
@@ -35,6 +36,8 @@ fn builtin(name: &str) -> Option<&'static [u8]> {
         "todo.wasm" => include_bytes!("pages/todo.wasm"),
         "stopwatch" => include_bytes!("pages/stopwatch.html"),
         "stopwatch.wasm" => include_bytes!("pages/stopwatch.wasm"),
+        "events" => include_bytes!("pages/events.html"),
+        "events.wasm" => include_bytes!("pages/events.wasm"),
         _ => return None,
     })
 }
@@ -61,6 +64,35 @@ enum Request {
     Page { tab: u64, serial: u64, url: String },
     Stylesheet { tab: u64, serial: u64, link: NodeId },
     Script { tab: u64, serial: u64, url: String },
+}
+
+/// Extra fields of a dispatched event.
+#[derive(Clone, Copy, Debug, Default)]
+struct EventInit {
+    key: i32,
+    mods: i32,
+    x: f32,
+    y: f32,
+    button: i32,
+}
+
+impl EventInit {
+    fn key(key: i32, mods: i32) -> Self {
+        EventInit {
+            key,
+            mods,
+            ..Default::default()
+        }
+    }
+
+    fn pointer(x: f32, y: f32, button: i32) -> Self {
+        EventInit {
+            x,
+            y,
+            button,
+            ..Default::default()
+        }
+    }
 }
 
 /// A pending `set_timeout` of a script.
@@ -121,6 +153,8 @@ pub struct Browser {
     shown_tabs: Vec<(String, bool)>,
     /// Built-in resources fetched, delivered on the next update.
     local: Vec<(u32, Result<Vec<u8>, String>)>,
+    /// Last page click (element, time), to detect double clicks.
+    last_click: Option<(NodeId, f64)>,
 }
 
 impl Browser {
@@ -146,6 +180,7 @@ impl Browser {
             dirty: true,
             shown_tabs: Vec::new(),
             local: Vec::new(),
+            last_click: None,
         };
         b.push_tab("about:home");
         b.tabs[0].doc = Document::from_html(HOME_HTML, "about:home");
@@ -368,16 +403,18 @@ impl Browser {
 
     /// Acts on what script `si` of tab `i` asked for; returns whether it
     /// prevented the default action.
-    fn after_script(&mut self, i: usize, si: usize, host: &mut dyn Host) -> bool {
+    fn after_script(&mut self, i: usize, si: usize, host: &mut dyn Host) -> (bool, bool) {
         let now = self.now;
         let Some(Some(script)) = self.tabs[i].scripts.get_mut(si) else {
-            return false;
+            return (false, false);
         };
         let out = script.take_output();
         for msg in &out.logs {
             host.log(msg);
         }
         let tab = &mut self.tabs[i];
+        tab.timers
+            .retain(|t| !(t.script == si && out.cleared.contains(&t.id)));
         for (delay, id) in out.timers {
             tab.timers.push(Timer {
                 due: now + delay,
@@ -392,8 +429,10 @@ impl Browser {
         {
             let target = url::resolve(&self.tabs[i].doc.url, &target);
             self.navigate(&target, host);
+        } else if out.history != 0 && i == self.active {
+            self.go(out.history as isize, host);
         }
-        out.prevent_default
+        (out.prevent_default, out.stop_propagation)
     }
 
     /// Reports a script failure and stops that script.
@@ -403,44 +442,61 @@ impl Browser {
         self.tabs[i].timers.retain(|t| t.script != si);
     }
 
-    /// Dispatches `event` at `node` of the active page, bubbling up to the
-    /// root. Returns whether a listener prevented the default action.
-    fn dispatch(
-        &mut self,
-        node: NodeId,
-        event: &str,
-        key: i32,
-        mods: i32,
-        host: &mut dyn Host,
-    ) -> bool {
+    /// Dispatches event `kind` at `node` of the active page, bubbling up to
+    /// the document. `init` supplies key and pointer fields. Returns whether
+    /// a listener prevented the default action.
+    fn dispatch(&mut self, node: NodeId, kind: &str, init: EventInit, host: &mut dyn Host) -> bool {
         let i = self.active;
-        let tab = &self.tabs[i];
-        let mut calls = Vec::new();
+        let mut event = EventInfo {
+            kind: kind.to_string(),
+            target: node,
+            current: node,
+            key_code: init.key,
+            key: crate::abi::key_name(init.key, init.mods & crate::abi::modifier::SHIFT != 0),
+            mods: init.mods,
+            x: init.x as f64,
+            y: init.y as f64,
+            button: init.button,
+        };
+        let mut prevented = false;
         let mut n = Some(node);
         while let Some(id) = n {
-            for (si, s) in tab.scripts.iter().enumerate() {
-                for l in s.iter().flat_map(|s| s.listeners()) {
-                    if l.node == id && l.event == event {
-                        calls.push((si, l.id));
+            let calls: Vec<(usize, i32)> = self.tabs[i]
+                .scripts
+                .iter()
+                .enumerate()
+                .flat_map(|(si, s)| {
+                    s.iter()
+                        .flat_map(|s| s.listeners())
+                        .filter(|l| l.node == id && l.event == kind)
+                        .map(move |l| (si, l.id))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            event.current = id;
+            let mut stopped = false;
+            for (si, lid) in calls {
+                let now = self.now;
+                let t = &mut self.tabs[i];
+                let Some(Some(script)) = t.scripts.get_mut(si) else {
+                    continue;
+                };
+                match script.dispatch(&mut t.doc, lid, &event, now) {
+                    Ok(()) => {
+                        let (p, s) = self.after_script(i, si, host);
+                        prevented |= p;
+                        stopped |= s;
                     }
+                    Err(e) => self.script_failed(i, si, &e, host),
+                }
+                if self.active != i || self.tabs.len() <= i {
+                    return prevented; // the script navigated away
                 }
             }
-            n = tab.doc.dom.parent(id);
-        }
-        let mut prevented = false;
-        for (si, lid) in calls {
-            let now = self.now;
-            let t = &mut self.tabs[i];
-            let Some(Some(script)) = t.scripts.get_mut(si) else {
-                continue;
-            };
-            match script.dispatch(&mut t.doc, lid, node, key, mods, now) {
-                Ok(()) => prevented |= self.after_script(i, si, host),
-                Err(e) => self.script_failed(i, si, &e, host),
+            if stopped {
+                break;
             }
-            if self.active != i || self.tabs.len() <= i {
-                break; // the script navigated away or closed the tab
-            }
+            n = self.tabs[i].doc.dom.parent(id);
         }
         prevented
     }
@@ -644,7 +700,7 @@ impl Browser {
                     self.caret_epoch = now;
                     self.dirty = true;
                     if t == Target::Page {
-                        self.dispatch(n, "input", 0, 0, host);
+                        self.dispatch(n, "input", EventInit::default(), host);
                     }
                 }
             }
@@ -678,8 +734,19 @@ impl Browser {
         } else {
             Target::Chrome
         };
+        let old_page_hover = self.doc(Target::Page).state().hover;
         self.set_state(other, |s| s.hover = None);
         self.set_state(t, |s| s.hover = hit.element);
+        let new_page_hover = self.doc(Target::Page).state().hover;
+        if old_page_hover != new_page_hover {
+            let at = EventInit::pointer(lx, ly, 0);
+            if let Some(o) = old_page_hover {
+                self.dispatch(o, "mouseout", at, host);
+            }
+            if let Some(n) = new_page_hover {
+                self.dispatch(n, "mouseover", at, host);
+            }
+        }
         let doc = self.doc(t);
         let mut cursor = doc.cursor(hit.element);
         if hit.element.is_some_and(|e| doc.is_text_input(e)) {
@@ -717,9 +784,34 @@ impl Browser {
         self.dirty = true;
     }
 
-    fn mouse_down(&mut self, x: f32, y: f32, _host: &mut dyn Host) {
+    /// The pointer position in page coordinates, for page events.
+    fn page_pointer(&self) -> EventInit {
+        let vp = self.viewport_rect();
+        EventInit::pointer(self.pointer.0 - vp.x, self.pointer.1 - vp.y, 0)
+    }
+
+    /// Moves page focus to `node`, firing `blur` and `focus`.
+    fn focus_page(&mut self, node: Option<NodeId>, host: &mut dyn Host) {
+        let old = self.doc(Target::Page).state().focus;
+        self.set_focus(Target::Page, node);
+        if old != node {
+            if let Some(o) = old {
+                self.dispatch(o, "blur", EventInit::default(), host);
+            }
+            if let Some(n) = node {
+                self.dispatch(n, "focus", EventInit::default(), host);
+            }
+        }
+    }
+
+    fn mouse_down(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         let (t, lx, ly) = self.target_at(x, y);
         let hit = self.doc(t).hit_test(lx, ly);
+        if t == Target::Page
+            && let Some(e) = hit.element
+        {
+            self.dispatch(e, "mousedown", EventInit::pointer(lx, ly, 0), host);
+        }
         self.set_state(t, |s| s.active = hit.element);
         let focus = hit.element.and_then(|e| self.doc(t).focusable_ancestor(e));
         let was_focused = self.doc(t).state().focus;
@@ -729,8 +821,16 @@ impl Browser {
         } else {
             Target::Chrome
         };
-        self.set_focus(other, None);
-        self.set_focus(t, focus);
+        if other == Target::Page {
+            self.focus_page(None, host);
+        } else {
+            self.set_focus(other, None);
+        }
+        if t == Target::Page {
+            self.focus_page(focus, host);
+        } else {
+            self.set_focus(t, focus);
+        }
         let mut input = None;
         if let Some(f) = focus.filter(|&f| self.doc(t).is_text_input(f)) {
             let is_address = t == Target::Chrome && Some(f) == self.chrome_el("address");
@@ -763,15 +863,29 @@ impl Browser {
         };
         self.set_state(press.target, |s| s.active = None);
         let (t, lx, ly) = self.target_at(x, y);
+        let hit = self.doc(t).hit_test(lx, ly);
+        if t == Target::Page
+            && let Some(e) = hit.element
+        {
+            self.dispatch(e, "mouseup", EventInit::pointer(lx, ly, 0), host);
+        }
         if t != press.target || press.input.is_some() {
             return;
         }
-        let hit = self.doc(t).hit_test(lx, ly);
         // A click: released on the pressed element or inside it.
         if let (Some(p), Some(h)) = (press.element, hit.element)
             && self.doc(t).dom.is_inclusive_ancestor(p, h)
         {
+            let double = t == Target::Page
+                && self
+                    .last_click
+                    .is_some_and(|(n, at)| n == h && self.now - at < DOUBLE_CLICK_MS);
+            self.last_click = (t == Target::Page).then_some((h, self.now));
             self.click(t, h, host);
+            if double && self.tabs[self.active].doc.dom.get(h).is_some() {
+                self.dispatch(h, "dblclick", EventInit::pointer(lx, ly, 0), host);
+                self.last_click = None;
+            }
         }
     }
 
@@ -803,7 +917,7 @@ impl Browser {
                 }
             }
             Target::Page => {
-                if self.dispatch(node, "click", 0, 0, host) {
+                if self.dispatch(node, "click", self.page_pointer(), host) {
                     return;
                 }
                 let doc = &self.tabs[self.active].doc;
@@ -860,7 +974,11 @@ impl Browser {
         let focus = self.doc(t).state().focus;
         if code == key::TAB {
             let next = self.doc(t).next_focusable(focus, mods.shift);
-            self.set_focus(t, next);
+            if t == Target::Page {
+                self.focus_page(next, host);
+            } else {
+                self.set_focus(t, next);
+            }
             if let Some(n) = next.filter(|&n| self.doc(t).is_text_input(n)) {
                 self.doc_mut(t).input(n).select_all();
             }
@@ -870,7 +988,7 @@ impl Browser {
             let target = focus
                 .or_else(|| self.doc(t).dom.body())
                 .unwrap_or(crate::dom::Dom::ROOT);
-            if self.dispatch(target, "keydown", code, mods.bits(), host) {
+            if self.dispatch(target, "keydown", EventInit::key(code, mods.bits()), host) {
                 return;
             }
         }
@@ -879,7 +997,7 @@ impl Browser {
                 let before = self.doc(t).input_value(n);
                 let action = self.doc_mut(t).input(n).key(code, mods, host);
                 if t == Target::Page && self.doc(t).input_value(n) != before {
-                    self.dispatch(n, "input", 0, 0, host);
+                    self.dispatch(n, "input", EventInit::default(), host);
                 }
                 self.input_action(t, n, action, host);
                 return;
@@ -908,7 +1026,7 @@ impl Browser {
                 self.navigate(&target, host);
             }
             Action::Submit if t == Target::Page => {
-                self.dispatch(n, "change", key::ENTER, 0, host);
+                self.dispatch(n, "change", EventInit::key(key::ENTER, 0), host);
             }
             Action::Cancel if is_address => {
                 let current = self.tabs[self.active].url().to_string();
@@ -1347,6 +1465,106 @@ mod tests {
         b.render(1300.0, &mut h);
         let time = b.tabs[b.active].doc.dom.text_content(page_el(&b, "time"));
         assert!(time.starts_with("00:01."), "{time}");
+    }
+
+    #[test]
+    fn dom_events_page() {
+        let (mut b, mut h) = browser();
+        b.navigate("about:events", &mut h);
+        b.render(0.0, &mut h);
+        let log = |b: &Browser| b.tabs[b.active].doc.dom.text_content(page_el(b, "log"));
+        assert!(log(&b).contains("ready at about:events"), "{}", log(&b));
+
+        // Hover a card: mouseover adds a class, mouseout removes it.
+        let card = b.tabs[b.active].doc.dom.find_tag(Dom::ROOT, "b").unwrap();
+        let card = b.tabs[b.active].doc.dom.parent(card).unwrap();
+        let r = b.tabs[b.active].doc.content_box(card).unwrap();
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + r.x + 2.0) as i32, (vp.y + r.y + 2.0) as i32);
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        assert!(
+            b.tabs[b.active]
+                .doc
+                .dom
+                .element(card)
+                .unwrap()
+                .has_class("hot")
+        );
+        b.event(
+            Event::MouseMove {
+                x: 1,
+                y: (vp.y + vp.h - 2.0) as i32,
+            },
+            0.0,
+            &mut h,
+        );
+        assert!(
+            !b.tabs[b.active]
+                .doc
+                .dom
+                .element(card)
+                .unwrap()
+                .has_class("hot")
+        );
+
+        // stopPropagation keeps the inner click from the outer listener.
+        click_page(&mut b, &mut h, "inner");
+        assert!(log(&b).contains("inner click (stopped)"));
+        assert!(!log(&b).contains("outer got click"));
+        // Click the outer box's own text, left of the inner span.
+        let outer = page_el(&b, "outer");
+        let r = b.tabs[b.active].doc.content_box(outer).unwrap();
+        click_at(
+            &mut b,
+            &mut h,
+            RectF {
+                x: vp.x + r.x,
+                y: vp.y + r.y,
+                w: 4.0,
+                h: r.h,
+            },
+        );
+        assert!(
+            log(&b).contains("outer got click from <div>"),
+            "{}",
+            log(&b)
+        );
+
+        // innerHTML builds a list.
+        click_page(&mut b, &mut h, "fill");
+        assert!(log(&b).contains("3 items, first = one"), "{}", log(&b));
+
+        // Double click.
+        click_page(&mut b, &mut h, "dbl");
+        click_page(&mut b, &mut h, "dbl");
+        assert!(log(&b).contains("double click"));
+
+        // Input events and keydown on the document.
+        click_page(&mut b, &mut h, "name");
+        type_text(&mut b, &mut h, "Ann");
+        let hello = b.tabs[b.active].doc.dom.text_content(page_el(&b, "hello"));
+        assert_eq!(hello, "Hello, Ann!");
+        let body = page_el(&b, "log");
+        let r = b.tabs[b.active].doc.content_box(body).unwrap();
+        click_at(
+            &mut b,
+            &mut h,
+            RectF {
+                x: r.x + vp.x,
+                y: r.y + vp.y,
+                ..r
+            },
+        );
+        press(&mut b, &mut h, 'Q' as i32, Modifiers::default());
+        assert!(log(&b).contains("key \"q\""), "{}", log(&b));
+
+        // The interval clears itself after five ticks.
+        for t in 1..=10 {
+            b.render(t as f64 * 210.0, &mut h);
+        }
+        let ticks = b.tabs[b.active].doc.dom.text_content(page_el(&b, "ticks"));
+        assert_eq!(ticks, "5");
+        assert!(b.tabs[b.active].timers.is_empty());
     }
 
     #[test]

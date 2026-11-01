@@ -16,8 +16,11 @@ use crate::css;
 use crate::document::Document;
 use crate::dom::{Dom, Element, NodeId};
 
-/// Instructions a script may run per call (init, event, timer).
+/// Instructions a compiled script may run per call (init, event, timer).
 pub const FUEL_PER_CALL: u64 = 30_000_000;
+/// Budget for language runtimes such as `js.wasm`, which interpret the
+/// page's source and so need many more wasm instructions per call.
+pub const RUNTIME_FUEL_PER_CALL: u64 = 2_000_000_000;
 /// Maximum linear memory of a script.
 pub const MAX_MEMORY: usize = 64 << 20;
 /// Longest string a script may pass to the browser.
@@ -37,8 +40,34 @@ pub struct Output {
     pub navigate: Option<String>,
     pub logs: Vec<String>,
     pub prevent_default: bool,
+    pub stop_propagation: bool,
     /// Timers to start: (delay in ms, timer id).
     pub timers: Vec<(f64, i32)>,
+    /// Timers to cancel.
+    pub cleared: Vec<i32>,
+    /// History steps requested (`history.back()` is -1).
+    pub history: i32,
+}
+
+/// The event being dispatched, readable through the `event_*` imports.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EventInfo {
+    /// `click`, `keydown`, …
+    pub kind: String,
+    /// Node the event happened on.
+    pub target: NodeId,
+    /// Node whose listener is running (changes while bubbling).
+    pub current: NodeId,
+    /// `abi::key` code for keyboard events.
+    pub key_code: i32,
+    /// DOM-style key name: `"a"`, `"Enter"`, `"ArrowLeft"`, …
+    pub key: String,
+    /// `abi::modifier` bits.
+    pub mods: i32,
+    /// Pointer position in page coordinates.
+    pub x: f64,
+    pub y: f64,
+    pub button: i32,
 }
 
 struct State {
@@ -47,19 +76,34 @@ struct State {
     now: f64,
     out: Output,
     limits: StoreLimits,
+    event: Option<EventInfo>,
 }
 
 /// A loaded script module.
 pub struct Script {
     store: Store<State>,
-    event_fn: Option<TypedFunc<(i32, i32, i32, i32), ()>>,
+    event_fn: Option<TypedFunc<i32, ()>>,
     timer_fn: Option<TypedFunc<i32, ()>>,
+    alloc_fn: Option<TypedFunc<i32, i32>>,
+    eval_fn: Option<TypedFunc<(i32, i32, i32, i32), ()>>,
+    memory: Option<Memory>,
+    fuel: u64,
 }
 
 impl Script {
     /// Compiles and instantiates `wasm` against `doc`, then calls its
     /// `rb_init` export.
     pub fn load(wasm: &[u8], doc: &mut Document, now: f64) -> Result<Script, String> {
+        Self::load_with_fuel(wasm, doc, now, FUEL_PER_CALL)
+    }
+
+    /// Like [`Script::load`], with a custom fuel budget per call.
+    pub fn load_with_fuel(
+        wasm: &[u8],
+        doc: &mut Document,
+        now: f64,
+        fuel: u64,
+    ) -> Result<Script, String> {
         let mut config = Config::default();
         config.consume_fuel(true);
         let engine = Engine::new(&config);
@@ -73,15 +117,20 @@ impl Script {
                 .memory_size(MAX_MEMORY)
                 .instances(1)
                 .build(),
+            event: None,
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(FUEL_PER_CALL).map_err(|e| e.to_string())?;
+        store.set_fuel(fuel).map_err(|e| e.to_string())?;
         let linker = linker(&engine).map_err(|e| e.to_string())?;
         let mut script = Script {
             store,
             event_fn: None,
             timer_fn: None,
+            alloc_fn: None,
+            eval_fn: None,
+            memory: None,
+            fuel,
         };
         script.with_doc(doc, now, |s| {
             let instance = linker
@@ -89,6 +138,9 @@ impl Script {
                 .map_err(describe)?;
             s.event_fn = instance.get_typed_func(&s.store, "rb_event").ok();
             s.timer_fn = instance.get_typed_func(&s.store, "rb_timer").ok();
+            s.alloc_fn = instance.get_typed_func(&s.store, "rb_alloc").ok();
+            s.eval_fn = instance.get_typed_func(&s.store, "rb_eval").ok();
+            s.memory = instance.get_memory(&s.store, "memory");
             if let Ok(init) = instance.get_typed_func::<(), ()>(&s.store, "rb_init") {
                 init.call(&mut s.store, ()).map_err(describe)?;
             }
@@ -108,7 +160,7 @@ impl Script {
         let s = self.store.data_mut();
         s.now = now;
         std::mem::swap(&mut s.doc, doc);
-        let r = match self.store.set_fuel(FUEL_PER_CALL) {
+        let r = match self.store.set_fuel(self.fuel) {
             Ok(()) => f(self),
             Err(e) => Err(e.to_string()),
         };
@@ -120,22 +172,60 @@ impl Script {
         &self.store.data().listeners
     }
 
-    /// Calls listener `id` for an event on `target`.
+    /// Calls listener `id` for `event`.
     pub fn dispatch(
         &mut self,
         doc: &mut Document,
         id: i32,
-        target: NodeId,
-        key: i32,
-        mods: i32,
+        event: &EventInfo,
         now: f64,
     ) -> Result<(), String> {
         let Some(f) = self.event_fn else {
             return Ok(());
         };
+        self.store.data_mut().event = Some(event.clone());
+        let r = self.with_doc(doc, now, |s| f.call(&mut s.store, id).map_err(describe));
+        self.store.data_mut().event = None;
+        r
+    }
+
+    /// Whether this module is a language runtime (it can [`Script::eval`]).
+    pub fn is_runtime(&self) -> bool {
+        self.alloc_fn.is_some() && self.eval_fn.is_some()
+    }
+
+    /// Runs source code in a language runtime module (see `doc/plan2.md`,
+    /// runtime protocol): copies it into the module and calls `rb_eval`.
+    pub fn eval(
+        &mut self,
+        doc: &mut Document,
+        source: &str,
+        name: &str,
+        now: f64,
+    ) -> Result<(), String> {
+        let (Some(alloc), Some(eval)) = (self.alloc_fn, self.eval_fn) else {
+            return Err("not a language runtime".into());
+        };
         self.with_doc(doc, now, |s| {
-            f.call(&mut s.store, (id, target as i32, key, mods))
-                .map_err(describe)
+            let put = |s: &mut Script, text: &str| -> Result<i32, String> {
+                let ptr = alloc
+                    .call(&mut s.store, text.len() as i32)
+                    .map_err(describe)?;
+                let memory = s
+                    .memory
+                    .ok_or_else(|| "runtime does not export memory".to_string())?;
+                let data = memory.data_mut(&mut s.store);
+                let r = range(data, ptr, text.len()).map_err(|e| e.to_string())?;
+                data[r].copy_from_slice(text.as_bytes());
+                Ok(ptr)
+            };
+            let src = put(s, source)?;
+            let file = put(s, name)?;
+            eval.call(
+                &mut s.store,
+                (src, source.len() as i32, file, name.len() as i32),
+            )
+            .map_err(describe)
         })
     }
 
@@ -508,6 +598,201 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
         },
     )?;
     l.func_wrap("rb", "now", |c: C| -> f64 { c.data().now })?;
+
+    // ----- ABI v1: tree navigation ---------------------------------------
+    l.func_wrap("rb", "node_type", |c: C, h: i32| -> i32 {
+        use crate::dom::NodeData;
+        let doc = &c.data().doc;
+        match node(doc, h).map(|n| &doc.dom.node(n).data) {
+            Some(NodeData::Element(_)) => 1,
+            Some(NodeData::Text(_)) => 3,
+            Some(NodeData::Comment(_)) => 8,
+            Some(NodeData::Document) => 9,
+            None => -1,
+        }
+    })?;
+    l.func_wrap(
+        "rb",
+        "tag_name",
+        |mut c: C, h: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let doc = &c.data().doc;
+            match element(doc, h)
+                .and_then(|e| doc.dom.tag(e))
+                .map(str::to_string)
+            {
+                Some(t) => write_str(&mut c, p, cap, &t),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap("rb", "relative", |c: C, h: i32, which: i32| -> i32 {
+        // which: 0 parent node, 1 first child, 2 last child, 3 next
+        // sibling, 4 previous sibling.
+        let dom = &c.data().doc.dom;
+        let Some(n) = node(&c.data().doc, h) else {
+            return -1;
+        };
+        let sibling = |delta: isize| {
+            let p = dom.parent(n)?;
+            let kids = dom.children(p);
+            let i = kids.iter().position(|&k| k == n)? as isize + delta;
+            kids.get(usize::try_from(i).ok()?).copied()
+        };
+        let r = match which {
+            0 => dom.parent(n),
+            1 => dom.children(n).first().copied(),
+            2 => dom.children(n).last().copied(),
+            3 => sibling(1),
+            4 => sibling(-1),
+            _ => None,
+        };
+        r.map_or(-1, |r| r as i32)
+    })?;
+    l.func_wrap("rb", "child_count", |c: C, h: i32| -> i32 {
+        let doc = &c.data().doc;
+        node(doc, h).map_or(-1, |n| doc.dom.children(n).len() as i32)
+    })?;
+    l.func_wrap("rb", "child_at", |c: C, h: i32, i: i32| -> i32 {
+        let doc = &c.data().doc;
+        node(doc, h)
+            .and_then(|n| doc.dom.children(n).get(usize::try_from(i).ok()?).copied())
+            .map_or(-1, |n| n as i32)
+    })?;
+    l.func_wrap("rb", "special", |c: C, which: i32| -> i32 {
+        // which: 0 document, 1 <html>, 2 <head>, 3 <body>.
+        let dom = &c.data().doc.dom;
+        let r = match which {
+            0 => Some(Dom::ROOT),
+            1 => dom.html(),
+            2 => dom.head(),
+            3 => dom.body(),
+            _ => None,
+        };
+        r.map_or(-1, |n| n as i32)
+    })?;
+    l.func_wrap(
+        "rb",
+        "matches",
+        |c: C, h: i32, p: i32, n: i32| -> Result<i32, Error> {
+            let sel = read_str(&c, p, n)?;
+            let doc = &c.data().doc;
+            let state = doc.state();
+            Ok(element(doc, h).is_some_and(|e| css::matches(&doc.dom, e, &sel, &state)) as i32)
+        },
+    )?;
+
+    // ----- ABI v1: markup and attributes ---------------------------------
+    l.func_wrap(
+        "rb",
+        "get_html",
+        |mut c: C, h: i32, outer: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let doc = &c.data().doc;
+            match node(doc, h).map(|n| doc.dom.to_html(n, outer != 0)) {
+                Some(html) => write_str(&mut c, p, cap, &html),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "set_html",
+        |mut c: C, h: i32, p: i32, n: i32| -> Result<(), Error> {
+            let html = read_str(&c, p, n)?;
+            let doc = &mut c.data_mut().doc;
+            if let Some(e) = element(doc, h) {
+                doc.dom_mut().set_inner_html(e, &html);
+            }
+            Ok(())
+        },
+    )?;
+    l.func_wrap("rb", "attr_count", |c: C, h: i32| -> i32 {
+        let doc = &c.data().doc;
+        element(doc, h)
+            .and_then(|e| doc.dom.element(e))
+            .map_or(-1, |e| e.attrs.len() as i32)
+    })?;
+    l.func_wrap(
+        "rb",
+        "attr_name_at",
+        |mut c: C, h: i32, i: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let doc = &c.data().doc;
+            let name = element(doc, h)
+                .and_then(|e| doc.dom.element(e))
+                .and_then(|e| e.attrs.get(usize::try_from(i).ok()?))
+                .map(|(n, _)| n.clone());
+            match name {
+                Some(n) => write_str(&mut c, p, cap, &n),
+                None => Ok(-1),
+            }
+        },
+    )?;
+
+    // ----- ABI v1: events, timers, location -------------------------------
+    l.func_wrap(
+        "rb",
+        "unlisten",
+        |mut c: C, h: i32, p: i32, n: i32, id: i32| -> Result<(), Error> {
+            let event = read_str(&c, p, n)?.to_ascii_lowercase();
+            let s = c.data_mut();
+            if let Some(n) = node(&s.doc, h) {
+                s.listeners
+                    .retain(|l| !(l.node == n && l.event == event && l.id == id));
+            }
+            Ok(())
+        },
+    )?;
+    l.func_wrap("rb", "stop_propagation", |mut c: C| {
+        c.data_mut().out.stop_propagation = true;
+    })?;
+    l.func_wrap("rb", "clear_timeout", |mut c: C, id: i32| {
+        let out = &mut c.data_mut().out;
+        out.timers.retain(|&(_, t)| t != id);
+        out.cleared.push(id);
+    })?;
+    l.func_wrap(
+        "rb",
+        "event_string",
+        |mut c: C, which: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            // which: 0 type, 1 key.
+            let v = c.data().event.as_ref().map(|e| match which {
+                0 => e.kind.clone(),
+                _ => e.key.clone(),
+            });
+            match v {
+                Some(v) => write_str(&mut c, p, cap, &v),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap("rb", "event_int", |c: C, which: i32| -> i32 {
+        // which: 0 target, 1 current target, 2 key code, 3 modifiers, 4 button.
+        c.data().event.as_ref().map_or(-1, |e| match which {
+            0 => e.target as i32,
+            1 => e.current as i32,
+            2 => e.key_code,
+            3 => e.mods,
+            4 => e.button,
+            _ => -1,
+        })
+    })?;
+    l.func_wrap("rb", "event_pos", |c: C, which: i32| -> f64 {
+        // which: 0 x, 1 y (page coordinates).
+        c.data()
+            .event
+            .as_ref()
+            .map_or(0.0, |e| if which == 0 { e.x } else { e.y })
+    })?;
+    l.func_wrap(
+        "rb",
+        "location",
+        |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+            let url = c.data().doc.url.clone();
+            write_str(&mut c, p, cap, &url)
+        },
+    )?;
+    l.func_wrap("rb", "history_go", |mut c: C, delta: i32| {
+        c.data_mut().out.history = delta.clamp(-100, 100);
+    })?;
     Ok(l)
 }
 
@@ -536,6 +821,7 @@ mod tests {
           (import "rb" "set_timeout" (func $set_timeout (param f64 i32)))
           (import "rb" "get_value" (func $get_value (param i32 i32 i32) (result i32)))
           (import "rb" "navigate" (func $navigate (param i32 i32)))
+          (import "rb" "event_int" (func $event_int (param i32) (result i32)))
           (memory (export "memory") 1)
           (data (i32.const 0) "#out")
           (data (i32.const 16) "#b")
@@ -548,8 +834,9 @@ mod tests {
             (call $listen (call $query (i32.const 16) (i32.const 2))
                           (i32.const 32) (i32.const 5) (i32.const 7))
             (call $set_timeout (f64.const 100) (i32.const 9)))
-          (func (export "rb_event") (param $id i32) (param $target i32) (param i32 i32)
-            (if (i32.eq (local.get $id) (i32.const 7))
+          (func (export "rb_event") (param $id i32)
+            (if (i32.and (i32.eq (local.get $id) (i32.const 7))
+                         (i32.ge_s (call $event_int (i32.const 0)) (i32.const 0)))
               (then
                 (call $set_text (call $query (i32.const 0) (i32.const 4))
                                 (i32.const 48) (i32.const 7))
@@ -577,7 +864,13 @@ mod tests {
             }]
         );
         assert_eq!(s.take_output().timers, vec![(100.0, 9)]);
-        s.dispatch(&mut doc, 7, b, 0, 0, 1.0).unwrap();
+        let ev = EventInfo {
+            kind: "click".into(),
+            target: b,
+            current: b,
+            ..Default::default()
+        };
+        s.dispatch(&mut doc, 7, &ev, 1.0).unwrap();
         let out = doc.dom.element_by_id("out").unwrap();
         assert_eq!(doc.dom.text_content(out), "clicked");
         assert_eq!(doc.dom.attr(out, "class"), Some("a big"));
@@ -622,7 +915,13 @@ mod tests {
         let mut s = Script::load(&wasm(&doc_md[start..end]), &mut doc, 0.0).unwrap();
         let btn = doc.dom.element_by_id("btn").unwrap();
         let l = s.listeners()[0].clone();
-        s.dispatch(&mut doc, l.id, btn, 0, 0, 0.0).unwrap();
+        let ev = EventInfo {
+            kind: "click".into(),
+            target: btn,
+            current: btn,
+            ..Default::default()
+        };
+        s.dispatch(&mut doc, l.id, &ev, 0.0).unwrap();
         assert_eq!(doc.dom.text_content(btn), "Clicked!");
     }
 

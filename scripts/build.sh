@@ -4,7 +4,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-examples="counter todo stopwatch"
+examples="counter todo stopwatch events"
 args=""
 for e in $examples; do args="$args --example $e"; done
 

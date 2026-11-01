@@ -1,4 +1,4 @@
-# rubrowser 腳本 ABI（v0）
+# rubrowser 腳本 ABI（v1）
 
 rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責。本文件是瀏覽器和 wasm 模組之間的介面規格。
 
@@ -21,8 +21,10 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 |---|---|---|
 | `memory` | memory | **必要**。瀏覽器透過它讀寫字串 |
 | `rb_init` | `() -> ()` | 載入後呼叫一次 |
-| `rb_event` | `(listener: i32, target: i32, key: i32, mods: i32) -> ()` | 事件發生時呼叫 |
+| `rb_event` | `(listener: i32) -> ()` | 事件發生時呼叫；事件內容用 `event_*` 查詢 |
 | `rb_timer` | `(timer: i32) -> ()` | `set_timeout` 到期時呼叫 |
+| `rb_alloc` | `(len: i32) -> i32` | 語言 runtime 才需要：配置放原始碼的記憶體 |
+| `rb_eval` | `(src, src_len, name, name_len) -> ()` | 語言 runtime 才需要：執行原始碼 |
 
 `listener` 與 `timer` 是腳本自己在註冊時給的 id，瀏覽器原封不動傳回。
 
@@ -42,6 +44,12 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `query(sel_ptr, sel_len) -> i32` | 第一個符合 CSS 選擇器的元素 |
 | `query_all(sel_ptr, sel_len, out_ptr, max) -> i32` | 把最多 `max` 個 handle（`i32` 陣列）寫到 `out_ptr`，回傳總數 |
 | `parent(h) -> i32` | 父元素 |
+| `relative(h, which) -> i32` | `which`：0 父節點、1 第一個子節點、2 最後一個子節點、3 下一個兄弟、4 上一個兄弟（含文字節點） |
+| `child_count(h) -> i32` / `child_at(h, i) -> i32` | 子節點數與第 `i` 個子節點 |
+| `special(which) -> i32` | 0 document、1 `<html>`、2 `<head>`、3 `<body>` |
+| `node_type(h) -> i32` | 1 元素、3 文字、8 註解、9 文件、-1 無效 |
+| `tag_name(h, ptr, cap) -> i32` | 小寫標籤名 |
+| `matches(h, sel_ptr, sel_len) -> i32` | 是否符合選擇器 |
 
 ### 內容與屬性
 
@@ -56,6 +64,9 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `set_style(h, prop_ptr, prop_len, val_ptr, val_len)` | 設定 `style` 屬性中的一個屬性；空值表示移除 |
 | `get_value(h, ptr, cap) -> i32` | `<input>` 目前的值 |
 | `set_value(h, ptr, len)` | 設定 `<input>` 的值 |
+| `get_html(h, outer, ptr, cap) -> i32` | `outer` 為 0 時是 innerHTML，1 是 outerHTML |
+| `set_html(h, ptr, len)` | 設定 innerHTML（以 html5ever 片段解析） |
+| `attr_count(h) -> i32` / `attr_name_at(h, i, ptr, cap) -> i32` | 列出屬性名稱 |
 
 ### 建立與移動節點
 
@@ -70,17 +81,26 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 
 | 函式 | 說明 |
 |---|---|
-| `listen(h, ev_ptr, ev_len, listener)` | 在節點上登記事件 |
+| `listen(h, ev_ptr, ev_len, listener)` | 在節點上登記事件（`h` 為 0 表示整份文件） |
+| `unlisten(h, ev_ptr, ev_len, listener)` | 取消登記 |
 | `prevent_default()` | 在事件處理中呼叫，取消瀏覽器的預設動作（例如連結跳轉） |
+| `stop_propagation()` | 不再往祖先冒泡（同一節點上的其他 listener 仍會執行） |
+| `event_string(which, ptr, cap) -> i32` | 0 事件種類、1 key 名稱（`"a"`、`"Enter"`、`"ArrowLeft"`…） |
+| `event_int(which) -> i32` | 0 target、1 currentTarget、2 鍵碼、3 修飾鍵、4 滑鼠按鍵 |
+| `event_pos(which) -> f64` | 0 x、1 y（頁面座標） |
 
 事件會**冒泡**：先呼叫目標節點上的 listener，再往父節點一路到根。
 
 | 事件 | 觸發時機 | `key` / `mods` |
 |---|---|---|
-| `click` | 滑鼠點擊、或焦點在按鈕/連結時按 Enter / Space | 0 |
-| `input` | `<input>` 的內容改變 | 0 |
+| `click` | 滑鼠點擊、或焦點在按鈕/連結時按 Enter / Space | 座標 |
+| `dblclick` | 400 ms 內在同一元素點兩下 | 座標 |
+| `mousedown` / `mouseup` | 按下／放開滑鼠左鍵 | 座標 |
+| `mouseover` / `mouseout` | 滑鼠移入／移出元素 | 座標 |
+| `input` | `<input>` 的內容改變 | — |
 | `change` | 在 `<input>` 中按 Enter | `key::ENTER` |
-| `keydown` | 頁面有鍵盤焦點時按鍵；目標是焦點元素或 `<body>` | 鍵碼、修飾鍵位元 |
+| `keydown` | 頁面有鍵盤焦點時按鍵；目標是焦點元素或 `<body>` | 鍵碼、key 名稱、修飾鍵 |
+| `focus` / `blur` | 元素取得／失去焦點 | — |
 
 鍵碼與修飾鍵位元定義在 `rubrowser::abi`（`key::ENTER = 13`、`modifier::SHIFT = 1` 等）。
 
@@ -89,6 +109,9 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | 函式 | 說明 |
 |---|---|
 | `set_timeout(ms: f64, timer: i32)` | `ms` 毫秒後呼叫 `rb_timer(timer)` |
+| `clear_timeout(timer: i32)` | 取消尚未觸發的計時器 |
+| `location(ptr, cap) -> i32` | 目前網頁的網址 |
+| `history_go(delta: i32)` | 在歷史中移動（-1 是上一頁） |
 | `navigate(ptr, len)` | 以目前頁面為基準開啟網址 |
 | `log(ptr, len)` | 輸出到主控台（原生版為 stderr，網頁版為瀏覽器 console） |
 | `now() -> f64` | 瀏覽器啟動後的毫秒數 |
@@ -111,6 +134,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
   (import "rb" "query" (func $query (param i32 i32) (result i32)))
   (import "rb" "set_text" (func $set_text (param i32 i32 i32)))
   (import "rb" "listen" (func $listen (param i32 i32 i32 i32)))
+  (import "rb" "event_int" (func $event_int (param i32) (result i32)))
   (memory (export "memory") 1)
   (data (i32.const 0) "#btn")
   (data (i32.const 8) "click")
@@ -118,6 +142,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
   (func (export "rb_init")
     (call $listen (call $query (i32.const 0) (i32.const 4))
                   (i32.const 8) (i32.const 5) (i32.const 1)))
-  (func (export "rb_event") (param $id i32) (param $target i32) (param i32 i32)
-    (call $set_text (local.get $target) (i32.const 16) (i32.const 8))))
+  (func (export "rb_event") (param $id i32)
+    ;; event_int(0) is the event's target.
+    (call $set_text (call $event_int (i32.const 0)) (i32.const 16) (i32.const 8))))
 ```

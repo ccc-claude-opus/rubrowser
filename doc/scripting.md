@@ -94,14 +94,21 @@ rubrowser index.html
 | `value()` / `set_value(s)` | `<input>` 的值 |
 | `append(child)` / `insert_before(child, before)` / `append_text(s)` | 插入子節點 |
 | `remove()` | 從文件移除 |
-| `parent()` | 父元素 |
-| `on(event, handler)` | 登記事件處理 |
+| `parent()` / `children()` / `child_nodes()` | 父元素、子元素、所有子節點 |
+| `first_child()` / `last_child()` / `next_sibling()` / `previous_sibling()` | 節點導覽 |
+| `tag()` / `node_type()` | 標籤名、節點種類 |
+| `matches(sel)` / `closest(sel)` | 選擇器比對 |
+| `inner_html()` / `set_inner_html(html)` / `outer_html()` | HTML 字串 |
+| `attr_names()` | 所有屬性名稱 |
+| `on(event, handler) -> Listener` / `off(&listener)` | 登記／取消事件處理 |
+
+另外有 `document()`（整份文件，可用來接收所有事件）、`document_element()`、`head()`、`body()`。
 
 ### 事件
 
 ```rust
 input.on("keydown", |e| {
-    if e.key == key::ESCAPE {
+    if e.key == "Escape" {
         e.target.set_value("");
         e.prevent_default();
     }
@@ -110,19 +117,23 @@ input.on("keydown", |e| {
 
 | 事件 | 時機 |
 |---|---|
-| `click` | 點擊（或在焦點按鈕上按 Enter / Space） |
+| `click` / `dblclick` | 點擊、雙擊（或在焦點按鈕上按 Enter / Space） |
+| `mousedown` / `mouseup` / `mouseover` / `mouseout` | 滑鼠事件（`e.x`、`e.y`） |
 | `input` | `<input>` 內容改變 |
 | `change` | 在 `<input>` 中按 Enter |
-| `keydown` | 頁面上按鍵（`e.key`、`e.mods`） |
+| `keydown` | 頁面上按鍵（`e.key` 名稱、`e.key_code`、`e.mods`） |
+| `focus` / `blur` | 取得／失去焦點 |
 
-事件會冒泡到祖先元素。`e.prevent_default()` 會取消預設動作，例如連結跳轉。
+事件會冒泡到祖先元素。`e.prevent_default()` 取消預設動作（例如連結跳轉），`e.stop_propagation()` 停止冒泡；`e.target` 是事件發生的元素，`e.current_target` 是目前執行的 listener 所在元素。
 
 ### 計時與其他
 
 | 函式 | 說明 |
 |---|---|
-| `set_timeout(ms, f)` | `ms` 毫秒後執行一次 |
-| `set_interval(ms, f)` | 每 `ms` 毫秒執行一次 |
+| `set_timeout(ms, f) -> Timer` | `ms` 毫秒後執行一次 |
+| `set_interval(ms, f) -> Timer` | 每 `ms` 毫秒執行一次 |
+| `clear_timeout(timer)` | 取消 |
+| `location()` / `history_go(-1)` | 目前網址、上一頁 |
 | `now()` | 毫秒時間 |
 | `navigate(url)` | 開啟網址 |
 | `log(msg)` | 寫到主控台 |
@@ -151,6 +162,7 @@ for (sel, step) in [("#inc", 1), ("#dec", -1)] {
 | [counter.rs](../examples/counter.rs) | `about:counter` | 事件、共用狀態、行內樣式 |
 | [todo.rs](../examples/todo.rs) | `about:todo` | 建立／刪除元素、讀取輸入框、`change` 事件 |
 | [stopwatch.rs](../examples/stopwatch.rs) | `about:stopwatch` | `set_interval`、`now()` |
+| [events.rs](../examples/events.rs) | `about:events` | 滑鼠與鍵盤事件、`stop_propagation`、innerHTML、`clear_timeout` |
 
 ## 7. 限制
 
