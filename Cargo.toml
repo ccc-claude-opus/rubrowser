@@ -16,15 +16,17 @@ default = ["native"]
 # API for page authors; no dependencies.
 sdk = []
 # Platform-independent browser core: graphics, UI, page runtime.
-core = []
+core = ["dep:font8x8"]
 # Native window version (main).
 native = ["core", "dep:winit", "dep:softbuffer"]
 # Canvas version running inside a web browser (extra).
 web = ["core"]
+font8x8 = ["dep:font8x8"]
 
 [dependencies]
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
+font8x8 = { version = "0.3", default-features = false, optional = true }
 
 [[bin]]
 name = "rubrowser"

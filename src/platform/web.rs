@@ -18,19 +18,19 @@ thread_local! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_web_init(width: u32, height: u32) {
+pub extern "C" fn rb_web_init(width: u32, height: u32, scale: f32) {
     let web = Web {
-        browser: Browser::new(width as usize, height as usize),
+        browser: Browser::new(width as usize, height as usize, scale),
         rgba: Vec::new(),
     };
     WEB.with(|w| *w.borrow_mut() = Some(web));
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn rb_web_resize(width: u32, height: u32) {
+pub extern "C" fn rb_web_resize(width: u32, height: u32, scale: f32) {
     WEB.with(|w| {
         if let Some(web) = w.borrow_mut().as_mut() {
-            web.browser.resize(width as usize, height as usize);
+            web.browser.resize(width as usize, height as usize, scale);
         }
     });
 }

@@ -10,11 +10,12 @@ const rb = instance.exports;
 
 let width = 0;
 let height = 0;
+let scale = 1;
 
 function fitCanvas() {
-  const dpr = window.devicePixelRatio || 1;
-  width = Math.max(1, Math.floor(window.innerWidth * dpr));
-  height = Math.max(1, Math.floor(window.innerHeight * dpr));
+  scale = window.devicePixelRatio || 1;
+  width = Math.max(1, Math.floor(window.innerWidth * scale));
+  height = Math.max(1, Math.floor(window.innerHeight * scale));
   canvas.width = width;
   canvas.height = height;
   canvas.style.width = window.innerWidth + 'px';
@@ -22,11 +23,11 @@ function fitCanvas() {
 }
 
 fitCanvas();
-rb.rb_web_init(width, height);
+rb.rb_web_init(width, height, scale);
 
 window.addEventListener('resize', () => {
   fitCanvas();
-  rb.rb_web_resize(width, height);
+  rb.rb_web_resize(width, height, scale);
 });
 
 function frame() {

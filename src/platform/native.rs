@@ -43,7 +43,8 @@ impl ApplicationHandler for App {
         let context = Context::new(window.clone()).expect("create softbuffer context");
         let surface = Surface::new(&context, window.clone()).expect("create softbuffer surface");
         let size = window.inner_size();
-        let browser = Browser::new(size.width as usize, size.height as usize);
+        let scale = window.scale_factor() as f32;
+        let browser = Browser::new(size.width as usize, size.height as usize, scale);
         self.state = Some(State {
             window,
             surface,
@@ -58,7 +59,10 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                state.browser.resize(size.width as usize, size.height as usize);
+                let scale = state.window.scale_factor() as f32;
+                state
+                    .browser
+                    .resize(size.width as usize, size.height as usize, scale);
                 state.window.request_redraw();
             }
             WindowEvent::RedrawRequested => state.redraw(),
