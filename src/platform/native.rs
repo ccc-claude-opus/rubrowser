@@ -149,6 +149,8 @@ fn agent() -> &'static ureq::Agent {
 /// if redirects led elsewhere, the final URL.
 pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
     use ureq::ResponseExt;
+    // The fragment is for the browser, not the server.
+    let url = url.split('#').next().unwrap_or(url);
     match url::scheme(url) {
         Some("http") | Some("https") => {
             let mut resp = agent().get(url).call().map_err(|e| e.to_string())?;
@@ -170,7 +172,9 @@ pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
         }
         Some("file") => {
             let path = url.trim_start_matches("file://");
-            std::fs::read(path)
+            let path = path.split('?').next().unwrap_or(path);
+            let path = String::from_utf8_lossy(&url::percent_decode(path)).into_owned();
+            std::fs::read(&path)
                 .map(|b| (b, None))
                 .map_err(|e| format!("{path}: {e}"))
         }

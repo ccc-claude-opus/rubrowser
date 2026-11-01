@@ -46,6 +46,14 @@ pub fn resolve(base: &str, link: &str) -> String {
     if scheme(link).is_some() {
         return link.to_string();
     }
+    // Same-document references keep the base path (and query for `#`).
+    let no_fragment = base.split('#').next().unwrap_or(base);
+    if link.is_empty() || link.starts_with('#') {
+        return format!("{no_fragment}{link}");
+    }
+    if link.starts_with('?') {
+        return format!("{}{link}", no_fragment.split('?').next().unwrap_or(""));
+    }
     // Scheme-relative: //host/path
     if let (Some(rest), Some(sch)) = (link.strip_prefix("//"), scheme(base))
         && sch != "about"
@@ -133,7 +141,7 @@ pub fn decode_data_url(url: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn percent_decode(s: &str) -> Vec<u8> {
+pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -249,6 +257,18 @@ mod tests {
         assert!(decode_data_url("nope").is_none());
         assert_eq!(scheme("data:image/png;base64,xx"), Some("data"));
         assert_eq!(resolve("https://a.com/x/", "data:,hi"), "data:,hi");
+        assert_eq!(
+            resolve("https://a.com/w/A_(b)#x", "#y"),
+            "https://a.com/w/A_(b)#y"
+        );
+        assert_eq!(
+            resolve("https://a.com/w/p?q=1#x", "?q=2"),
+            "https://a.com/w/p?q=2"
+        );
+        assert_eq!(
+            resolve("https://a.com/w/p?q=1", "#t"),
+            "https://a.com/w/p?q=1#t"
+        );
     }
 
     #[test]

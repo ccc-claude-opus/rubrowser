@@ -361,7 +361,9 @@ impl Browser {
         tab.history.truncate(tab.index + 1);
         tab.history.push(url.to_string());
         tab.index += 1;
-        self.load(self.active, host);
+        if !self.same_document(self.active) {
+            self.load(self.active, host);
+        }
         self.keyboard = Target::Page;
         self.set_focus(Target::Chrome, None);
     }
@@ -371,8 +373,29 @@ impl Browser {
         let next = tab.index as isize + delta;
         if next >= 0 && (next as usize) < tab.history.len() {
             tab.index = next as usize;
-            self.load(self.active, host);
+            if !self.same_document(self.active) {
+                self.load(self.active, host);
+            }
         }
+    }
+
+    /// If tab `i`'s current history entry is its loaded document with
+    /// another fragment, scrolls to that fragment and returns true.
+    fn same_document(&mut self, i: usize) -> bool {
+        let tab = &mut self.tabs[i];
+        let target = tab.history[tab.index].clone();
+        let strip = |u: &str| u.split('#').next().unwrap_or("").to_string();
+        if tab.loading || target.starts_with("about:") || strip(&target) != strip(&tab.doc.url) {
+            return false;
+        }
+        if !target.contains('#') && !tab.doc.url.contains('#') {
+            return false; // same URL without fragments: a reload
+        }
+        let fragment = target.split_once('#').map_or("", |(_, f)| f);
+        tab.doc.scroll_to_fragment(fragment);
+        tab.doc.url = target;
+        self.dirty = true;
+        true
     }
 
     /// (Re)loads the current history entry of tab `i`.
@@ -629,6 +652,14 @@ impl Browser {
     pub fn fetch_redirected(&mut self, id: u32, final_url: &str) {
         if let Some(Request::Page { tab, url, .. }) = self.requests.get_mut(&id) {
             let tab = *tab;
+            // HTTP never sends the fragment: keep the requested one.
+            let mut final_url = final_url.to_string();
+            if let Some((_, f)) = url.split_once('#')
+                && !final_url.contains('#')
+            {
+                final_url = format!("{final_url}#{f}");
+            }
+            let final_url = final_url.as_str();
             *url = final_url.to_string();
             if let Some(i) = self.tab_index(tab) {
                 let t = &mut self.tabs[i];
@@ -2059,6 +2090,28 @@ mod tests {
                 ..r
             },
         );
+    }
+
+    #[test]
+    fn fragment_links_scroll_without_reloading() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://w.org/wiki/A", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = br##"<body style="margin:0"><a id=go href="#sec" style="display:block">go</a>
+            <div style="height:3000px"></div><h2 id=sec>Section</h2>
+            <div style="height:3000px"></div></body>"##;
+        b.fetch_done(id, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let fetches = h.fetched.len();
+        click_page(&mut b, &mut h, "go");
+        assert_eq!(h.fetched.len(), fetches, "no reload");
+        assert_eq!(b.tabs[b.active].url(), "https://w.org/wiki/A#sec");
+        let y = b.tabs[b.active].doc.scroll_y();
+        assert!(y > 2900.0 && y < 3100.0, "scrolled to #sec: {y}");
+        b.go(-1, &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(h.fetched.len(), fetches, "back stays in the document");
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 0.0);
     }
 
     #[test]

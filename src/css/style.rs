@@ -45,6 +45,8 @@ pub enum Position {
     Absolute,
     /// Positioned against the viewport; does not scroll.
     Fixed,
+    /// In flow, then kept inside the viewport while its parent is visible.
+    Sticky,
 }
 
 /// How a border or outline line is drawn.
@@ -523,7 +525,8 @@ impl Style {
             "position" => {
                 self.position = match v {
                     "static" => Position::Static,
-                    "relative" | "sticky" => Position::Relative,
+                    "relative" => Position::Relative,
+                    "sticky" | "-webkit-sticky" => Position::Sticky,
                     "absolute" => Position::Absolute,
                     "fixed" => Position::Fixed,
                     _ => return,

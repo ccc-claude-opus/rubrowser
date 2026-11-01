@@ -36,6 +36,8 @@ pub struct Painter<'a> {
     pub caret: bool,
     pub images: &'a Images,
     pub forms: &'a FormState,
+    /// Top of the page viewport while painting (for sticky boxes).
+    pub view_top: std::cell::Cell<f32>,
 }
 
 const SELECTION: Rgba = Rgba::new(51, 132, 255, 90);
@@ -83,6 +85,7 @@ impl Painter<'_> {
         };
         c.fill_rect(clip.x, clip.y, clip.w, clip.h, bg.rgb());
         let sy = self.scroll.get(&None).copied().unwrap_or(0.0);
+        self.view_top.set(origin.1);
         // The page, then fixed boxes (which do not scroll) by z-index.
         let mut kids = vp.children.clone();
         kids.sort_by_key(|&k| (self.tree.boxes[k].fixed, self.tree.boxes[k].z));
@@ -173,10 +176,13 @@ impl Painter<'_> {
         // In-flow children first, then positioned ones on top by z-index.
         let mut positioned = Vec::new();
         for &child in &b.children {
-            if self.tree.boxes[child].absolute {
+            let cb = &self.tree.boxes[child];
+            if cb.absolute {
                 positioned.push(child);
             } else {
-                self.paint_box(c, child, r.x, r.y - sy);
+                let bottom = r.y + r.h - b.padding[cs::BOTTOM] - b.border[cs::BOTTOM];
+                let shift = cb.sticky_shift(r.y - sy + cb.rect.y, self.view_top.get(), bottom);
+                self.paint_box(c, child, r.x, r.y - sy + shift);
             }
         }
         positioned.sort_by_key(|&k| self.tree.boxes[k].z);

@@ -15,15 +15,20 @@ pub enum Item {
     /// Text of DOM text node `node` (styled by `styles[node]`).
     Text { node: NodeId, text: String },
     /// An atomic inline (layout box index) with its margin-box size and the
-    /// distance from its top to its baseline.
+    /// distance from its top to its baseline. `wraps`: whether a line may
+    /// break around it (its parent's `white-space`).
     Atomic {
         index: usize,
         width: f32,
         height: f32,
         baseline: f32,
+        wraps: bool,
     },
     /// A forced line break (`<br>`).
     Break { node: NodeId },
+    /// Horizontal space from an inline element's margin, border and
+    /// padding at its start or end.
+    Gap { width: f32 },
 }
 
 /// The items of one inline formatting context and the block that owns it.
@@ -100,8 +105,10 @@ enum Piece {
         width: f32,
         height: f32,
         baseline: f32,
+        wraps: bool,
     },
     Break,
+    Gap(f32),
 }
 
 fn style(styles: &[Option<Style>], node: NodeId) -> &Style {
@@ -125,17 +132,20 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                 out.push(Piece::Break);
                 after_space = true;
             }
+            Item::Gap { width } => out.push(Piece::Gap(*width)),
             Item::Atomic {
                 index,
                 width,
                 height,
                 baseline,
+                wraps,
             } => {
                 out.push(Piece::Atomic {
                     index: *index,
                     width: *width,
                     height: *height,
                     baseline: *baseline,
+                    wraps: *wraps,
                 });
                 after_space = false;
             }
@@ -273,6 +283,10 @@ pub fn layout(
             Piece::Break => {
                 finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
             }
+            Piece::Gap(w) => {
+                x += w;
+                trailing = 0.0;
+            }
             Piece::Word {
                 node,
                 text,
@@ -323,12 +337,13 @@ pub fn layout(
                 width,
                 height,
                 baseline,
+                wraps,
             } => {
-                if !line.items.is_empty() && x + width > max_width + 0.01 {
+                if wraps && !line.items.is_empty() && x + width > max_width + 0.01 {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                 }
                 trailing = 0.0;
-                breakable = true;
+                breakable = wraps;
                 // The box's baseline sits on the line's baseline.
                 ext = (ext.0.max(baseline), ext.1.max(height - baseline));
                 line.items.push(Placed::Atomic {
@@ -554,6 +569,7 @@ mod tests {
             width: 50.0,
             height: 40.0,
             baseline: 40.0,
+            wraps: true,
         });
         let l = layout(&c, f32::INFINITY, &s, &f);
         assert_eq!(texts(&l), vec!["a []"]);

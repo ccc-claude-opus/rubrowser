@@ -56,6 +56,9 @@ pub struct Document {
     tree: LayoutTree,
     state: ElementState,
     scroll: ScrollOffsets,
+    /// Fragment (`#id`) to keep scrolled into view while the page loads,
+    /// until the user scrolls.
+    fragment: Option<String>,
     size: (f32, f32),
     needs_style: bool,
     needs_layout: bool,
@@ -85,6 +88,10 @@ impl Document {
             tree: LayoutTree::default(),
             state: ElementState::default(),
             scroll: ScrollOffsets::new(),
+            fragment: url
+                .split_once('#')
+                .map(|(_, f)| f.to_string())
+                .filter(|f| !f.is_empty()),
             size: (0.0, 0.0),
             needs_style: true,
             needs_layout: true,
@@ -298,6 +305,7 @@ impl Document {
             );
             self.needs_layout = false;
             self.clamp_scroll();
+            self.apply_fragment();
             if let Some(t) = t0 {
                 eprintln!(
                     "[profile] style+layout {:.1} ms",
@@ -320,6 +328,7 @@ impl Document {
             caret: self.caret_on,
             images: &self.images,
             forms: &self.forms,
+            view_top: Default::default(),
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -946,7 +955,10 @@ impl Document {
             .copied()
             .filter(|&c| !self.tree.boxes[c].absolute);
         for c in positioned.into_iter().chain(in_flow) {
-            if self.hit_box(c, x, y, r.x, r.y - sy, hit) {
+            let cb = &self.tree.boxes[c];
+            let bottom = r.y + r.h - b.padding[2] - b.border[2];
+            let shift = cb.sticky_shift(r.y - sy + cb.rect.y, 0.0, bottom);
+            if self.hit_box(c, x, y, r.x, r.y - sy + shift, hit) {
                 return true;
             }
         }
@@ -1019,9 +1031,47 @@ impl Document {
         })
     }
 
+    /// Scrolls the page to the element named by `fragment` (`id`, or
+    /// `<a name>`), or to the top for an empty fragment / `top`.
+    pub fn scroll_to_fragment(&mut self, fragment: &str) {
+        self.fragment = Some(fragment.to_string());
+        self.apply_fragment();
+    }
+
+    fn apply_fragment(&mut self) {
+        let Some(f) = self.fragment.clone() else {
+            return;
+        };
+        let f = String::from_utf8_lossy(&crate::net::url::percent_decode(&f)).into_owned();
+        if f.is_empty() || f.eq_ignore_ascii_case("top") {
+            self.scroll.insert(None, 0.0);
+            return;
+        }
+        let target = self.dom.element_by_id(&f).or_else(|| {
+            self.dom
+                .descendants(Dom::ROOT)
+                .into_iter()
+                .find(|&n| self.dom.tag(n) == Some("a") && self.dom.attr(n, "name") == Some(&f))
+        });
+        // Inline elements have no box: use the nearest ancestor's.
+        let mut node = target;
+        let rect = loop {
+            let Some(n) = node else { return };
+            if let Some((r, _)) = self.box_rects(n) {
+                break r;
+            }
+            node = self.dom.parent(n);
+        };
+        let r = rect;
+        let y = r.y + self.scroll_of(None);
+        let y = y.clamp(0.0, self.max_scroll(None));
+        self.scroll.insert(None, y);
+    }
+
     /// Scrolls the innermost scroller under `(x, y)` that can move by `dy`.
     /// Returns true if something scrolled.
     pub fn scroll_by(&mut self, x: f32, y: f32, dy: f32) -> bool {
+        self.fragment = None;
         for s in self.hit_test(x, y).scrollers {
             let cur = self.scroll_of(s);
             let next = (cur + dy).clamp(0.0, self.max_scroll(s));

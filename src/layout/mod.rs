@@ -61,9 +61,22 @@ pub struct LBox {
     pub z: i32,
     /// Downward shift of the content (table cells with `vertical-align`).
     pub content_shift: f32,
+    /// `position: sticky` with a `top` offset (px).
+    pub sticky_top: Option<f32>,
 }
 
 impl LBox {
+    /// How far a sticky box moves down so its top stays `sticky_top` below
+    /// `view_top`, without leaving `parent_bottom`. `y` is where it was laid
+    /// out (same coordinates as the other two).
+    pub fn sticky_shift(&self, y: f32, view_top: f32, parent_bottom: f32) -> f32 {
+        let Some(top) = self.sticky_top else {
+            return 0.0;
+        };
+        let room = (parent_bottom - (y + self.rect.h)).max(0.0);
+        (view_top + top - y).clamp(0.0, room)
+    }
+
     /// Content box relative to this box's border box.
     pub fn content_offset(&self) -> (f32, f32) {
         (
@@ -211,6 +224,7 @@ fn layout_pass(
         fixed: false,
         z: 0,
         content_shift: 0.0,
+        sticky_top: None,
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
@@ -228,7 +242,10 @@ fn layout_pass(
         let root = tree.new_with_children(root_style, &top).unwrap();
         b.compute(&mut tree, root, width, AvailableSpace::Definite(height));
         let html_box = b.collect(&tree, html_node);
-        let content_h = b.boxes[html_box].rect.h.max(height);
+        // The page scrolls over everything that overflows <html> too
+        // (sites often set `html { height: 100% }`).
+        let hb = &b.boxes[html_box];
+        let content_h = hb.rect.h.max(hb.content_h + hb.rect.y).max(height);
         let fixed: Vec<usize> = top[1..].iter().map(|&n| b.collect(&tree, n)).collect();
         let vp = &mut b.boxes[LayoutTree::VIEWPORT];
         vp.children.push(html_box);
@@ -386,11 +403,6 @@ impl Builder<'_> {
 
         let all_inline = parts.iter().all(|p| matches!(p, Part::Inline(_)));
         if !is_flex && !is_grid && all_inline {
-            if in_block {
-                // Text flows beside floats: as a new block formatting
-                // context, taffy places the box next to them.
-                tstyle.overflow = avoid_floats(tstyle.overflow);
-            }
             let items: Vec<Item> = parts
                 .into_iter()
                 .flat_map(|p| match p {
@@ -398,6 +410,14 @@ impl Builder<'_> {
                     Part::Block(_) => Vec::new(),
                 })
                 .collect();
+            let content = Content { owner: id, items };
+            if in_block && !content.is_blank(self.styles) {
+                // Text flows beside floats: as a new block formatting
+                // context, taffy places the box next to them. (Empty boxes
+                // stay ordinary so their margins collapse through.)
+                tstyle.overflow = avoid_floats(tstyle.overflow);
+            }
+            let items = content.items;
             let ctx = Ctx {
                 node: Some(id),
                 style_node: id,
@@ -499,9 +519,23 @@ impl Builder<'_> {
                 let child = self.build(tree, c);
                 parts.push(Part::Block(child));
             } else if css.display == CDisplay::Inline {
+                // Margin + border + padding at the start and end.
+                let side = |i: usize| {
+                    css.margin[i].px_or_zero(0.0).max(0.0)
+                        + css.border(i)
+                        + css.padding[i].px_or_zero(0.0)
+                };
+                let (lead, trail) = (side(cs::LEFT), side(cs::RIGHT));
+                if lead > 0.0 {
+                    push_inline(parts, Item::Gap { width: lead });
+                }
                 self.collect_children(tree, c, false, parts);
+                if trail > 0.0 {
+                    push_inline(parts, Item::Gap { width: trail });
+                }
             } else {
                 // inline-block / inline-flex: an atomic inline box.
+                let wraps = self.style(parent).is_none_or(|p| p.white_space.wraps());
                 let (index, width, height, baseline) = self.atomic(c);
                 push_inline(
                     parts,
@@ -510,6 +544,7 @@ impl Builder<'_> {
                         width,
                         height,
                         baseline,
+                        wraps,
                     },
                 );
             }
@@ -613,6 +648,13 @@ impl Builder<'_> {
             .is_some_and(|(p, _)| matches!(p, cs::Position::Absolute | cs::Position::Fixed));
         let fixed = positioned.is_some_and(|(p, _)| p == cs::Position::Fixed);
         let z = positioned.and_then(|(_, z)| z).unwrap_or(0);
+        let sticky_top = dom_node
+            .and_then(|n| self.style(n))
+            .filter(|s| s.position == cs::Position::Sticky)
+            .and_then(|s| match s.inset[cs::TOP] {
+                Dim::Px(v) => Some(v),
+                _ => None,
+            });
         let overflow = l.scrollable_overflow_rect;
         let index = self.boxes.len();
         self.boxes.push(LBox {
@@ -641,6 +683,7 @@ impl Builder<'_> {
             fixed,
             z,
             content_shift: 0.0,
+            sticky_top,
         });
         let kids: Vec<usize> = tree
             .children(node)
@@ -1180,7 +1223,12 @@ fn convert(s: &Css) -> Style {
             (false, true) => taffy::Clear::Right,
             _ => taffy::Clear::None,
         },
-        inset: rect4(s.inset.map(lpa)),
+        // Sticky offsets apply at paint time, not in layout.
+        inset: if s.position == cs::Position::Sticky {
+            rect4([Dim::Auto; 4].map(lpa))
+        } else {
+            rect4(s.inset.map(lpa))
+        },
         overflow: Point {
             x: overflow,
             y: overflow,
