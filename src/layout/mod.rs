@@ -151,6 +151,9 @@ struct Builder<'a> {
     caps: HashMap<NodeId, f32>,
     /// Inline-blocks found wider than their container in this pass.
     overflow: HashMap<NodeId, f32>,
+    /// Positioned elements being built (innermost last), each with the
+    /// absolutely positioned descendants hoisted to it as its children.
+    abs_stack: Vec<(NodeId, Vec<taffy::NodeId>)>,
 }
 
 /// Natural sizes of replaced elements (`<img>`), by node.
@@ -209,6 +212,7 @@ fn layout_pass(
         gen_of,
         caps,
         overflow: HashMap::new(),
+        abs_stack: Vec::new(),
         in_block: true,
         fixed: Vec::new(),
         replaced,
@@ -376,6 +380,45 @@ impl Builder<'_> {
 
     /// Creates the taffy node for element `id` and its subtree.
     fn build(&mut self, tree: &mut TaffyTree<Ctx>, id: NodeId) -> taffy::NodeId {
+        let positioned = self.is_positioned(id);
+        if positioned {
+            self.abs_stack.push((id, Vec::new()));
+        }
+        let node = self.build_box(tree, id);
+        if positioned && let Some((_, hoisted)) = self.abs_stack.pop() {
+            for h in hoisted {
+                tree.add_child(node, h).unwrap();
+            }
+        }
+        node
+    }
+
+    /// Whether `id` is the containing block of absolutely positioned
+    /// descendants.
+    fn is_positioned(&self, id: NodeId) -> bool {
+        self.style(id).is_some_and(|s| {
+            s.position != cs::Position::Static
+                || s.translate.0 != Dim::Px(0.0)
+                || s.translate.1 != Dim::Px(0.0)
+        })
+    }
+
+    /// Whether absolutely positioned `id` should be laid out in its
+    /// containing block rather than its parent: when its place does not
+    /// depend on where it would have been in the flow (insets on both axes,
+    /// or a percentage width and height).
+    fn hoistable(&self, id: NodeId) -> bool {
+        let Some(s) = self.style(id) else {
+            return false;
+        };
+        let set = |d: Dim| d != Dim::Auto;
+        let pct = |d: Dim| matches!(d, Dim::Percent(_) | Dim::Calc(_, _));
+        let horizontal = set(s.inset[cs::LEFT]) || set(s.inset[cs::RIGHT]);
+        let vertical = set(s.inset[cs::TOP]) || set(s.inset[cs::BOTTOM]);
+        (horizontal && vertical) || (pct(s.width) && pct(s.height))
+    }
+
+    fn build_box(&mut self, tree: &mut TaffyTree<Ctx>, id: NodeId) -> taffy::NodeId {
         // Read before building children, which reset it.
         let in_block = std::mem::replace(&mut self.in_block, true);
         let css = self.style(id).cloned().unwrap_or_default();
@@ -561,8 +604,25 @@ impl Builder<'_> {
             if self.dom.tag(c) == Some("br") && !flex {
                 push_inline(parts, Item::Break { node: c });
             } else if block_level {
+                let absolute = css.position == cs::Position::Absolute;
                 self.in_block = !flex;
                 let child = self.build(tree, c);
+                // An absolutely positioned box whose containing block is an
+                // outer positioned element goes there.
+                if absolute && self.hoistable(c) {
+                    let mut up = self.dom.parent(c);
+                    while let Some(a) = up {
+                        if self.is_positioned(a) {
+                            break;
+                        }
+                        up = self.dom.parent(a);
+                    }
+                    let target = up.and_then(|a| self.abs_stack.iter().position(|(n, _)| *n == a));
+                    if let Some(t) = target.filter(|_| !self.is_positioned(parent)) {
+                        self.abs_stack[t].1.push(child);
+                        continue;
+                    }
+                }
                 parts.push(Part::Block(child));
             } else if css.display == CDisplay::Inline {
                 // Margin + border + padding at the start and end.
@@ -603,7 +663,10 @@ impl Builder<'_> {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
         // Fractional sizes: rounding would cut text boxes short and wrap.
         tree.disable_rounding();
+        // Boxes in this separate tree cannot be hoisted out of it.
+        let outer = std::mem::take(&mut self.abs_stack);
         let node = self.build(&mut tree, id);
+        self.abs_stack = outer;
         // A percentage width needs the container's width, known only in
         // the next pass; until then the box takes its intrinsic width.
         if self.percent_width(id) && !self.caps.contains_key(&id) {

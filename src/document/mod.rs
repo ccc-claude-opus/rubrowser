@@ -7,6 +7,7 @@ use crate::css::selector::DynScope;
 use crate::css::selector::PseudoElement;
 use crate::css::style::Cursor as CssCursor;
 use crate::css::syntax::{Rule, Sheet, parse_stylesheet};
+use crate::css::values::Dim;
 use crate::css::{Cascade, ElementState, Matcher, Style, compute};
 use crate::dom::{Dom, NodeId, parse_html};
 use crate::gfx::Canvas;
@@ -612,8 +613,16 @@ impl Document {
                 .style(n)
                 .map(|s| {
                     format!(
-                        "{:?} {:?} w={:?} m={:?} p={:?}",
-                        s.display, s.position, s.width, s.margin, s.padding
+                        "{:?} {:?} w={:?} m={:?} p={:?} vis={} op={} color=#{:06x}{}",
+                        s.display,
+                        s.position,
+                        s.width,
+                        s.margin,
+                        s.padding,
+                        s.visible,
+                        s.opacity,
+                        s.color.rgb(),
+                        if s.clipped_away { " clipped" } else { "" }
                     )
                 })
                 .unwrap_or_else(|| "none".into());
@@ -707,7 +716,14 @@ impl Document {
                     return; // src changed since the request
                 }
                 self.images.set(n, state);
-                self.needs_layout = true;
+                // An image whose box CSS sizes completely does not move
+                // anything when it arrives: repaint only.
+                let sized = self.style(n).is_some_and(|s| {
+                    s.width != Dim::Auto && (s.height != Dim::Auto || s.aspect_ratio.is_some())
+                });
+                if !sized {
+                    self.needs_layout = true;
+                }
             }
             None => self.images.set_url(src, state),
         }
