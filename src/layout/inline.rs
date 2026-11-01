@@ -429,7 +429,7 @@ pub fn align(layout: &mut InlineLayout, align: TextAlign, width: f32) {
     let factor = match align {
         TextAlign::Left => return,
         TextAlign::Right => 1.0,
-        TextAlign::Center => 0.5,
+        TextAlign::Center | TextAlign::WebkitCenter => 0.5,
     };
     for line in &mut layout.lines {
         let dx = ((width - line.width) * factor).max(0.0);

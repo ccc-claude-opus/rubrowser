@@ -64,7 +64,7 @@ summary { display: list-item; cursor: pointer; }
 details { margin: 0.5em 0; }
 figcaption { font-size: 0.9em; }
 big { font-size: larger; }
-center { text-align: center; }
+center { text-align: -webkit-center; }
 
 pre, code, kbd, samp, tt { font-family: monospace; }
 pre { white-space: pre; }

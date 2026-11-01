@@ -33,6 +33,16 @@ pub fn ua_sheet() -> Rc<Sheet> {
     UA_SHEET.with(Rc::clone)
 }
 
+/// Extra UA rules for quirks-mode documents (as in other browsers).
+const QUIRKS_CSS: &str = "
+table { white-space: normal; line-height: normal; font-weight: normal; font-size: medium;
+  font-style: normal; text-align: start; }
+";
+
+thread_local! {
+    static QUIRKS_SHEET: Rc<Sheet> = Rc::new(syntax::parse_stylesheet(QUIRKS_CSS, None));
+}
+
 /// Dynamic element state that pseudo-classes depend on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ElementState {
@@ -116,6 +126,11 @@ impl Cascade {
     /// Indexes the UA sheet and `author` sheets (in order, with the media
     /// list they were included with) for `env`.
     pub fn new(author: &[(Rc<Sheet>, MediaList)], env: &MediaEnv) -> Cascade {
+        Self::with_quirks(author, env, false)
+    }
+
+    /// Like [`Cascade::new`]; `quirks` adds the quirks-mode UA rules.
+    pub fn with_quirks(author: &[(Rc<Sheet>, MediaList)], env: &MediaEnv, quirks: bool) -> Cascade {
         let mut c = Cascade {
             rules: Vec::new(),
             layers: HashMap::new(),
@@ -125,6 +140,10 @@ impl Cascade {
         };
         let ua = ua_sheet();
         c.add(&ua.rules, 0, env, "");
+        if quirks {
+            let q = QUIRKS_SHEET.with(Rc::clone);
+            c.add(&q.rules, 0, env, "");
+        }
         for (sheet, media) in author {
             if media.matches(env) {
                 c.add(&sheet.rules, 2, env, "");
@@ -915,10 +934,42 @@ fn presentational_hints(dom: &Dom, id: NodeId) -> Vec<(&'static str, String)> {
     }
     if matches!(
         tag,
-        "td" | "th" | "tr" | "div" | "p" | "h1" | "h2" | "h3" | "caption"
+        "td" | "th"
+            | "tr"
+            | "tbody"
+            | "thead"
+            | "div"
+            | "p"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "caption"
     ) && let Some(a) = dom.attr(id, "align")
     {
-        out.push(("text-align", a.to_string()));
+        let a = a.trim().to_ascii_lowercase();
+        let center_blocks = matches!(tag, "td" | "th" | "tr" | "tbody" | "thead" | "div");
+        let a = if a == "center" && center_blocks {
+            "-webkit-center".to_string()
+        } else {
+            a
+        };
+        out.push(("text-align", a));
+    }
+    if matches!(tag, "table" | "img" | "iframe")
+        && let Some(a) = dom.attr(id, "align")
+    {
+        match a.trim().to_ascii_lowercase().as_str() {
+            "center" if tag == "table" => {
+                out.push(("margin-left", "auto".into()));
+                out.push(("margin-right", "auto".into()));
+            }
+            "left" => out.push(("float", "left".into())),
+            "right" => out.push(("float", "right".into())),
+            _ => {}
+        }
     }
     if matches!(tag, "td" | "th" | "tr")
         && let Some(v) = dom.attr(id, "valign")

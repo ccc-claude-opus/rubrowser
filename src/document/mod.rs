@@ -265,7 +265,7 @@ impl Document {
             let cascade = match &self.cascade {
                 Some((k, e, c)) if *k == keys && *e == env => c.clone(),
                 _ => {
-                    let c = Rc::new(Cascade::new(&sheets, &env));
+                    let c = Rc::new(Cascade::with_quirks(&sheets, &env, self.dom.quirks));
                     self.cascade = Some((keys, env, c.clone()));
                     c
                 }

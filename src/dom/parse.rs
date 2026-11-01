@@ -155,7 +155,9 @@ impl TreeSink for Sink {
         x.id == y.id
     }
 
-    fn set_quirks_mode(&self, _: QuirksMode) {}
+    fn set_quirks_mode(&self, mode: QuirksMode) {
+        self.dom.borrow_mut().quirks = mode == QuirksMode::Quirks;
+    }
 
     fn append_before_sibling(&self, sibling: &Handle, new_node: NodeOrText<Handle>) {
         let parent = self.dom.borrow().parent(sibling.id);

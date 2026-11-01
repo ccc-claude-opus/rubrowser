@@ -146,6 +146,9 @@ pub enum TextAlign {
     Left,
     Right,
     Center,
+    /// `-webkit-center` (`<center>`, `align=center`): centers text and
+    /// block children too.
+    WebkitCenter,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -847,6 +850,7 @@ impl Style {
                     "left" | "start" | "justify" => TextAlign::Left,
                     "right" | "end" => TextAlign::Right,
                     "center" => TextAlign::Center,
+                    "-webkit-center" | "-moz-center" => TextAlign::WebkitCenter,
                     _ => return,
                 }
             }

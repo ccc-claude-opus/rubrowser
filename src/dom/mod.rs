@@ -79,6 +79,8 @@ pub struct Node {
 #[derive(Clone, Debug)]
 pub struct Dom {
     nodes: Vec<Node>,
+    /// The document has no (or an old) doctype: quirks-mode rendering.
+    pub quirks: bool,
 }
 
 impl Default for Dom {
@@ -98,6 +100,7 @@ impl Dom {
                 children: Vec::new(),
                 data: NodeData::Document,
             }],
+            quirks: false,
         }
     }
 
