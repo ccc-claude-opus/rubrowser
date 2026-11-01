@@ -17,6 +17,8 @@
     let n = wrappers.get(h);
     if (!n) {
       const t = rb.nodeType(h);
+      const custom = t === 1 && customRegistry.get(rb.tagName(h));
+      if (custom) return upgrade(h, custom);
       n = t === 1 ? new Element(h) : t === 3 ? new Text(h) : t === 9 ? new Document(h) : new Node(h);
       wrappers.set(h, n);
     }
@@ -64,7 +66,8 @@
   class Node extends EventTarget {
     constructor(h) {
       super();
-      Object.defineProperty(this, '__h', { value: h });
+      // A custom element's constructor runs while it is being upgraded.
+      Object.defineProperty(this, '__h', { value: h === undefined ? upgrading : h });
     }
 
     get nodeType() { return rb.nodeType(this.__h); }
@@ -265,6 +268,17 @@
     get scrollLeft() { return 0; }
     set scrollLeft(v) {}
     scrollIntoView() {}
+    attachShadow() {
+      // Shadow trees are not rendered; scripts still get a working root.
+      const root = document.createDocumentFragment();
+      Object.defineProperty(root, 'host', { value: this });
+      Object.defineProperty(this, 'shadowRoot', { value: root, configurable: true });
+      return root;
+    }
+    animate() {
+      return { finished: Promise.resolve(), cancel() {}, finish() {}, play() {}, pause() {}, onfinish: null };
+    }
+    isEqualNode(other) { return !!other && this.outerHTML === other.outerHTML; }
     focus() {}
     blur() {}
     get innerHTML() { return rb.getHtml(this.__h, 0); }
@@ -383,6 +397,10 @@
     hasFocus() { return true; }
     createEvent(kind) { return new (/custom/i.test(kind) ? CustomEvent : Event)(''); }
     createComment(text) { return this.createTextNode(''); }
+    createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
+    get currentScript() { return null; }
+    get visibilityState() { return 'visible'; }
+    get hidden() { return false; }
     createElement(tag) {
       const h = rb.createElement(String(tag).toLowerCase());
       if (h < 0) throw new Error('InvalidCharacterError: ' + tag);
@@ -615,6 +633,70 @@
     back() { rb.historyGo(-1); },
     forward() { rb.historyGo(1); },
     go(n) { rb.historyGo(Number(n) || 0); },
+    // Single-page apps: the state is kept, the address does not change.
+    state: null,
+    length: 1,
+    scrollRestoration: 'auto',
+    pushState(state) { this.state = state; },
+    replaceState(state) { this.state = state; },
+  };
+
+  // ----- custom elements -----------------------------------------------------
+
+  const customRegistry = new Map(); // tag -> class
+  const definedWaiters = new Map(); // tag -> [resolve]
+  let upgrading;
+
+  // Turns element `h` into an instance of custom element class `cls`.
+  function upgrade(h, cls) {
+    let el;
+    upgrading = h;
+    try {
+      el = Reflect.construct(cls, []);
+    } catch (err) {
+      reportError(err);
+      el = Object.create(cls.prototype);
+      Object.defineProperty(el, '__h', { value: h });
+    } finally {
+      upgrading = undefined;
+    }
+    wrappers.set(h, el);
+    const observed = cls.observedAttributes || [];
+    if (typeof el.attributeChangedCallback === 'function') {
+      for (const a of observed) {
+        const v = el.getAttribute(a);
+        if (v !== null) call(el.attributeChangedCallback, el, [a, null, v]);
+      }
+    }
+    if (typeof el.connectedCallback === 'function' && el.isConnected) {
+      call(el.connectedCallback, el, []);
+    }
+    return el;
+  }
+
+  const customElements = {
+    define(name, cls) {
+      name = String(name).toLowerCase();
+      if (customRegistry.has(name)) return;
+      customRegistry.set(name, cls);
+      // Upgrade the elements already in the document.
+      for (const h of rb.queryAll(name)) {
+        const old = wrappers.get(h);
+        if (!old || !(old instanceof cls)) upgrade(h, cls);
+      }
+      for (const resolve of definedWaiters.get(name) || []) resolve(cls);
+      definedWaiters.delete(name);
+    },
+    get(name) { return customRegistry.get(String(name).toLowerCase()); },
+    whenDefined(name) {
+      name = String(name).toLowerCase();
+      if (customRegistry.has(name)) return Promise.resolve(customRegistry.get(name));
+      return new Promise((resolve) => {
+        if (!definedWaiters.has(name)) definedWaiters.set(name, []);
+        definedWaiters.get(name).push(resolve);
+      });
+    },
+    upgrade() {},
   };
 
   // ----- web platform stand-ins ---------------------------------------------
@@ -669,6 +751,279 @@
     disconnect() {}
     takeRecords() { return []; }
   }
+
+  // URL: absolute URLs, or relative ones resolved against a base.
+  class URL {
+    constructor(url, base) {
+      url = String(url);
+      const abs = /^[a-z][a-z0-9+.-]*:/i.test(url);
+      if (!abs) {
+        if (base === undefined) throw new TypeError('Invalid URL: ' + url);
+        url = URL.resolve(String(base instanceof URL ? base.href : base), url);
+      }
+      const m = /^([a-z][a-z0-9+.-]*:)(?:\/\/([^/?#]*))?([^?#]*)(\?[^#]*)?(#.*)?$/i.exec(url);
+      if (!m) throw new TypeError('Invalid URL: ' + url);
+      this.protocol = m[1].toLowerCase();
+      const auth = m[2] || '';
+      this.host = auth.replace(/^.*@/, '').toLowerCase();
+      this.pathname = m[3] || (m[2] !== undefined ? '/' : '');
+      this.search = m[4] && m[4].length > 1 ? m[4] : '';
+      this.hash = m[5] && m[5].length > 1 ? m[5] : '';
+      this.username = '';
+      this.password = '';
+    }
+    static resolve(base, rel) {
+      const m = /^([a-z][a-z0-9+.-]*:)(\/\/[^/?#]*)?([^?#]*)(\?[^#]*)?/i.exec(base) || ['', '', '', '/', ''];
+      const [, scheme, authority = '', path = '/', query = ''] = m;
+      if (rel.startsWith('//')) return scheme + rel;
+      if (rel.startsWith('#')) return scheme + authority + path + query + rel;
+      if (rel.startsWith('?')) return scheme + authority + path + rel;
+      let p = rel.startsWith('/') ? rel : path.replace(/[^/]*$/, '') + rel;
+      const [pathPart, ...rest] = p.split(/(?=[?#])/);
+      const out = [];
+      for (const seg of pathPart.split('/')) {
+        if (seg === '..') out.pop();
+        else if (seg !== '.') out.push(seg);
+      }
+      let joined = out.join('/');
+      if (!joined.startsWith('/')) joined = '/' + joined;
+      return scheme + authority + joined + rest.join('');
+    }
+    static canParse(url, base) { try { new URL(url, base); return true; } catch (_) { return false; } }
+    get hostname() { return this.host.replace(/:\d+$/, ''); }
+    get port() { const m = /:(\d+)$/.exec(this.host); return m ? m[1] : ''; }
+    get origin() { return this.host ? this.protocol + '//' + this.host : 'null'; }
+    get href() { return this.protocol + (this.host || this.protocol === 'file:' ? '//' + this.host : '') + this.pathname + this.search + this.hash; }
+    set href(v) { Object.assign(this, new URL(v)); }
+    get searchParams() {
+      const params = new URLSearchParams(this.search);
+      const url = this;
+      for (const m of ['set', 'append', 'delete']) {
+        const orig = params[m].bind(params);
+        params[m] = (...a) => { orig(...a); const q = params.toString(); url.search = q ? '?' + q : ''; };
+      }
+      return params;
+    }
+    toString() { return this.href; }
+    toJSON() { return this.href; }
+  }
+  URL.createObjectURL = () => 'blob:';
+  URL.revokeObjectURL = () => {};
+
+  class TextEncoder {
+    get encoding() { return 'utf-8'; }
+    encode(s = '') {
+      const bytes = [];
+      for (const ch of String(s)) {
+        let c = ch.codePointAt(0);
+        if (c < 0x80) bytes.push(c);
+        else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+        else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+        else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+      }
+      return new Uint8Array(bytes);
+    }
+  }
+  class TextDecoder {
+    get encoding() { return 'utf-8'; }
+    decode(buf) {
+      if (!buf) return '';
+      const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer || buf);
+      let out = '';
+      for (let i = 0; i < b.length;) {
+        const c = b[i];
+        let cp, n;
+        if (c < 0x80) { cp = c; n = 1; }
+        else if (c >= 0xf0) { cp = ((c & 7) << 18) | ((b[i + 1] & 63) << 12) | ((b[i + 2] & 63) << 6) | (b[i + 3] & 63); n = 4; }
+        else if (c >= 0xe0) { cp = ((c & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63); n = 3; }
+        else { cp = ((c & 31) << 6) | (b[i + 1] & 63); n = 2; }
+        out += String.fromCodePoint(cp);
+        i += n;
+      }
+      return out;
+    }
+  }
+
+  const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  function btoa(s) {
+    s = String(s);
+    let out = '';
+    for (let i = 0; i < s.length; i += 3) {
+      const [a, b, c] = [s.charCodeAt(i), s.charCodeAt(i + 1), s.charCodeAt(i + 2)];
+      if (a > 255 || b > 255 || c > 255) throw new Error('InvalidCharacterError');
+      const n = (a << 16) | ((b || 0) << 8) | (c || 0);
+      out += B64[n >> 18] + B64[(n >> 12) & 63] + (i + 1 < s.length ? B64[(n >> 6) & 63] : '=') + (i + 2 < s.length ? B64[n & 63] : '=');
+    }
+    return out;
+  }
+  function atob(s) {
+    s = String(s).replace(/[\s=]/g, '');
+    let out = '', bits = 0, acc = 0;
+    for (const ch of s) {
+      const v = B64.indexOf(ch === '-' ? '+' : ch === '_' ? '/' : ch);
+      if (v < 0) throw new Error('InvalidCharacterError');
+      acc = (acc << 6) | v;
+      bits += 6;
+      if (bits >= 8) { bits -= 8; out += String.fromCharCode((acc >> bits) & 255); }
+    }
+    return out;
+  }
+
+  const crypto = {
+    getRandomValues(arr) {
+      const max = 2 ** (8 * (arr.BYTES_PER_ELEMENT || 1));
+      for (let i = 0; i < arr.length; i++) arr[i] = Math.floor(Math.random() * max);
+      return arr;
+    },
+    randomUUID() {
+      const h = '0123456789abcdef';
+      let s = '';
+      for (let i = 0; i < 36; i++) {
+        s += i === 8 || i === 13 || i === 18 || i === 23 ? '-' : i === 14 ? '4' : i === 19 ? h[8 + Math.floor(Math.random() * 4)] : h[Math.floor(Math.random() * 16)];
+      }
+      return s;
+    },
+  };
+
+  function structuredClone(v) {
+    if (v === null || typeof v !== 'object') return v;
+    if (v instanceof Date) return new Date(v.getTime());
+    if (v instanceof Map) return new Map([...v].map(([k, x]) => [structuredClone(k), structuredClone(x)]));
+    if (v instanceof Set) return new Set([...v].map(structuredClone));
+    if (Array.isArray(v)) return v.map(structuredClone);
+    const out = {};
+    for (const k of Object.keys(v)) out[k] = structuredClone(v[k]);
+    return out;
+  }
+
+  class AbortSignal extends EventTarget {
+    constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
+    throwIfAborted() { if (this.aborted) throw this.reason; }
+    static timeout() { return new AbortSignal(); }
+    static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason; return s; }
+    static any() { return new AbortSignal(); }
+  }
+  class AbortController {
+    constructor() { this.signal = new AbortSignal(); }
+    abort(reason) {
+      if (this.signal.aborted) return;
+      this.signal.aborted = true;
+      this.signal.reason = reason === undefined ? new Error('AbortError') : reason;
+      if (typeof this.signal.onabort === 'function') call(this.signal.onabort, this.signal, [{ type: 'abort' }]);
+    }
+  }
+
+  // No network access from scripts yet: requests fail like an offline
+  // browser's.
+  class Headers {
+    constructor(init) { this._m = new Map(); if (init) for (const [k, v] of Object.entries(init)) this.set(k, v); }
+    get(k) { return this._m.get(String(k).toLowerCase()) ?? null; }
+    set(k, v) { this._m.set(String(k).toLowerCase(), String(v)); }
+    append(k, v) { this.set(k, v); }
+    has(k) { return this._m.has(String(k).toLowerCase()); }
+    delete(k) { this._m.delete(String(k).toLowerCase()); }
+    forEach(fn) { this._m.forEach((v, k) => fn(v, k, this)); }
+    [Symbol.iterator]() { return this._m.entries(); }
+  }
+  class Request { constructor(url, init) { this.url = String(url); this.method = (init && init.method) || 'GET'; this.headers = new Headers(init && init.headers); } }
+  class Response {
+    constructor(body, init) { this._body = body == null ? '' : String(body); this.status = (init && init.status) || 200; this.ok = this.status < 300; this.headers = new Headers(init && init.headers); }
+    text() { return Promise.resolve(this._body); }
+    json() { return Promise.resolve(JSON.parse(this._body)); }
+  }
+  function fetch(url) {
+    return new Promise((_, reject) => addTimer(() => reject(new TypeError('Failed to fetch ' + String(url))), 0, [], false));
+  }
+  class XMLHttpRequest extends EventTarget {
+    constructor() { super(); this.readyState = 0; this.status = 0; this.responseText = ''; this.response = null; }
+    open(method, url) { this.readyState = 1; this._url = url; }
+    setRequestHeader() {}
+    getResponseHeader() { return null; }
+    getAllResponseHeaders() { return ''; }
+    abort() {}
+    send() {
+      addTimer(() => {
+        this.readyState = 4;
+        for (const h of ['onreadystatechange', 'onerror', 'onloadend']) {
+          if (typeof this[h] === 'function') call(this[h], this, [{ type: h.slice(2), target: this }]);
+        }
+      }, 0, [], false);
+    }
+  }
+  class FormData {
+    constructor(form) {
+      this._p = [];
+      if (form && form.elements) for (const el of form.elements) if (el.name) this._p.push([el.name, el.value]);
+    }
+    append(k, v) { this._p.push([String(k), v]); }
+    set(k, v) { this.delete(k); this.append(k, v); }
+    get(k) { const p = this._p.find(([n]) => n === k); return p ? p[1] : null; }
+    getAll(k) { return this._p.filter(([n]) => n === k).map(([, v]) => v); }
+    has(k) { return this._p.some(([n]) => n === k); }
+    delete(k) { this._p = this._p.filter(([n]) => n !== k); }
+    entries() { return this._p[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
+  }
+  class Blob {
+    constructor(parts, opts) { this._t = (parts || []).join(''); this.type = (opts && opts.type) || ''; this.size = this._t.length; }
+    text() { return Promise.resolve(this._t); }
+  }
+
+  class DOMParser {
+    parseFromString(text) {
+      const html = document.createElement('html');
+      html.innerHTML = String(text);
+      const doc = {
+        documentElement: html,
+        body: html.querySelector('body') || html,
+        head: html.querySelector('head'),
+        querySelector: (s) => html.querySelector(s),
+        querySelectorAll: (s) => html.querySelectorAll(s),
+        getElementById: (id) => html.querySelector('[id="' + id + '"]'),
+        getElementsByTagName: (t) => html.getElementsByTagName(t),
+      };
+      return doc;
+    }
+  }
+
+  // Intl without locale data: enough for formatting numbers and dates.
+  const Intl = {
+    NumberFormat: class {
+      constructor(locale, opts) { this.opts = opts || {}; }
+      format(n) {
+        const d = this.opts.maximumFractionDigits;
+        const s = d !== undefined ? Number(n).toFixed(d).replace(/\.?0+$/, '') : String(n);
+        const [i, f] = s.split('.');
+        return i.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + (f ? '.' + f : '');
+      }
+      formatToParts(n) { return [{ type: 'integer', value: this.format(n) }]; }
+      resolvedOptions() { return { locale: 'en-US', ...this.opts }; }
+    },
+    DateTimeFormat: class {
+      constructor(locale, opts) { this.opts = opts || {}; }
+      format(d) {
+        d = d === undefined ? new Date() : new Date(d);
+        const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+        return months[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear();
+      }
+      formatToParts(d) { return [{ type: 'literal', value: this.format(d) }]; }
+      resolvedOptions() { return { locale: 'en-US', timeZone: 'UTC', ...this.opts }; }
+    },
+    RelativeTimeFormat: class {
+      format(v, unit) { const n = Math.abs(v); const u = n === 1 ? unit.replace(/s$/, '') : unit.replace(/s?$/, 's'); return v < 0 ? n + ' ' + u + ' ago' : 'in ' + n + ' ' + u; }
+    },
+    PluralRules: class { select(n) { return n === 1 ? 'one' : 'other'; } },
+    Collator: class { compare(a, b) { return a < b ? -1 : a > b ? 1 : 0; } },
+    ListFormat: class { format(l) { return [...l].join(', '); } },
+    Segmenter: class { segment(s) { return [...String(s)].map((segment, index) => ({ segment, index })); } },
+    getCanonicalLocales: (l) => (l ? [].concat(l) : []),
+  };
+
+  class PerformanceObserver {
+    observe() {}
+    disconnect() {}
+  }
+  PerformanceObserver.supportedEntryTypes = [];
 
   function matchMedia(query) {
     return {
@@ -732,6 +1087,44 @@
     Event,
     EventTarget,
     URLSearchParams,
+    URL,
+    customElements,
+    TextEncoder,
+    TextDecoder,
+    btoa,
+    atob,
+    crypto,
+    structuredClone,
+    AbortController,
+    AbortSignal,
+    Headers,
+    Request,
+    Response,
+    fetch,
+    XMLHttpRequest,
+    FormData,
+    Blob,
+    DOMParser,
+    Intl: typeof global.Intl === 'object' ? global.Intl : Intl,
+    PerformanceObserver,
+    HTMLInputElement: Element,
+    HTMLAnchorElement: Element,
+    HTMLButtonElement: Element,
+    HTMLFormElement: Element,
+    HTMLImageElement: Element,
+    HTMLDivElement: Element,
+    HTMLTemplateElement: Element,
+    HTMLScriptElement: Element,
+    HTMLSelectElement: Element,
+    HTMLTextAreaElement: Element,
+    SVGElement: Element,
+    ShadowRoot: DocumentFragment,
+    Image: function Image(w, h) { const i = document.createElement('img'); if (w) i.width = w; if (h) i.height = h; return i; },
+    Option: function Option(text, value) { const o = document.createElement('option'); o.textContent = text || ''; if (value !== undefined) o.value = value; return o; },
+    requestIdleCallback: (fn) => addTimer(() => fn({ didTimeout: false, timeRemaining: () => 50 }), 1, [], false),
+    cancelIdleCallback: clearTimer,
+    reportError: (e) => reportError(e),
+    getSelection: () => ({ rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }),
     Storage,
     localStorage: new Storage(),
     sessionStorage: new Storage(),
@@ -760,7 +1153,17 @@
     cancelAnimationFrame: clearTimer,
     queueMicrotask: (fn) => Promise.resolve().then(fn),
     alert: (msg) => rb.log('alert: ' + String(msg)),
-    performance: { now: () => rb.now() },
+    performance: {
+      now: () => rb.now(),
+      timeOrigin: 0,
+      mark() {},
+      measure() {},
+      clearMarks() {},
+      clearMeasures() {},
+      getEntriesByType: () => [],
+      getEntriesByName: () => [],
+      getEntries: () => [],
+    },
     addEventListener: (type, fn, opts) => document.addEventListener(type, fn, opts),
     removeEventListener: (type, fn) => document.removeEventListener(type, fn),
   });

@@ -101,9 +101,75 @@ pub fn key_name(code: i32, shift: bool) -> String {
     named.to_string()
 }
 
+/// Resolves an ES module specifier against the URL of the importing
+/// module (import map entries first). Shared by the browser, which fetches
+/// module graphs, and the JavaScript runtime, which links them, so both
+/// name every module by the same URL.
+pub fn resolve_module(spec: &str, base: &str, map: &[(String, String)]) -> String {
+    for (k, v) in map {
+        if spec == k {
+            return v.clone();
+        }
+        if k.ends_with('/')
+            && let Some(rest) = spec.strip_prefix(k.as_str())
+        {
+            return format!("{v}{rest}");
+        }
+    }
+    if spec.contains("://") {
+        return spec.to_string();
+    }
+    let origin_end = base.find("://").map_or(0, |i| {
+        base[i + 3..].find('/').map_or(base.len(), |j| i + 3 + j)
+    });
+    let origin = &base[..origin_end];
+    if let Some(rest) = spec.strip_prefix("//") {
+        let scheme = base.split("://").next().unwrap_or("https");
+        return format!("{scheme}://{rest}");
+    }
+    let path = if spec.starts_with('/') {
+        spec.to_string()
+    } else {
+        let dir = &base[origin_end..base.rfind('/').map_or(origin_end, |i| i.max(origin_end))];
+        format!("{dir}/{spec}")
+    };
+    let mut out: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        match seg {
+            "." | "" => {}
+            ".." => {
+                out.pop();
+            }
+            s => out.push(s),
+        }
+    }
+    format!("{origin}/{}", out.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn module_specifiers() {
+        let map = vec![
+            ("lit".to_string(), "https://cdn/lit.js".to_string()),
+            ("@x/".to_string(), "https://cdn/x/".to_string()),
+        ];
+        let base = "https://a.com/js/app.js?v=2";
+        assert_eq!(
+            resolve_module("./b.js", base, &map),
+            "https://a.com/js/b.js"
+        );
+        assert_eq!(resolve_module("../c.js", base, &map), "https://a.com/c.js");
+        assert_eq!(resolve_module("/d.js", base, &map), "https://a.com/d.js");
+        assert_eq!(resolve_module("lit", base, &map), "https://cdn/lit.js");
+        assert_eq!(resolve_module("@x/y.js", base, &map), "https://cdn/x/y.js");
+        assert_eq!(
+            resolve_module("https://e.com/f.js", base, &map),
+            "https://e.com/f.js"
+        );
+    }
 
     #[test]
     fn key_names() {

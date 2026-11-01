@@ -299,12 +299,17 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         }
         let wait = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(wait) {
-            Ok(f) => {
-                host.pending -= 1;
-                if let Some(u) = &f.final_url {
-                    browser.fetch_redirected(f.id, u);
+            Ok(first) => {
+                // Deliver everything that has arrived, then render once.
+                let mut next = Some(first);
+                while let Some(f) = next {
+                    host.pending -= 1;
+                    if let Some(u) = &f.final_url {
+                        browser.fetch_redirected(f.id, u);
+                    }
+                    browser.fetch_done(f.id, f.result, &mut host);
+                    next = rx.try_recv().ok();
                 }
-                browser.fetch_done(f.id, f.result, &mut host);
             }
             Err(_) => {
                 eprintln!(

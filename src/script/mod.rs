@@ -114,6 +114,8 @@ pub struct Script {
     eval_fn: Option<TypedFunc<(i32, i32, i32, i32), ()>>,
     memory: Option<Memory>,
     fuel: u64,
+    /// Fuel left for a bounded phase (page load), shared by all calls.
+    budget: Option<u64>,
 }
 
 impl Script {
@@ -161,6 +163,7 @@ impl Script {
             eval_fn: None,
             memory: None,
             fuel,
+            budget: None,
         };
         script.with_doc(doc, now, |s| {
             let instance = linker
@@ -190,12 +193,28 @@ impl Script {
         let s = self.store.data_mut();
         s.now = now;
         std::mem::swap(&mut s.doc, doc);
-        let r = match self.store.set_fuel(self.fuel) {
+        let fuel = self.budget.map_or(self.fuel, |b| b.min(self.fuel));
+        let r = match self.store.set_fuel(fuel) {
             Ok(()) => f(self),
             Err(e) => Err(e.to_string()),
         };
+        if let Some(b) = &mut self.budget {
+            let left = self.store.get_fuel().unwrap_or(0);
+            *b = b.saturating_sub(fuel - left.min(fuel));
+        }
         std::mem::swap(&mut self.store.data_mut().doc, doc);
         r
+    }
+
+    /// Limits the total fuel of all following calls to `budget` (`None`:
+    /// only the per-call limit applies).
+    pub fn set_budget(&mut self, budget: Option<u64>) {
+        self.budget = budget;
+    }
+
+    /// Fuel left in the budget, if one is set.
+    pub fn budget(&self) -> Option<u64> {
+        self.budget
     }
 
     /// Sets the wall clock (`Date.now()`): epoch milliseconds at `now == 0`.

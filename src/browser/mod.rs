@@ -94,6 +94,13 @@ enum Request {
         serial: u64,
         font: crate::document::FontRequest,
     },
+    /// A module imported by module script `slot`.
+    Module {
+        tab: u64,
+        serial: u64,
+        slot: usize,
+        url: String,
+    },
 }
 
 /// Languages a `<script>` can be written in. Every one runs as wasm: Rust
@@ -107,6 +114,8 @@ enum Lang {
     /// A page-provided language runtime (`<link rel=rubrowser-runtime>`)
     /// for this MIME type.
     Runtime(String),
+    /// A JavaScript module (`<script type=module>`).
+    Module,
 }
 
 /// The MIME type all JavaScript `<script>` types are normalized to.
@@ -147,6 +156,220 @@ struct PendingScript {
     /// URL or `inline script` (for messages).
     name: String,
     body: Option<Result<Vec<u8>, String>>,
+    /// For a module: its import graph, fetched before it runs (`body` is
+    /// set once every module has arrived).
+    graph: Option<ModuleGraph>,
+}
+
+/// The modules of one `<script type=module>`.
+#[derive(Default)]
+struct ModuleGraph {
+    root: String,
+    /// (URL, source) of every module fetched.
+    sources: Vec<(String, String)>,
+    seen: std::collections::HashSet<String>,
+    /// Fetches still outstanding.
+    waiting: usize,
+}
+
+impl ModuleGraph {
+    fn new(root: &str) -> Self {
+        ModuleGraph {
+            root: root.to_string(),
+            seen: std::iter::once(root.to_string()).collect(),
+            waiting: 1,
+            ..Default::default()
+        }
+    }
+}
+
+/// The page's `<script type=importmap>` entries.
+fn import_map(doc: &Document, base: &str) -> Vec<(String, String)> {
+    let dom = &doc.dom;
+    dom.descendants(crate::dom::Dom::ROOT)
+        .into_iter()
+        .filter(|&n| {
+            dom.tag(n) == Some("script")
+                && dom
+                    .attr(n, "type")
+                    .is_some_and(|t| t.trim().eq_ignore_ascii_case("importmap"))
+        })
+        .flat_map(|n| parse_import_map(&dom.text_content(n), base))
+        .collect()
+}
+
+/// With `RUBROWSER_PROFILE` set: the start time of something to time.
+fn profiling_now() -> Option<std::time::Instant> {
+    #[cfg(not(target_arch = "wasm32"))]
+    if std::env::var_os("RUBROWSER_PROFILE").is_some() {
+        return Some(std::time::Instant::now());
+    }
+    None
+}
+
+/// Fuel all of a page's language-runtime calls may use while it loads
+/// (roughly three seconds); after `load` only the per-call limit applies.
+const PAGE_LOAD_FUEL: u64 = 8_000_000_000;
+
+/// Most modules fetched for one module script.
+const MAX_MODULES: usize = 400;
+
+/// Static import specifiers of an ES module (`import … from "x"`,
+/// `import "x"`, `export … from "x"`, `import("x")` with a literal). A small
+/// lexer: comments, strings, regex literals and nested template literals
+/// are skipped so their contents are not mistaken for imports.
+fn module_imports(src: &str) -> Vec<String> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // The last word seen outside strings and comments, and whether an
+    // `import(` call is open.
+    let mut last_word = String::new();
+    let mut call = false;
+    // The last significant character, to tell a regex literal from `/`.
+    let mut prev = b'(';
+    // Brace depth, and the depths at which template `${…}` parts began.
+    let mut depth = 0usize;
+    let mut templates: Vec<usize> = Vec::new();
+    // Skips template text from `i` to its end or to `${`; returns true at `${`.
+    let skip_template = |i: &mut usize| -> bool {
+        while *i < b.len() {
+            match b[*i] {
+                b'\\' => *i += 2,
+                b'`' => {
+                    *i += 1;
+                    return false;
+                }
+                b'$' if b.get(*i + 1) == Some(&b'{') => {
+                    *i += 2;
+                    return true;
+                }
+                _ => *i += 1,
+            }
+        }
+        false
+    };
+    while i < b.len() {
+        let c = b[i];
+        let regex_can_start = b"(,=:[!&|?{};+-*%~^<>".contains(&prev)
+            || matches!(
+                last_word.as_str(),
+                "return" | "typeof" | "case" | "do" | "else" | "in" | "of"
+            );
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+        } else if c == b'/' && regex_can_start {
+            // A regex literal: skip to its closing slash.
+            i += 1;
+            let mut class = false;
+            while i < b.len() && b[i] != b'\n' && (class || b[i] != b'/') {
+                match b[i] {
+                    b'\\' => i += 1,
+                    b'[' => class = true,
+                    b']' => class = false,
+                    _ => {}
+                }
+                i += 1;
+            }
+            i += 1;
+            prev = b'a';
+            last_word.clear();
+        } else if c == b'`' {
+            i += 1;
+            if skip_template(&mut i) {
+                templates.push(depth);
+                depth += 1;
+                prev = b'{';
+            } else {
+                prev = b'a';
+            }
+            last_word.clear();
+            call = false;
+        } else if c == b'"' || c == b'\'' {
+            let start = i + 1;
+            i += 1;
+            while i < b.len() && b[i] != c && b[i] != b'\n' {
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            let lit = &src[start.min(src.len())..i.min(src.len())];
+            if last_word == "from" || last_word == "import" || call {
+                out.push(lit.to_string());
+            }
+            call = false;
+            last_word.clear();
+            prev = b'a';
+            i += 1;
+        } else if c.is_ascii_alphanumeric() || c == b'_' || c == b'$' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                i += 1;
+            }
+            last_word = src[start..i].to_string();
+            call = false;
+            prev = b'a';
+        } else {
+            match c {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth = depth.saturating_sub(1);
+                    if templates.last() == Some(&depth) {
+                        // The end of a `${…}`: back inside the template.
+                        templates.pop();
+                        i += 1;
+                        if skip_template(&mut i) {
+                            templates.push(depth);
+                            depth += 1;
+                        }
+                        prev = b'a';
+                        last_word.clear();
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+            if c == b'(' {
+                call = last_word == "import";
+            } else if !c.is_ascii_whitespace() {
+                call = false;
+            }
+            if !c.is_ascii_whitespace() {
+                last_word.clear();
+                prev = c;
+            }
+            i += 1;
+        }
+    }
+    out
+}
+
+/// `"imports"` of a `<script type=importmap>` (a flat JSON object of
+/// strings), with URLs resolved against `base`.
+fn parse_import_map(json: &str, base: &str) -> Vec<(String, String)> {
+    let Some(start) = json.find("\"imports\"") else {
+        return Vec::new();
+    };
+    let rest = &json[start + 9..];
+    let Some(open) = rest.find('{') else {
+        return Vec::new();
+    };
+    let body = &rest[open + 1..rest[open..].find('}').map_or(rest.len(), |e| open + e)];
+    let strings: Vec<&str> = body.split('"').skip(1).step_by(2).collect();
+    strings
+        .chunks(2)
+        .filter(|kv| kv.len() == 2)
+        .map(|kv| (kv[0].to_string(), url::resolve(base, kv[1])))
+        .collect()
 }
 
 /// The JavaScript runtime module (boa compiled to wasm).
@@ -208,6 +431,10 @@ struct Tab {
     script_count: usize,
     /// Whether `DOMContentLoaded` / `load` have fired.
     loaded: bool,
+    /// The page's import map (bare specifier or prefix → URL).
+    import_map: Vec<(String, String)>,
+    /// Whether the JavaScript runtime has the import map.
+    import_map_sent: bool,
 }
 
 impl Tab {
@@ -323,6 +550,8 @@ impl Browser {
             scripts: Vec::new(),
             timers: Vec::new(),
             pending: Default::default(),
+            import_map: Vec::new(),
+            import_map_sent: false,
             runtimes: HashMap::new(),
             script_count: 0,
             loaded: false,
@@ -487,9 +716,11 @@ impl Browser {
             };
             self.fetch(req, &target, host);
         }
+        self.tabs[i].import_map = import_map(&self.tabs[i].doc, url);
         // Scripts are fetched in parallel but run in document order.
         for (slot, (lang, src, inline)) in scripts.into_iter().enumerate() {
             let tab = &mut self.tabs[i];
+            let module = lang == Lang::Module;
             match src {
                 Some(src) => {
                     let target = url::resolve(url, &src);
@@ -497,6 +728,7 @@ impl Browser {
                         lang,
                         name: target.clone(),
                         body: None,
+                        graph: module.then(|| ModuleGraph::new(&target)),
                     });
                     let req = Request::Script {
                         tab: id,
@@ -505,10 +737,21 @@ impl Browser {
                     };
                     self.fetch(req, &target, host);
                 }
+                None if module => {
+                    let root = format!("{url}#inline-module-{slot}");
+                    tab.pending.push_back(PendingScript {
+                        lang,
+                        name: format!("{url} (inline module)"),
+                        body: None,
+                        graph: Some(ModuleGraph::new(&root)),
+                    });
+                    self.module_loaded(i, slot, &root, Ok(inline.into_bytes()), host);
+                }
                 None => tab.pending.push_back(PendingScript {
                     lang,
                     name: format!("{url} (inline script)"),
                     body: Some(Ok(inline.into_bytes())),
+                    graph: None,
                 }),
             }
         }
@@ -524,9 +767,34 @@ impl Browser {
             if tab.pending.is_empty() {
                 if !tab.loaded {
                     tab.loaded = true;
+                    // After loading, only the per-call limit applies.
+                    for rt in tab.scripts.iter_mut().flatten() {
+                        rt.set_budget(None);
+                    }
                     self.fire_load(i, host);
                 }
                 return;
+            }
+            // Once the page's scripts used up their loading budget, the rest
+            // are skipped so the page shows without waiting for them.
+            let exhausted = tab
+                .runtimes
+                .get(JS_MIME)
+                .and_then(|&si| tab.scripts.get(si))
+                .and_then(|rt| rt.as_ref()?.budget())
+                .is_some_and(|b| b < PAGE_LOAD_FUEL / 100);
+            if exhausted
+                && matches!(
+                    tab.pending.front().map(|p| &p.lang),
+                    Some(Lang::Module | Lang::Source(_))
+                )
+            {
+                let skipped = tab.pending.len();
+                tab.pending.clear();
+                host.log(&format!(
+                    "skipped {skipped} scripts: the page's script time budget is used up"
+                ));
+                continue;
             }
             if !tab.pending.front().is_some_and(|p| p.body.is_some()) {
                 return;
@@ -541,6 +809,7 @@ impl Browser {
                 }
             };
             match p.lang {
+                Lang::Module => self.run_module(i, p.graph.unwrap_or_default(), host),
                 Lang::Wasm => self.start_wasm(i, &body, &p.name, host),
                 Lang::Runtime(mime) => self.start_runtime(i, &mime, &body, &p.name, host),
                 Lang::Source(mime) => {
@@ -552,6 +821,76 @@ impl Browser {
                 return;
             }
         }
+    }
+
+    /// Module `url` of module script `slot` arrived: records it, fetches
+    /// the modules it imports, and marks the script ready once its whole
+    /// graph is in.
+    fn module_loaded(
+        &mut self,
+        i: usize,
+        slot: usize,
+        url: &str,
+        result: Result<Vec<u8>, String>,
+        host: &mut dyn Host,
+    ) {
+        let (id, serial) = (self.tabs[i].id, self.tabs[i].serial);
+        let total = self.tabs[i].scripts_seen();
+        let tab = &mut self.tabs[i];
+        let map = tab.import_map.clone();
+        let index = slot.checked_sub(total - tab.pending.len());
+        let Some(p) = index.and_then(|k| tab.pending.get_mut(k)) else {
+            return;
+        };
+        let Some(g) = p.graph.as_mut() else { return };
+        g.waiting = g.waiting.saturating_sub(1);
+        let mut fetches = Vec::new();
+        match result {
+            Ok(bytes) => {
+                let src = String::from_utf8_lossy(&bytes).into_owned();
+                for spec in module_imports(&src) {
+                    let dep = crate::abi::resolve_module(&spec, url, &map);
+                    if g.seen.len() < MAX_MODULES && g.seen.insert(dep.clone()) {
+                        g.waiting += 1;
+                        fetches.push(dep);
+                    }
+                }
+                g.sources.push((url.to_string(), src));
+            }
+            Err(e) => host.log(&format!("{url}: {e}")),
+        }
+        if g.waiting == 0 {
+            p.body = Some(Ok(Vec::new()));
+        }
+        for dep in fetches {
+            let req = Request::Module {
+                tab: id,
+                serial,
+                slot,
+                url: dep.clone(),
+            };
+            self.fetch(req, &dep, host);
+        }
+        self.run_scripts(i, host);
+    }
+
+    /// Hands a fetched module graph to the JavaScript runtime and runs its
+    /// root (see the module protocol in doc/javascript.md).
+    fn run_module(&mut self, i: usize, graph: ModuleGraph, host: &mut dyn Host) {
+        let tab = &mut self.tabs[i];
+        if !tab.import_map_sent && !tab.import_map.is_empty() {
+            tab.import_map_sent = true;
+            let text: String = tab
+                .import_map
+                .iter()
+                .map(|(k, v)| format!("{k}\t{v}\n"))
+                .collect();
+            self.run_source(i, JS_MIME, &text, "rb-import-map", host);
+        }
+        for (url, src) in &graph.sources {
+            self.run_source(i, JS_MIME, src, &format!("rb-define-module:{url}"), host);
+        }
+        self.run_source(i, JS_MIME, "", &format!("rb-module:{}", graph.root), host);
     }
 
     /// `DOMContentLoaded` at the document, then `load` at the body.
@@ -604,7 +943,10 @@ impl Browser {
         let (now, offset) = (self.now, self.wall_offset(host));
         let t = &mut self.tabs[i];
         match Script::load_with(bytes, &mut t.doc, now, offset, Limits::RUNTIME) {
-            Ok(rt) if rt.is_runtime() => {
+            Ok(mut rt) if rt.is_runtime() => {
+                if !t.loaded {
+                    rt.set_budget(Some(PAGE_LOAD_FUEL));
+                }
                 t.scripts.push(Some(rt));
                 let si = t.scripts.len() - 1;
                 t.runtimes.insert(mime.to_string(), si);
@@ -628,7 +970,11 @@ impl Browser {
                     let data = mime.contains("json")
                         || matches!(
                             mime,
-                            "text/template" | "text/html" | "text/plain" | "text/x-template"
+                            "text/template"
+                                | "text/html"
+                                | "text/plain"
+                                | "text/x-template"
+                                | "speculationrules"
                         );
                     if !data {
                         host.log(&format!("{name}: no runtime for scripts of type {mime}"));
@@ -645,7 +991,17 @@ impl Browser {
         let Some(Some(rt)) = t.scripts.get_mut(si) else {
             return;
         };
-        match rt.eval(&mut t.doc, source, name, now) {
+        let started = profiling_now();
+        let result = rt.eval(&mut t.doc, source, name, now);
+        if let Some(t0) = started {
+            eprintln!(
+                "[profile] eval {:.0} ms, budget left {:?}: {}",
+                t0.elapsed().as_secs_f64() * 1000.0,
+                rt.budget(),
+                name.chars().take(100).collect::<String>()
+            );
+        }
+        match result {
             Ok(()) => {
                 self.after_script(i, si, host);
             }
@@ -776,9 +1132,28 @@ impl Browser {
                 let tab = &mut self.tabs[i];
                 let index = slot.checked_sub(total - tab.pending.len());
                 if let Some(p) = index.and_then(|k| tab.pending.get_mut(k)) {
-                    p.body = Some(result);
+                    match &p.graph {
+                        Some(g) => {
+                            let root = g.root.clone();
+                            return self.module_loaded(i, slot, &root, result, host);
+                        }
+                        None => p.body = Some(result),
+                    }
                 }
                 self.run_scripts(i, host);
+            }
+            Request::Module {
+                tab,
+                serial,
+                slot,
+                url,
+            } => {
+                if let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                {
+                    self.module_loaded(i, slot, &url, result, host);
+                }
             }
         }
     }
@@ -1858,9 +2233,18 @@ fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
             return None;
         }
         let src = dom.attr(n, "src").map(str::to_string);
-        let ty = dom.attr(n, "type").unwrap_or("");
+        let ty = dom
+            .attr(n, "type")
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        // `nomodule` scripts are fallbacks for browsers without modules.
+        if dom.attr(n, "nomodule").is_some() || ty == "importmap" {
+            return None;
+        }
         let wasm_src = src.as_deref().is_some_and(|s| s.ends_with(".wasm"));
-        let lang = match script_mime(ty) {
+        let lang = match script_mime(&ty) {
+            _ if ty == "module" => Lang::Module,
             Some(m) if m == JS_MIME && wasm_src => Lang::Wasm,
             Some(m) => Lang::Source(m),
             None => Lang::Wasm,
@@ -2142,6 +2526,19 @@ mod tests {
                 y: r.y + vp.y,
                 ..r
             },
+        );
+    }
+
+    #[test]
+    fn module_import_scanning() {
+        let src = r#"import a from "./a.js";import*as i from"./b.js";export{x}from'./c.js';
+            // import "./no.js"
+            const re = /"/g, s = "import './no2.js'"; import("./d.js"); import "./e.js";
+            const t = `from "./no3.js" ${f(`"./no5.js"`)} "x"`; x = a / 2; y = "./no4.js";
+            import "./f.js";"#;
+        assert_eq!(
+            module_imports(src),
+            ["./a.js", "./b.js", "./c.js", "./d.js", "./e.js", "./f.js"]
         );
     }
 

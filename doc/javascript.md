@@ -47,9 +47,28 @@ flowchart LR
 | 元素 | `id`、`className`、`classList`、`style`（含 `setProperty`）、`dataset`、`innerHTML`、`outerHTML`、`innerText`、`value`、`hidden`、`disabled`、`getAttribute` 等、`matches`、`closest`、`insertAdjacentHTML`、`click()` |
 | 事件 | `addEventListener`（含 `once`）、`removeEventListener`；事件物件的 `type`、`target`、`currentTarget`、`key`、`keyCode`、`shiftKey/ctrlKey/altKey/metaKey`、`clientX/clientY`、`button`、`preventDefault()`、`stopPropagation()`；`window.onload` 等屬性 |
 | 計時 | `setTimeout`、`setInterval`、`clearTimeout`、`clearInterval`、`requestAnimationFrame`、`queueMicrotask`、`performance.now()`、`Date.now()` |
-| 其他 | `console.log/info/warn/error`、`alert`（寫到主控台）、`location.href`（讀取與換頁）、`history.back/forward/go` |
+| 其他 | `console.log/info/warn/error`、`alert`（寫到主控台）、`location.href`（讀取與換頁）、`history.back/forward/go`（`pushState` / `replaceState` 只保存 state） |
+| 模組 | `<script type=module>`（外部與內嵌）、`import` / `export`、`import * as`、`export … from`、import map、`import.meta.url`；`nomodule` 腳本不執行 |
+| 幾何 | `getBoundingClientRect`、`offsetWidth/Height/Top/Left`、`clientWidth/Height`、`innerWidth/innerHeight`（上次排版的結果） |
+| Web API | `URL`、`URLSearchParams`、`customElements`（含升級已存在的元素、`connectedCallback`、`attributeChangedCallback`）、`DocumentFragment`、`localStorage` / `sessionStorage`（只存在於這一頁）、`document.cookie`（同上）、`navigator`、`matchMedia`（一律不符合）、`TextEncoder/Decoder`、`atob/btoa`、`crypto.getRandomValues/randomUUID`、`structuredClone`、`AbortController`、`CustomEvent`、`dispatchEvent`、`DOMParser`、簡化的 `Intl`、`requestIdleCallback`；`MutationObserver`、`ResizeObserver`、`IntersectionObserver`（所有元素都算可見） |
 
-尚未支援：`fetch` / `XMLHttpRequest`、`localStorage`、`getComputedStyle`、`getBoundingClientRect`、canvas、表單送出事件（第二階段 H12 後補）。
+尚未支援：網路（`fetch` / `XMLHttpRequest` 會像離線一樣失敗）、canvas、Web Worker、WebSocket、shadow DOM 的繪製。
+
+### 模組協定
+
+瀏覽器先抓齊一個模組腳本的整個靜態 import 圖（解析 `import … from`、`import "…"`、`export … from` 與字面值的 `import("…")`，最多 400 個模組），再依序呼叫 runtime 的 `rb_eval`，以名稱表示動作：
+
+| 名稱 | 原始碼 | 作用 |
+|---|---|---|
+| `rb-import-map` | 每行 `specifier\tURL` | 設定 import map |
+| `rb-define-module:URL` | 模組原始碼 | 登記模組（尚不執行） |
+| `rb-module:URL` | （空） | 連結並執行該模組 |
+
+兩邊都用 `abi::resolve_module` 解析 specifier，所以模組的 URL 一致。
+
+### 執行時間
+
+載入頁面時，所有腳本合計最多約 80 億 fuel（約 3 秒）；用完後其餘的腳本會略過，讓頁面先顯示。載入完成後，每次呼叫（事件、計時器）最多 100 億 fuel。
 
 ## 3. 錯誤
 

@@ -11,15 +11,20 @@
 //! `js_runtime`, target `wasm32-unknown-unknown`).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
+use boa_engine::builtins::promise::PromiseState;
 use boa_engine::context::time::JsInstant;
 use boa_engine::context::{Clock, HostHooks};
+use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::JsArray;
 use boa_engine::property::Attribute;
 use boa_engine::{
-    Context, JsArgs, JsError, JsResult, JsString, JsValue, NativeFunction, Source, js_string,
+    Context, JsArgs, JsError, JsResult, JsString, JsValue, Module, NativeFunction, Source,
+    js_error, js_string,
 };
 
 use crate::sdk::{ffi, read_string};
@@ -391,11 +396,104 @@ fn call_global(name: &str, id: i32) {
     });
 }
 
+/// ES modules: sources the browser fetched (by URL), parsed on demand.
+/// The browser sends every module of a graph before evaluating its root.
+#[derive(Default)]
+struct UrlModules {
+    sources: RefCell<HashMap<String, String>>,
+    modules: RefCell<HashMap<String, Module>>,
+    /// Import map entries (`specifier` or `prefix/` → URL).
+    import_map: RefCell<Vec<(String, String)>>,
+}
+
+thread_local! {
+    static MODULES: Rc<UrlModules> = Rc::new(UrlModules::default());
+}
+
+impl UrlModules {
+    /// The parsed module at `url`, if its source was provided.
+    fn get(&self, url: &str, ctx: &mut Context) -> JsResult<Module> {
+        if let Some(m) = self.modules.borrow().get(url) {
+            return Ok(m.clone());
+        }
+        let src = self
+            .sources
+            .borrow()
+            .get(url)
+            .cloned()
+            .ok_or_else(|| js_error!(TypeError: "module not loaded: {}", url))?;
+        let module = Module::parse(
+            Source::from_bytes(&src).with_path(Path::new(url)),
+            None,
+            ctx,
+        )?;
+        self.modules
+            .borrow_mut()
+            .insert(url.to_string(), module.clone());
+        Ok(module)
+    }
+}
+
+impl ModuleLoader for UrlModules {
+    async fn load_imported_module(
+        self: Rc<Self>,
+        referrer: Referrer,
+        request: ModuleRequest,
+        context: &RefCell<&mut Context>,
+    ) -> JsResult<Module> {
+        let base = referrer
+            .path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let url = crate::abi::resolve_module(
+            &request.specifier().to_std_string_escaped(),
+            &base,
+            &self.import_map.borrow(),
+        );
+        self.get(&url, &mut context.borrow_mut())
+    }
+
+    fn init_import_meta(
+        self: Rc<Self>,
+        import_meta: &boa_engine::JsObject,
+        module: &Module,
+        context: &mut Context,
+    ) {
+        // `import.meta.url` (bundlers derive their public path from it).
+        if let Some(path) = module.path() {
+            let url = JsString::from(path.to_string_lossy().as_ref());
+            let _ = import_meta.set(js_string!("url"), url, false, context);
+        }
+    }
+}
+
+/// Evaluates the module at `url` (its graph was provided already).
+fn run_module(url: &str, ctx: &mut Context) {
+    let loader = MODULES.with(Rc::clone);
+    let result = loader.get(url, ctx).and_then(|m| {
+        let promise = m.load_link_evaluate(ctx);
+        ctx.run_jobs()?;
+        Ok(promise)
+    });
+    match result {
+        Ok(p) => {
+            if let PromiseState::Rejected(e) = p.state() {
+                log(&format!("Uncaught {} ({url})", e.display()));
+            }
+        }
+        Err(e) => {
+            let value = e.into_opaque(ctx).unwrap_or_default();
+            log(&format!("Uncaught {} ({url})", value.display()));
+        }
+    }
+}
+
 /// `rb_init`: creates the engine and the browser environment.
 pub fn init() {
     let mut ctx = Context::builder()
         .clock(Rc::new(HostClock))
         .host_hooks(Rc::new(Hooks))
+        .module_loader(MODULES.with(Rc::clone))
         .build()
         .expect("create JavaScript context");
     let mut rb = ObjectInitializer::new(&mut ctx);
@@ -435,6 +533,27 @@ pub unsafe fn eval(src: *const u8, len: usize, name: *const u8, name_len: usize)
         )
     };
     BUFFERS.with(|b| b.borrow_mut().clear());
+    // Module protocol (see doc/javascript.md): the name says what to do.
+    if let Some(url) = name.strip_prefix("rb-define-module:") {
+        let src = String::from_utf8_lossy(&source).into_owned();
+        MODULES.with(|m| m.sources.borrow_mut().insert(url.to_string(), src));
+        return;
+    }
+    if name == "rb-import-map" {
+        let text = String::from_utf8_lossy(&source).into_owned();
+        let map: Vec<(String, String)> = text
+            .lines()
+            .filter_map(|l| l.split_once('\t'))
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        MODULES.with(|m| *m.import_map.borrow_mut() = map);
+        return;
+    }
+    if let Some(url) = name.strip_prefix("rb-module:") {
+        let url = url.to_string();
+        with_context(|ctx| run_module(&url, ctx));
+        return;
+    }
     with_context(|ctx| {
         if let Err(e) = ctx.eval(Source::from_bytes(&source)) {
             let value = e.into_opaque(ctx).unwrap_or_default();
