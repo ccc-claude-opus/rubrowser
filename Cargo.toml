@@ -77,3 +77,6 @@ required-features = ["sdk"]
 name = "stopwatch"
 crate-type = ["cdylib"]
 required-features = ["sdk"]
+
+[package.metadata.docs.rs]
+features = ["native", "sdk"]

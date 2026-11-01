@@ -6,7 +6,7 @@
 /// A color in `0x00RRGGBB` format.
 pub type Color = u32;
 
-/// A rectangle; physical pixels on a [`Canvas`], logical ones on a [`Painter`].
+/// A rectangle in pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub struct Rect {
     pub x: i32,

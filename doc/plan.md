@@ -83,31 +83,27 @@ flowchart LR
 ```rust
 use rubrowser::sdk::*;
 
-struct Counter;
-
-impl Script for Counter {
-    fn init(&mut self) {
-        query("#inc").on("click");
-    }
-    fn event(&mut self, e: Event) {
-        let count = query("#count");
-        let n: i32 = count.text().parse().unwrap_or(0);
-        count.set_text(&(n + 1).to_string());
-    }
+fn init() {
+    let count = query("#count").unwrap();
+    let mut n = 0;
+    query("#inc").unwrap().on("click", move |_| {
+        n += 1;
+        count.set_text(&n.to_string());
+    });
 }
 
-script!(Counter);
+rubrowser::script!(init);
 ```
 
 | 項目 | 設計 |
 |---|---|
 | 節點參照 | 整數 handle |
 | DOM API | `query`、`query_all`、`text` / `set_text`、`attr` / `set_attr`、`add_class` / `remove_class`、`set_style`、`create_element`、`append`、`remove`、`value` / `set_value` |
-| 事件 | `on(handle, "click")` 登記，事件發生時呼叫 wasm 匯出的 `rb_event` |
+| 事件 | `on("click", 閉包)` 登記，事件冒泡；瀏覽器呼叫 wasm 匯出的 `rb_event` |
 | 其他 | `navigate`、`log`、`set_timeout` |
 | 沙箱 | 每次呼叫有 fuel 上限、記憶體上限；崩潰只影響自己的分頁 |
 
-完整 ABI 寫在 `doc/abi.md`（H8）。
+完整 ABI 寫在 [abi.md](abi.md)，教學在 [scripting.md](scripting.md)，架構說明在 [architecture.md](architecture.md)。
 
 ## 4. HTML / CSS 支援範圍（第一版）
 
@@ -153,15 +149,15 @@ src/
 | M0 | 單一 crate 骨架，原生與網頁版都能顯示畫面 | `cargo publish --dry-run` 通過 | ✅ |
 | M1 | 軟體繪圖、點陣字、高 DPI | 畫出靜態外框 | ✅ |
 | 基礎 | 輸入事件、URL、TextField、wasm 執行環境 | 單元測試通過 | ✅ |
-| **H1** 文字 | fontdue、DejaVu、量測、字形快取 | 畫出不同大小、粗細的比例字 | |
-| **H2** DOM + HTML | 自己的 DOM、html5ever TreeSink | 解析 HTML 得到正確 DOM 樹 | |
-| **H3** CSS | UA 樣式表、選擇器比對、cascade、繼承、值解析 | 每個節點算得出 computed style | |
-| **H4** 排版 + 繪製 | box tree、taffy、行內排版、背景、邊框、文字 | `rubrowser page.html` 畫出靜態網頁 | |
-| **H5** 互動 | hit-test、`:hover` `:active` `:focus`、連結、捲動 | 點擊連結能換頁 | |
-| **H6** HTML 外框 | `chrome.html` / `chrome.css`、分頁、歷史、載入 http / file | 整個瀏覽器由 HTML + CSS 畫出 | |
-| **H7** 表單 | `<input>` 編輯、`<button>`、Tab 切換焦點 | 網址列可完整編輯 | |
-| **H8** wasm 腳本 | `<script type="application/wasm">`、DOM API、SDK、範例 | counter、todo 範例可運作 | |
-| **H9** 收尾 | 網頁 canvas 版、文件、`cargo publish --dry-run` | 交給作者發佈 | |
+| **H1** 文字 | fontdue、DejaVu、量測、字形快取 | 畫出不同大小、粗細的比例字 |✅ |
+| **H2** DOM + HTML | 自己的 DOM、html5ever TreeSink | 解析 HTML 得到正確 DOM 樹 |✅ |
+| **H3** CSS | UA 樣式表、選擇器比對、cascade、繼承、值解析 | 每個節點算得出 computed style |✅ |
+| **H4** 排版 + 繪製 | box tree、taffy、行內排版、背景、邊框、文字 | `rubrowser page.html` 畫出靜態網頁 |✅ |
+| **H5** 互動 | hit-test、`:hover` `:active` `:focus`、連結、捲動 | 點擊連結能換頁 |✅ |
+| **H6** HTML 外框 | `chrome.html` / `chrome.css`、分頁、歷史、載入 http / file | 整個瀏覽器由 HTML + CSS 畫出 |✅ |
+| **H7** 表單 | `<input>` 編輯、`<button>`、Tab 切換焦點 | 網址列可完整編輯 |✅ |
+| **H8** wasm 腳本 | `<script type="application/wasm">`、DOM API、SDK、範例 | counter、todo 範例可運作 |✅ |
+| **H9** 收尾 | 網頁 canvas 版、文件、`cargo publish --dry-run` | 交給作者發佈 |✅ |
 | 後期 | `img`、`table`、`position`、`border-radius`、中文字型、IME | | |
 
 ## 7. 已知風險

@@ -614,6 +614,19 @@ mod tests {
     }
 
     #[test]
+    fn abi_doc_example_works() {
+        let doc_md = include_str!("../../doc/abi.md");
+        let start = doc_md.find("```wat").unwrap() + 6;
+        let end = start + doc_md[start..].find("```").unwrap();
+        let mut doc = Document::from_html("<button id=btn>Go</button>", "t.html");
+        let mut s = Script::load(&wasm(&doc_md[start..end]), &mut doc, 0.0).unwrap();
+        let btn = doc.dom.element_by_id("btn").unwrap();
+        let l = s.listeners()[0].clone();
+        s.dispatch(&mut doc, l.id, btn, 0, 0, 0.0).unwrap();
+        assert_eq!(doc.dom.text_content(btn), "Clicked!");
+    }
+
+    #[test]
     fn rejects_invalid_modules() {
         let mut doc = page();
         assert!(Script::load(b"nope", &mut doc, 0.0).is_err());

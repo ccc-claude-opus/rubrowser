@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (native)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Clippy (web)
+        run: cargo clippy --lib --target wasm32-unknown-unknown --no-default-features --features web -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Engine without a platform
+        run: cargo check --no-default-features --features core
+      - name: Page scripts (sdk only)
+        run: cargo build --profile page --target wasm32-unknown-unknown --no-default-features --features sdk --example counter --example todo --example stopwatch
+      - name: Web version
+        run: cargo rustc --lib --release --target wasm32-unknown-unknown --no-default-features --features web --crate-type cdylib
+      - name: Package
+        run: cargo package --allow-dirty
