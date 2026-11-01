@@ -1314,14 +1314,36 @@ fn font_weight(v: &str, parent_bold: bool) -> Option<bool> {
     }
 }
 
+/// The first family in the list that maps to a bundled face.
 fn font_family(v: &str) -> Family {
     let v = v.to_ascii_lowercase();
-    let mono = ["mono", "courier", "consolas", "menlo", "monaco"];
-    if mono.iter().any(|m| v.contains(m)) {
-        Family::Mono
-    } else {
-        Family::Sans
+    let mono = ["mono", "courier", "consolas", "menlo", "monaco", "code"];
+    let serif = [
+        "serif",
+        "georgia",
+        "times",
+        "libertine",
+        "garamond",
+        "palatino",
+        "cambria",
+        "baskerville",
+        "charter",
+        "book",
+        "merriweather",
+    ];
+    for name in v.split(',') {
+        let name = name.trim().trim_matches(|c| c == '"' || c == '\'');
+        if mono.iter().any(|m| name.contains(m)) {
+            return Family::Mono;
+        }
+        if name.contains("sans") {
+            return Family::Sans;
+        }
+        if serif.iter().any(|m| name.contains(m)) {
+            return Family::Serif;
+        }
     }
+    Family::Sans
 }
 
 fn line_height(v: &str, fc: FontContext) -> Option<LineHeight> {

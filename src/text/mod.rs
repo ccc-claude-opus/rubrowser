@@ -16,6 +16,7 @@ pub enum Family {
     #[default]
     Sans,
     Mono,
+    Serif,
 }
 
 /// Selects one of the bundled font faces.
@@ -32,7 +33,7 @@ impl FontKey {
     }
 
     fn data(&self) -> &'static [u8] {
-        use dejavu::{sans, sans_mono};
+        use dejavu::{sans, sans_mono, serif};
         match (self.family, self.bold, self.italic) {
             (Family::Sans, false, false) => sans::regular(),
             (Family::Sans, true, false) => sans::bold(),
@@ -42,6 +43,10 @@ impl FontKey {
             (Family::Mono, true, false) => sans_mono::bold(),
             (Family::Mono, false, true) => sans_mono::oblique(),
             (Family::Mono, true, true) => sans_mono::bold_oblique(),
+            (Family::Serif, false, false) => serif::regular(),
+            (Family::Serif, true, false) => serif::bold(),
+            (Family::Serif, false, true) => serif::italic(),
+            (Family::Serif, true, true) => serif::bold_italic(),
         }
     }
 }
@@ -64,7 +69,9 @@ struct Glyph {
 /// The bundled fonts, parsed on first use, plus a glyph bitmap cache.
 #[derive(Default)]
 pub struct Fonts {
-    faces: [OnceCell<Font>; 8],
+    faces: [OnceCell<Font>; 12],
+    /// A system font for characters DejaVu lacks (CJK…), loaded on first use.
+    fallback: OnceCell<Option<Font>>,
     /// (face, char, physical size in 1/4 px) → rasterized glyph.
     glyphs: RefCell<HashMap<(usize, char, u32), Glyph>>,
 }
@@ -82,6 +89,33 @@ impl Fonts {
         })
     }
 
+    /// Index used for the fallback face in the glyph cache.
+    const FALLBACK: usize = 12;
+
+    fn fallback(&self) -> Option<&Font> {
+        self.fallback.get_or_init(load_fallback).as_ref()
+    }
+
+    /// The face that draws `c`: the requested one, else regular DejaVu Sans
+    /// (same weight/style), else the system fallback font.
+    fn face_for(&self, key: FontKey, c: char) -> (usize, &Font) {
+        let font = self.face(key);
+        if c.is_whitespace() || c.is_control() || font.lookup_glyph_index(c) != 0 {
+            return (key.index(), font);
+        }
+        let sans = FontKey {
+            family: Family::Sans,
+            ..key
+        };
+        if key.family != Family::Sans && self.face(sans).lookup_glyph_index(c) != 0 {
+            return (sans.index(), self.face(sans));
+        }
+        match self.fallback().filter(|f| f.lookup_glyph_index(c) != 0) {
+            Some(f) => (Self::FALLBACK, f),
+            None => (key.index(), font),
+        }
+    }
+
     pub fn line_metrics(&self, key: FontKey, size: f32) -> LineMetrics {
         match self.face(key).horizontal_line_metrics(size) {
             Some(m) => LineMetrics {
@@ -97,18 +131,19 @@ impl Fonts {
 
     /// Advance of each char of `text` at `size`, including kerning.
     pub fn advances(&self, key: FontKey, size: f32, text: &str) -> Vec<f32> {
-        let font = self.face(key);
         let mut out = Vec::with_capacity(text.len());
-        let mut prev: Option<char> = None;
+        let mut prev: Option<(char, usize)> = None;
         for c in text.chars() {
+            let (face, font) = self.face_for(key, c);
             let kern = prev
-                .and_then(|p| font.horizontal_kern(p, c, size))
+                .filter(|&(_, f)| f == face)
+                .and_then(|(p, _)| font.horizontal_kern(p, c, size))
                 .unwrap_or(0.0);
             if let Some(last) = out.last_mut() {
                 *last += kern;
             }
             out.push(font.metrics(c, size).advance_width);
-            prev = Some(c);
+            prev = Some((c, face));
         }
         out
     }
@@ -131,7 +166,6 @@ impl Fonts {
         text: &str,
         color: Color,
     ) -> f32 {
-        let face = key.index();
         let size_q = (size * 4.0).round() as u32;
         let advances = self.advances(key, size, text);
         let mut pen = x;
@@ -141,8 +175,9 @@ impl Fonts {
         }
         for (c, adv) in text.chars().zip(advances) {
             if !c.is_whitespace() {
+                let (face, font) = self.face_for(key, c);
                 let g = cache.entry((face, c, size_q)).or_insert_with(|| {
-                    let (m, coverage) = self.face(key).rasterize(c, size);
+                    let (m, coverage) = font.rasterize(c, size);
                     Glyph {
                         xmin: m.xmin,
                         ymin: m.ymin,
@@ -159,6 +194,35 @@ impl Fonts {
         }
         pen - x
     }
+}
+
+/// Loads the first available system font with wide Unicode (CJK)
+/// coverage; `RUBROWSER_FALLBACK_FONT` names one explicitly.
+fn load_fallback() -> Option<Font> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let custom = std::env::var("RUBROWSER_FALLBACK_FONT").ok();
+        let paths = [
+            "/System/Library/Fonts/STHeiti Medium.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+            "C:\\Windows\\Fonts\\msyh.ttc",
+            "C:\\Windows\\Fonts\\simsun.ttc",
+        ];
+        for path in custom.iter().map(String::as_str).chain(paths) {
+            if let Ok(bytes) = std::fs::read(path)
+                && let Ok(font) = Font::from_bytes(bytes, FontSettings::default())
+            {
+                return Some(font);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
