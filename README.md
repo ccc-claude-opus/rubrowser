@@ -5,8 +5,9 @@ A browser based on wasm. (RUST)
 rubrowser draws an entire web browser on a **blank canvas** — a native window's pixel buffer, or a single HTML `<canvas>`. It lays out and paints **HTML + CSS** itself, and **only executes WebAssembly**: page scripts are wasm modules, and **JavaScript runs inside a JS engine compiled to wasm** ([boa](https://crates.io/crates/boa_engine)). Even the browser's own tabs, toolbar and address bar are an HTML/CSS document rendered by the same engine.
 
 - HTML parsed by [`html5ever`](https://crates.io/crates/html5ever) into rubrowser's own DOM
-- CSS selectors and cascade with [`simplecss`](https://crates.io/crates/simplecss); block and flex layout with [`taffy`](https://crates.io/crates/taffy); inline layout written from scratch
-- Text rendered with [`fontdue`](https://crates.io/crates/fontdue) and the bundled DejaVu fonts
+- Its own CSS engine (parser, selectors, `@media`/`@supports`/`@layer`, `var()`, `calc()`); block, flex and grid layout with [`taffy`](https://crates.io/crates/taffy); inline layout written from scratch
+- Text rendered with [`fontdue`](https://crates.io/crates/fontdue): the system's Arial/Georgia when installed (so text wraps like in other browsers), the bundled DejaVu fonts otherwise, and a system CJK font for Chinese/Japanese
+- SVG (`<img>`, inline `<svg>`, `mask-image` icons) rasterized with [`resvg`](https://crates.io/crates/resvg)
 - Page scripts are wasm modules run by [`wasmi`](https://crates.io/crates/wasmi), sandboxed with fuel and memory limits
 - `<script>` JavaScript, inline `onclick` handlers and a familiar DOM API, executed by `js.wasm` (see [doc/javascript.md](doc/javascript.md))
 
@@ -25,6 +26,18 @@ Open a file or URL directly:
 ```bash
 rubrowser page.html
 ```
+
+Real sites such as Wikipedia and GitHub render close to other browsers. Run without JavaScript, or render a page to a PNG without opening a window:
+
+```bash
+rubrowser --no-js https://en.wikipedia.org/wiki/Rust_(programming_language)
+```
+
+```bash
+rubrowser --screenshot out.png --width 1280 --height 900 https://github.com/rust-lang/rust
+```
+
+Debugging aids for `--screenshot`: `RUBROWSER_DUMP=selector` prints the layout boxes under an element, `RUBROWSER_PROFILE=1` prints style and layout times.
 
 Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`, `about:events` (Rust/wasm), `about:js-todo`, `about:calc` (JavaScript) and `about:form`.
 
@@ -112,9 +125,9 @@ Then open <http://localhost:8000>. Append `#URL` to open a page, e.g. `http://lo
 
 ## Supported HTML and CSS
 
-A practical subset: block, inline, inline-block, flex and table layout; floats, absolute and fixed positioning, z-index; margins, padding, borders (solid, dashed, dotted, double), rounded corners, outlines, opacity; background colors and images; fonts, line height, text alignment, white-space, decorations, `text-transform`, sub/superscript, lists; `overflow` scrolling; `:hover`, `:active`, `:focus`; links; images (PNG, JPEG, GIF, WebP, BMP, `data:` URLs); forms (text, password, textarea, checkbox, radio, select, buttons, labels, GET submission); `<details>`. See [doc/plan.md](doc/plan.md), [doc/plan2.md](doc/plan2.md) and [doc/architecture.md](doc/architecture.md).
+A practical subset: block, inline, inline-block, flex, grid and table layout; floats, absolute, fixed and sticky positioning, z-index; margins, padding, borders (solid, dashed, dotted, double), rounded corners, outlines, opacity; background colors and images; fonts, line height, text alignment, white-space, decorations, `text-transform`, sub/superscript, lists, `::before`/`::after` content with counters; `overflow` scrolling; `:hover`, `:active`, `:focus`; links; images (PNG, JPEG, GIF, WebP, BMP, SVG, `data:` URLs), inline SVG, `mask-image`; `#fragment` links; forms (text, password, textarea, checkbox, radio, select, buttons, labels, GET submission); `<details>`. See [doc/plan.md](doc/plan.md), [doc/plan2.md](doc/plan2.md), [doc/plan3.md](doc/plan3.md) and [doc/architecture.md](doc/architecture.md).
 
-Not supported yet: CJK fonts and IME, `fetch`/`XMLHttpRequest`, `localStorage`, form POST, CSS grid/transforms/animations, video and canvas.
+Not supported yet: IME, `fetch`/`XMLHttpRequest`, `localStorage`, form POST, CSS transforms/animations, right-to-left text, video and canvas.
 
 ## License
 

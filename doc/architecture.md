@@ -16,7 +16,7 @@ flowchart TB
   end
   subgraph Doc["document：一份可互動的文件"]
     DOM["dom<br/>html5ever → arena"]
-    CSS["css<br/>simplecss + cascade"]
+    CSS["css<br/>解析器、選擇器、cascade"]
     LAY["layout<br/>taffy + 行內排版"]
     PAINT["paint"]
   end
@@ -36,15 +36,15 @@ flowchart TB
 | 模組 | 職責 |
 |---|---|
 | `gfx` | `Canvas`：`0x00RRGGBB` 像素、裁切、alpha 混色、反鋸齒圓角矩形 |
-| `text` | 內附 DejaVu Sans / Mono（一般、粗體、斜體），量測、字形快取、繪製 |
+| `text` | 系統的 Arial / Georgia（有的話）或內附 DejaVu Sans / Serif / Mono，缺字時退回 DejaVu 與系統中文字型；量測、字形快取、繪製 |
 | `dom` | 以 `NodeId` 索引的節點陣列；`html5ever` 透過 `TreeSink` 直接建樹 |
-| `css` | UA 樣式表、選擇器比對（`simplecss`）、cascade、繼承、computed `Style` |
-| `layout` | box tree；block / flex 交給 `taffy`，行內內容是自己算的葉節點 |
+| `css` | 自寫的 CSS 解析器（`@media`、`@supports`、`@layer`、`@import`、巢狀）、選擇器引擎、依最右側選擇器分桶的 cascade、`var()` / `calc()`、偽元素與 `content`、computed `Style` |
+| `layout` | box tree；block / flex / grid / float 交給 `taffy`，行內內容是自己算的葉節點；`::before` / `::after` 是 DOM 之後的合成節點 |
 | `paint` | 背景、邊框、圓角、文字、底線、清單符號、輸入框、捲軸 |
 | `document` | 把上面串成一份文件：重新計算、hit-test、hover / focus、捲動、輸入框狀態 |
 | `script` | 在 wasmi 中執行網頁的 wasm，提供 DOM API（見 [abi.md](abi.md)） |
 | `lang` | 語言 runtime：`lang::js` 把 boa 編成 `js.wasm`（見 [javascript.md](javascript.md)、[languages.md](languages.md)） |
-| `document::forms` / `document::image` | 表單控制項狀態、圖片解碼與縮放快取 |
+| `document::forms` / `document::image` | 表單控制項狀態、圖片解碼與縮放快取；SVG 以 `resvg` 依繪製大小點陣化 |
 | `browser` | 外框文件、分頁、歷史、載入、事件分派、快捷鍵 |
 | `net::url` | 網址列輸入、相對網址解析 |
 | `ui::TextField` | `<input>` 的編輯邏輯：游標、選取、單字移動、剪貼簿 |

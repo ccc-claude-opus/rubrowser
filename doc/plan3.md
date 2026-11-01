@@ -12,7 +12,7 @@
 | Threads | `<body>` 只有一個空的 `<div>` | 86 KB 內嵌 | **全部由 JS 產生**，第三階段不處理（只保證不當掉） |
 | Facebook | — | — | 依指示先不處理 |
 
-目前的 CSS 引擎（`simplecss`）無法處理以上大部分語法：它會跳過 `@media`、`@supports` 和其中的所有規則，也不支援 `var()`、`:not()`、偽元素。**所以第三階段的核心是一套新的 CSS 引擎。**
+第三階段開始時的 CSS 引擎（`simplecss`）無法處理以上大部分語法：它會跳過 `@media`、`@supports` 和其中的所有規則，也不支援 `var()`、`:not()`、偽元素。**所以第三階段的核心是一套新的 CSS 引擎。**
 
 ## 2. 驗證方式
 
@@ -43,3 +43,24 @@ rubrowser --screenshot out.png --width 1280 --height 900 https://en.wikipedia.or
 
 - **JS 驅動的網站**（Threads、Facebook、X 的動態內容）需要 `fetch`/XHR、大量 DOM API 與極大的 JS 程式；在 wasm 直譯器中執行 MB 級的 JS 會非常慢。第三階段的策略是：保證這些網站不會讓瀏覽器卡住，靜態 HTML 能呈現多少就呈現多少。
 - 不做 CSS 動畫、transition、transform、box-shadow（可能以後補）。
+
+## 5. 進度（2026-11-01）
+
+| 階段 | 狀態 | 備註 |
+|---|---|---|
+| W0 | 完成 | `--screenshot`、轉址、User-Agent；`--no-js`；除錯用 `RUBROWSER_DUMP`、`RUBROWSER_PROFILE` |
+| W1 | 完成 | 另外支援 `@layer` 的優先順序（未分層 > 後宣告的層 > 先宣告的層，`!important` 反過來）、邏輯屬性（`margin-inline`、`padding-block`…）、`@media` 中的 `calc()` |
+| W2 | 完成 | `content` 的字串、跳脫、`attr()`、`counter()` / `counters()`、引號；`::before` / `::after` 以 DOM 之後的合成節點排版；`::marker` 的 `content` 尚未支援 |
+| W3 | 完成 | grid、float 旁的文字、`display: contents`、`position: sticky`（繪製與 hit-test 時位移）；inline-block 依容器寬度 shrink-to-fit（第二次排版）；行內元素的左右 margin / padding；空區塊的 margin 可以穿透合併 |
+| W4 | 完成 | `resvg`：SVG 圖片依繪製大小點陣化、內嵌 `<svg>`（還原 SVG 標籤大小寫、`currentColor`）、`mask-image`；`srcset` / `<picture>` 尚未支援 |
+| W5 | 完成 | 原生版優先使用系統的 Arial / Georgia（或 Liberation），斷行位置與 Chrome 幾乎一致；DejaVu Serif；缺字退回 DejaVu |
+| W6 | 部分 | Wikipedia 樣式計算約 40–100 ms、排版約 40–60 ms；GitHub（4.8 MB CSS）樣式約 100 ms。滑鼠移動造成的重算尚未做增量 |
+| W7 | Wikipedia、GitHub 完成 | 兩站的版面位置與 Chrome 對齊到數個像素以內；GitHub 由 React 產生的內容（最後提交、分支數）不會出現 |
+| W8 | 完成 | `#片段` 連結在頁內捲動、上一頁不重新載入、載入中保持錨點位置；`html { height: 100% }` 的網站可以捲動 |
+| W9 | 部分 | 中文、日文以系統字型顯示；韓文需要另外的字型；IME 尚未支援 |
+
+### 已知差異
+
+- Wikipedia 頁首的 Log in 會換行（搜尋框的 flex basis 比 Chrome 大）；主選單圖示只顯示一條線。
+- 需要 JS 的部分（Wikipedia 的外觀設定面板、目錄折疊，GitHub 的檔案列表最後提交欄）不會出現。
+- X、Threads 只保證不當掉。
