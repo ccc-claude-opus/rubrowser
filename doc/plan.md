@@ -1,5 +1,7 @@
 # rubrowser 開發規劃
 
+> 第二階段（JavaScript、DOM、更完整的 HTML）見 [plan2.md](plan2.md)。
+
 rubrowser 是一個用 Rust 寫的瀏覽器，畫在**一塊空白畫布**上（原生視窗的像素緩衝區，或網頁上的單一 `<canvas>`）。
 
 - 網頁使用 **HTML + CSS**，由 rubrowser 自己排版、自己畫。
