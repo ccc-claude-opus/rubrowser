@@ -126,6 +126,8 @@ struct Ctx {
     inline: Option<Content>,
     /// Content size of a replaced element such as `<input>`.
     intrinsic: Option<(f32, f32)>,
+    /// Whether that size has a fixed aspect ratio (images, not controls).
+    keeps_ratio: bool,
 }
 
 struct Builder<'a> {
@@ -240,6 +242,8 @@ fn layout_pass(
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
+        // Fractional sizes: rounding would cut text boxes short and wrap.
+        tree.disable_rounding();
         let root_style = Style {
             display: Display::Block,
             size: Size {
@@ -268,6 +272,15 @@ fn layout_pass(
 }
 
 impl Builder<'_> {
+    /// Whether element `id` has a percentage (or calc with %) width.
+    fn percent_width(&self, id: NodeId) -> bool {
+        self.style(id).is_some_and(|s| match s.width {
+            Dim::Percent(_) => true,
+            Dim::Calc(_, p) => p != 0.0,
+            _ => false,
+        })
+    }
+
     /// Children of `id` including generated `::before` / `::after` boxes.
     fn kids(&self, id: NodeId) -> Vec<NodeId> {
         let base = self.dom.len();
@@ -318,7 +331,8 @@ impl Builder<'_> {
                     |known, avail| {
                         if let Some((w, h)) = ctx.as_ref().and_then(|c| c.intrinsic) {
                             // Keep the natural aspect ratio when one side is set.
-                            let ratio = (w > 0.0 && h > 0.0).then(|| h / w);
+                            let keeps = ctx.as_ref().is_some_and(|c| c.keeps_ratio);
+                            let ratio = (keeps && w > 0.0 && h > 0.0).then(|| h / w);
                             return match (known.width, known.height, ratio) {
                                 (Some(kw), None, Some(r)) => Size {
                                     width: kw,
@@ -392,6 +406,7 @@ impl Builder<'_> {
                 style_node: id,
                 inline: None,
                 intrinsic: Some(size),
+                keeps_ratio: false,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -405,6 +420,7 @@ impl Builder<'_> {
                 style_node: id,
                 inline: None,
                 intrinsic: Some(size),
+                keeps_ratio: true,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -435,6 +451,7 @@ impl Builder<'_> {
                 style_node: id,
                 inline: Some(Content { owner: id, items }),
                 intrinsic: None,
+                keeps_ratio: false,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -467,6 +484,7 @@ impl Builder<'_> {
                         style_node: id,
                         inline: Some(content),
                         intrinsic: None,
+                        keeps_ratio: false,
                     };
                     kids.push(tree.new_leaf_with_context(anon, ctx).unwrap());
                 }
@@ -480,6 +498,7 @@ impl Builder<'_> {
                 style_node: id,
                 inline: None,
                 intrinsic: None,
+                keeps_ratio: false,
             }),
         )
         .unwrap();
@@ -567,7 +586,16 @@ impl Builder<'_> {
     /// index and margin-box size.
     fn atomic(&mut self, id: NodeId) -> (usize, f32, f32, f32) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
+        // Fractional sizes: rounding would cut text boxes short and wrap.
+        tree.disable_rounding();
         let node = self.build(&mut tree, id);
+        // A percentage width needs the container's width, known only in
+        // the next pass; until then the box takes its intrinsic width.
+        if self.percent_width(id) && !self.caps.contains_key(&id) {
+            let mut st = tree.style(node).unwrap().clone();
+            st.size.width = Dimension::auto();
+            tree.set_style(node, st).unwrap();
+        }
         // Shrink-to-fit: lay out at max-content, capped by the container
         // width (once known) or the viewport.
         let avail = self.caps.get(&id).copied().unwrap_or(self.viewport.0);
@@ -640,10 +668,12 @@ impl Builder<'_> {
             for item in &content.items {
                 if let inline::Item::Atomic { index, width, .. } = *item {
                     let node = self.boxes[index].node;
-                    if let Some(n) = node.filter(|_| width > w + 0.5 && w > 0.0) {
-                        if !self.caps.contains_key(&n) {
-                            self.overflow.insert(n, w);
-                        }
+                    let Some(n) = node.filter(|_| w > 0.0) else {
+                        continue;
+                    };
+                    let wants = width > w + 0.5 || self.percent_width(n);
+                    if wants && !self.caps.contains_key(&n) {
+                        self.overflow.insert(n, w);
                     }
                 }
             }
@@ -863,6 +893,7 @@ impl Builder<'_> {
                     style_node: row,
                     inline: None,
                     intrinsic: None,
+                    keeps_ratio: false,
                 };
                 kids.push(tree.new_leaf_with_context(st, ctx).unwrap());
             }
@@ -914,6 +945,7 @@ impl Builder<'_> {
                 style_node: id,
                 inline: None,
                 intrinsic: None,
+                keeps_ratio: false,
             }),
         )
         .unwrap();

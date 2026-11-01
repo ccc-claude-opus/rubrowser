@@ -464,7 +464,10 @@ impl Document {
                 .unwrap_or(default)
         };
         Some(match kind {
-            Control::Text | Control::Password | Control::Hidden => (0.0, lh),
+            // About 20 characters, like other browsers' default.
+            Control::Text | Control::Password | Control::Hidden => {
+                (20.0 * fonts.measure(st.font(), st.font_size, "n"), lh)
+            }
             Control::TextArea => (
                 num("cols", 20.0) * fonts.measure(st.font(), st.font_size, "n"),
                 num("rows", 2.0) * lh,
