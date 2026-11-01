@@ -124,13 +124,14 @@ impl Painter<'_> {
 
     fn paint_box(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32) {
         let b = &self.tree.boxes[index];
-        let r = RectF {
-            x: ox + b.rect.x,
-            y: oy + b.rect.y,
-            ..b.rect
-        };
         let Some(style) = self.style(b.style_node) else {
             return;
+        };
+        let (tx, ty) = b.translation(style);
+        let r = RectF {
+            x: ox + b.rect.x + tx,
+            y: oy + b.rect.y + ty,
+            ..b.rect
         };
         let own = b.node.is_some();
         let alpha = c.global_alpha();
@@ -169,6 +170,24 @@ impl Painter<'_> {
         } else {
             0.0
         };
+        // Images inside a rounded clipping box (avatars) are rounded too.
+        let saved_round = c.round_clip();
+        if clips && style.border_radius > 0.0 {
+            let pr = b.padding_rect();
+            let p = RectF {
+                x: r.x + pr.x,
+                y: r.y + pr.y,
+                ..pr
+            };
+            let s = self.scale;
+            c.set_round_clip(Some([
+                p.x * s,
+                p.y * s,
+                p.w * s,
+                p.h * s,
+                style.border_radius * s,
+            ]));
+        }
         if let Some(il) = &b.inline {
             let (cx, cy) = b.content_offset();
             self.inline(c, il, r.x + cx, r.y + cy - sy);
@@ -211,11 +230,24 @@ impl Painter<'_> {
             .filter(|&n| matches!(self.dom.tag(n), Some("img" | "svg")))
             && style.visible
         {
+            let outer = c.round_clip();
+            if style.border_radius > 0.0 && outer.is_none() {
+                let s = self.scale;
+                c.set_round_clip(Some([
+                    r.x * s,
+                    r.y * s,
+                    r.w * s,
+                    r.h * s,
+                    style.border_radius * s,
+                ]));
+            }
             self.image(c, b, node, style, r);
+            c.set_round_clip(outer);
         }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);
         }
+        c.set_round_clip(saved_round);
         c.set_clip(saved);
         if own && style.visible && style.outline_style != cs::LineStyle::None {
             self.outline(c, style, r);

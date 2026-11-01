@@ -32,6 +32,8 @@ pub enum Rule {
     Layer(String, Vec<Rule>),
     /// `@layer a, b;`: declares layer order.
     LayerOrder(Vec<String>),
+    /// `@property --name { initial-value: … }`.
+    Property(String, String),
 }
 
 /// A parsed stylesheet.
@@ -222,6 +224,12 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                 "layer" => out.push(Rule::LayerOrder(
                     prelude.split(',').map(|n| n.trim().to_string()).collect(),
                 )),
+                "property" if has_block => {
+                    let (decls, _) = parse_block(body, base);
+                    if let Some(d) = decls.iter().rev().find(|d| d.name == "initial-value") {
+                        out.push(Rule::Property(prelude.to_string(), d.value.to_string()));
+                    }
+                }
                 "scope" | "-moz-document" if has_block => {
                     out.extend(parse_rules(body, base));
                 }
@@ -397,7 +405,7 @@ mod tests {
                         out.push((format!("{} selector(s)", selectors.len()), decls.to_vec()))
                     }
                     Rule::Media(_, inner) | Rule::Layer(_, inner) => walk(inner, out),
-                    Rule::Import(..) | Rule::LayerOrder(_) => {}
+                    Rule::Import(..) | Rule::LayerOrder(_) | Rule::Property(..) => {}
                 }
             }
         }

@@ -110,8 +110,9 @@ pub fn dim(s: &str, fc: FontContext) -> Option<Dim> {
         "cm" => v * 96.0 / 2.54,
         "mm" => v * 96.0 / 25.4,
         "ex" | "ch" => v * fc.em * 0.5,
-        "vw" => v * fc.vw / 100.0,
-        "vh" => v * fc.vh / 100.0,
+        // Container query units: approximated by the viewport.
+        "vw" | "cqw" | "cqi" | "svw" | "lvw" | "dvw" => v * fc.vw / 100.0,
+        "vh" | "cqh" | "cqb" | "svh" | "lvh" | "dvh" => v * fc.vh / 100.0,
         "vmin" => v * fc.vw.min(fc.vh) / 100.0,
         "vmax" => v * fc.vw.max(fc.vh) / 100.0,
         "q" => v * 96.0 / 101.6,

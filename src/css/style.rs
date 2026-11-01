@@ -285,6 +285,11 @@ pub struct Style {
     pub flex_basis: Dim,
     pub vertical_align: VerticalAlign,
     pub opacity: f32,
+    /// `translate` / `transform: translate…()` (percentages of the border
+    /// box); applied when painting and hit-testing.
+    pub translate: (Dim, Dim),
+    /// `aspect-ratio` (width / height).
+    pub aspect_ratio: Option<f32>,
     pub z_index: Option<i32>,
     pub float: Float,
     /// `clear`: (left, right).
@@ -367,6 +372,8 @@ impl Default for Style {
             flex_basis: Dim::Auto,
             vertical_align: VerticalAlign::Baseline,
             opacity: 1.0,
+            translate: (Dim::Px(0.0), Dim::Px(0.0)),
+            aspect_ratio: None,
             z_index: None,
             float: Float::None,
             clear: (false, false),
@@ -674,6 +681,27 @@ impl Style {
                 let t = tokens(v);
                 set(&mut self.background_position, background_position(&t, fc));
             }
+            "aspect-ratio" => {
+                // `auto`, `16 / 9`, `1.5`, `auto 4 / 3`
+                let r = v.trim_start_matches("auto").trim();
+                let mut parts = r.split('/').map(|p| p.trim().parse::<f32>().ok());
+                self.aspect_ratio = match (parts.next().flatten(), parts.next()) {
+                    (Some(w), None) if w > 0.0 => Some(w),
+                    (Some(w), Some(Some(h))) if w > 0.0 && h > 0.0 => Some(w / h),
+                    _ => None,
+                };
+            }
+            "translate" => {
+                let t = tokens(value);
+                let x = t.first().and_then(|v| dim(v)).unwrap_or(Dim::Px(0.0));
+                let y = t.get(1).and_then(|v| dim(v)).unwrap_or(Dim::Px(0.0));
+                self.translate = if v == "none" {
+                    (Dim::Px(0.0), Dim::Px(0.0))
+                } else {
+                    (x, y)
+                };
+            }
+            "transform" => self.translate = transform_translate(value, |v| dim(v)),
             "opacity" => {
                 if let Some(o) = values::number(v).or_else(|| {
                     v.strip_suffix('%')
@@ -1174,6 +1202,31 @@ fn logical(name: &str, value: &str) -> Option<Vec<(String, String)>> {
         _ => (value.to_string(), value.to_string()),
     };
     Some(vec![(side(start, suffix), a), (side(end, suffix), b)])
+}
+
+/// The translation part of a `transform` list (other functions ignored).
+fn transform_translate(value: &str, dim: impl Fn(&str) -> Option<Dim>) -> (Dim, Dim) {
+    let zero = Dim::Px(0.0);
+    let (mut x, mut y) = (zero, zero);
+    for t in values::tokens(value) {
+        let lower = t.to_ascii_lowercase();
+        let Some((name, args)) = lower.split_once('(') else {
+            continue;
+        };
+        let args: Vec<&str> = args
+            .trim_end_matches(')')
+            .split(',')
+            .map(str::trim)
+            .collect();
+        let d = |i: usize| args.get(i).and_then(|a| dim(a)).unwrap_or(zero);
+        match name {
+            "translate" | "translate3d" => (x, y) = (d(0), d(1)),
+            "translatex" => x = d(0),
+            "translatey" => y = d(0),
+            _ => {}
+        }
+    }
+    (x, y)
 }
 
 fn is_inherited(name: &str) -> bool {

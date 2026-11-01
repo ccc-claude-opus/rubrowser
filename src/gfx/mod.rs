@@ -60,9 +60,38 @@ pub struct Canvas {
     /// Opacity applied to translucent drawing (fills with alpha, glyphs,
     /// images, rounded shapes): 255 is opaque.
     global_alpha: u8,
+    /// Rounded rectangle (x, y, w, h, radius) that images are clipped to.
+    round_clip: Option<[f32; 5]>,
 }
 
 impl Canvas {
+    pub fn round_clip(&self) -> Option<[f32; 5]> {
+        self.round_clip
+    }
+
+    /// Clips images to a rounded rectangle (`None` to stop).
+    pub fn set_round_clip(&mut self, r: Option<[f32; 5]>) {
+        self.round_clip = r;
+    }
+
+    /// Coverage (0–255) of pixel `(px, py)` by the rounded clip.
+    fn round_coverage(&self, px: i32, py: i32) -> u8 {
+        let Some([x, y, w, h, r]) = self.round_clip else {
+            return 255;
+        };
+        let (cx, cy) = (px as f32 + 0.5, py as f32 + 0.5);
+        if cx < x || cy < y || cx > x + w || cy > y + h {
+            return 0;
+        }
+        let r = r.min(w / 2.0).min(h / 2.0);
+        let dx = (x + r - cx).max(cx - (x + w - r)).max(0.0);
+        let dy = (y + r - cy).max(cy - (y + h - r)).max(0.0);
+        if dx == 0.0 || dy == 0.0 {
+            return 255;
+        }
+        let d = (dx * dx + dy * dy).sqrt() - r;
+        ((0.5 - d).clamp(0.0, 1.0) * 255.0) as u8
+    }
     pub fn new(width: usize, height: usize) -> Self {
         Canvas {
             width,
@@ -70,6 +99,7 @@ impl Canvas {
             pixels: vec![0; width * height],
             clip: Rect::new(0, 0, width as i32, height as i32),
             global_alpha: 255,
+            round_clip: None,
         }
     }
 
@@ -309,7 +339,10 @@ impl Canvas {
             let line = row as usize * self.width;
             for col in r.x..r.right() {
                 let p = src[sy * w + (col - x) as usize];
-                let a = self.effective((p >> 24) as u8);
+                let mut a = self.effective((p >> 24) as u8);
+                if self.round_clip.is_some() {
+                    a = (a as u32 * self.round_coverage(col, row) as u32 / 255) as u8;
+                }
                 if a != 0 {
                     let d = &mut self.pixels[line + col as usize];
                     *d = blend(*d, p & 0xff_ffff, a);

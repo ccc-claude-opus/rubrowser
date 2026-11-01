@@ -926,12 +926,13 @@ impl Document {
     /// outermost first; the caller reverses them.
     fn hit_box(&self, i: usize, x: f32, y: f32, ox: f32, oy: f32, hit: &mut Hit) -> bool {
         let b = &self.tree.boxes[i];
+        let style = self.style(b.style_node);
+        let (tx, ty) = style.map_or((0.0, 0.0), |s| b.translation(s));
         let r = RectF {
-            x: ox + b.rect.x,
-            y: oy + b.rect.y,
+            x: ox + b.rect.x + tx,
+            y: oy + b.rect.y + ty,
             ..b.rect
         };
-        let style = self.style(b.style_node);
         let clips = b.node.is_some()
             && style.is_some_and(|s| s.overflow != crate::css::style::Overflow::Visible);
         let inside = r.contains(x, y);

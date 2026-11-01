@@ -66,6 +66,18 @@ pub struct LBox {
 }
 
 impl LBox {
+    /// The `translate` offset of this box's own element (percentages of
+    /// its border box).
+    pub fn translation(&self, style: &Css) -> (f32, f32) {
+        if self.node != Some(self.style_node) {
+            return (0.0, 0.0);
+        }
+        (
+            style.translate.0.px_or_zero(self.rect.w),
+            style.translate.1.px_or_zero(self.rect.h),
+        )
+    }
+
     /// How far a sticky box moves down so its top stays `sticky_top` below
     /// `view_top`, without leaving `parent_bottom`. `y` is where it was laid
     /// out (same coordinates as the other two).
@@ -1204,6 +1216,7 @@ fn convert(s: &Css) -> Style {
     };
     let border = std::array::from_fn(|i| LengthPercentage::length(s.border(i)));
     Style {
+        aspect_ratio: s.aspect_ratio,
         box_sizing: match s.box_sizing {
             cs::BoxSizing::BorderBox => BoxSizing::BorderBox,
             cs::BoxSizing::ContentBox => BoxSizing::ContentBox,

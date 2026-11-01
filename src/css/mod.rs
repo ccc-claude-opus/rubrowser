@@ -104,6 +104,8 @@ pub struct Cascade {
     rules: Vec<Indexed>,
     /// Layer names (dotted paths) in order of first appearance.
     layers: HashMap<String, u16>,
+    /// Initial values of custom properties registered with `@property`.
+    initial_vars: BTreeMap<String, String>,
     buckets: HashMap<Key, Vec<u32>>,
     /// Whether any rule depends on :hover/:active/:focus.
     pub dynamic: bool,
@@ -116,6 +118,7 @@ impl Cascade {
         let mut c = Cascade {
             rules: Vec::new(),
             layers: HashMap::new(),
+            initial_vars: BTreeMap::new(),
             buckets: HashMap::new(),
             dynamic: false,
         };
@@ -174,6 +177,9 @@ impl Cascade {
                     for n in names {
                         self.layer(&child(n));
                     }
+                }
+                Rule::Property(name, value) => {
+                    self.initial_vars.insert(name.clone(), value.clone());
                 }
                 Rule::Import(..) => {}
             }
@@ -276,7 +282,10 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
         vh: env.height,
     };
     let mut candidates = Vec::new();
-    let root_style = Style::default();
+    let root_style = Style {
+        vars: Rc::new(cascade.initial_vars.clone()),
+        ..Style::default()
+    };
     // Document order, parents before children.
     let mut stack: Vec<(NodeId, Rc<Style>)> = vec![(Dom::ROOT, Rc::new(root_style))];
     while let Some((id, parent)) = stack.pop() {
