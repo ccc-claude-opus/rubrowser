@@ -63,4 +63,5 @@ rubrowser --screenshot out.png --width 1280 --height 900 https://en.wikipedia.or
 
 - Wikipedia 頁首的 Log in 會換行（搜尋框的 flex basis 比 Chrome 大）；主選單圖示只顯示一條線。
 - 需要 JS 的部分（Wikipedia 的外觀設定面板、目錄折疊，GitHub 的檔案列表最後提交欄）不會出現。
-- X、Threads 只保證不當掉。
+- X：個人頁的文字、推文、按鈕與側欄都會出現，但頭像畫得過大、蓋住名稱；彩色 emoji 沒有字型。
+- Threads：頁面全由 JS 產生，只保證不當掉。
