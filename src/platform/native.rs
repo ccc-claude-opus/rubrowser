@@ -132,16 +132,43 @@ impl Host for NativeHost {
     }
 }
 
+/// A User-Agent in the format sites expect from current browsers (the
+/// usual compatibility tokens), naming rubrowser.
+fn user_agent() -> String {
+    let platform = if cfg!(target_os = "macos") {
+        "Macintosh; Intel Mac OS X 10_15_7"
+    } else if cfg!(target_os = "windows") {
+        "Windows NT 10.0; Win64; x64"
+    } else {
+        "X11; Linux x86_64"
+    };
+    format!(
+        "Mozilla/5.0 ({platform}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 rubrowser/{}",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// `Accept-Language` from the system locale (`LANG`, e.g. `zh_TW.UTF-8`),
+/// with English as a fallback.
+fn accept_language() -> String {
+    let lang = std::env::var("LC_ALL")
+        .or_else(|_| std::env::var("LANG"))
+        .unwrap_or_default();
+    let tag = lang.split(['.', '@']).next().unwrap_or("").replace('_', "-");
+    let primary = tag.split('-').next().unwrap_or("").to_string();
+    match (tag.as_str(), primary.as_str()) {
+        ("" | "C" | "POSIX", _) | (_, "en") => "en-US,en;q=0.9".into(),
+        (t, p) if t != p => format!("{t},{p};q=0.9,en-US;q=0.8,en;q=0.7"),
+        (t, _) => format!("{t},en-US;q=0.8,en;q=0.7"),
+    }
+}
+
 /// The HTTP client shared by all loads.
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
-            .user_agent(concat!(
-                "Mozilla/5.0 (compatible; rubrowser/",
-                env!("CARGO_PKG_VERSION"),
-                "; +https://github.com/ccc-claude-opus/rubrowser)"
-            ))
+            .user_agent(user_agent())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
             .build()
@@ -157,7 +184,15 @@ pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
     let url = url.split('#').next().unwrap_or(url);
     match url::scheme(url) {
         Some("http") | Some("https") => {
-            let mut resp = agent().get(url).call().map_err(|e| e.to_string())?;
+            let mut resp = agent()
+                .get(url)
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                )
+                .header("Accept-Language", accept_language())
+                .call()
+                .map_err(|e| e.to_string())?;
             let status = resp.status();
             let final_url = resp.get_uri().to_string();
             let body = resp

@@ -20,7 +20,7 @@ python https://www.python.org/
 rust https://www.rust-lang.org/
 bbc https://www.bbc.com/news
 hn https://news.ycombinator.com/
-reddit https://old.reddit.com/r/rust/
+lobsters https://lobste.rs/
 so https://stackoverflow.com/questions
 ddg https://html.duckduckgo.com/html/?q=rust
 apple https://www.apple.com/

@@ -37,7 +37,7 @@ js-runtime = ["sdk", "dep:boa_engine", "dep:getrandom"]
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"], optional = true }
-ureq = { version = "3", optional = true }
+ureq = { version = "3", optional = true, features = ["cookies", "brotli", "charset"] }
 arboard = { version = "3", default-features = false, optional = true }
 fontdue = { version = "0.9", optional = true }
 dejavu = { version = "2.37", optional = true }
