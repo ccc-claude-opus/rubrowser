@@ -421,6 +421,57 @@ impl Document {
         })
     }
 
+    /// A text dump of the boxes under the first element matching
+    /// `selector` (for debugging layout: `RUBROWSER_DUMP` in screenshots).
+    pub fn dump_layout(&self, selector: &str, max_depth: usize) -> String {
+        let Some(target) = self
+            .dom
+            .descendants(Dom::ROOT)
+            .into_iter()
+            .find(|&n| crate::css::matches(&self.dom, n, selector, &self.state))
+        else {
+            return format!("no element matches {selector}\n");
+        };
+        let mut out = String::new();
+        let mut stack = vec![(target, 0usize)];
+        while let Some((n, depth)) = stack.pop() {
+            if depth > max_depth {
+                continue;
+            }
+            let label = match self.dom.element(n) {
+                Some(e) => {
+                    let mut l = e.name.clone();
+                    if let Some(id) = e.id() {
+                        l.push_str(&format!("#{id}"));
+                    }
+                    for c in e.classes().take(3) {
+                        l.push_str(&format!(".{c}"));
+                    }
+                    l
+                }
+                None => match self.dom.text(n) {
+                    Some(t) if !t.trim().is_empty() => {
+                        format!("\"{}\"", t.trim().chars().take(30).collect::<String>())
+                    }
+                    _ => continue,
+                },
+            };
+            let geo = self
+                .box_rects(n)
+                .map(|(b, _)| format!("{:.0},{:.0} {:.0}x{:.0}", b.x, b.y, b.w, b.h))
+                .unwrap_or_else(|| "-".into());
+            let disp = self
+                .style(n)
+                .map(|s| format!("{:?} w={:?}", s.display, s.width))
+                .unwrap_or_else(|| "none".into());
+            out.push_str(&format!("{}{label}  [{geo}]  {disp}\n", "  ".repeat(depth)));
+            for &c in self.dom.children(n).iter().rev() {
+                stack.push((c, depth + 1));
+            }
+        }
+        out
+    }
+
     /// The URL relative links resolve against: `<base href>` or the page.
     pub fn base_url(&self) -> String {
         match self

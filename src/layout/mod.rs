@@ -7,6 +7,7 @@
 
 pub mod inline;
 
+use std::collections::HashMap;
 use taffy::prelude::*;
 use taffy::{
     AvailableSpace, LayoutInput, LayoutOutput, Overflow as TOverflow, Point, compute_leaf_layout,
@@ -112,6 +113,11 @@ struct Builder<'a> {
     viewport: (f32, f32),
     boxes: Vec<LBox>,
     replaced: &'a Replaced,
+    /// Widths that inline-blocks must shrink to (their container's width),
+    /// learned from a previous pass.
+    caps: HashMap<NodeId, f32>,
+    /// Inline-blocks found wider than their container in this pass.
+    overflow: HashMap<NodeId, f32>,
 }
 
 /// Natural sizes of replaced elements (`<img>`), by node.
@@ -127,7 +133,32 @@ pub fn layout(
     replaced: &Replaced,
 ) -> LayoutTree {
     CALC_BASE.with(|b| b.set(width));
+    let mut caps = HashMap::new();
+    // Shrink-to-fit needs the container width, which is only known after
+    // layout: re-run with caps for the inline-blocks that overflowed.
+    for _ in 0..3 {
+        let (tree, overflow) =
+            layout_pass(dom, styles, fonts, width, height, replaced, caps.clone());
+        if overflow.is_empty() {
+            return tree;
+        }
+        caps.extend(overflow);
+    }
+    layout_pass(dom, styles, fonts, width, height, replaced, caps).0
+}
+
+fn layout_pass(
+    dom: &Dom,
+    styles: &[Option<Css>],
+    fonts: &Fonts,
+    width: f32,
+    height: f32,
+    replaced: &Replaced,
+    caps: HashMap<NodeId, f32>,
+) -> (LayoutTree, HashMap<NodeId, f32>) {
     let mut b = Builder {
+        caps,
+        overflow: HashMap::new(),
         in_block: true,
         fixed: Vec::new(),
         replaced,
@@ -181,7 +212,7 @@ pub fn layout(
         vp.children.extend(fixed);
         vp.content_h = content_h;
     }
-    LayoutTree { boxes: b.boxes }
+    (LayoutTree { boxes: b.boxes }, b.overflow)
 }
 
 impl Builder<'_> {
@@ -438,23 +469,24 @@ impl Builder<'_> {
     fn atomic(&mut self, id: NodeId) -> (usize, f32, f32, f32) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
         let node = self.build(&mut tree, id);
-        // Shrink-to-fit: lay out at max-content, capped by the viewport.
+        // Shrink-to-fit: lay out at max-content, capped by the container
+        // width (once known) or the viewport.
+        let avail = self.caps.get(&id).copied().unwrap_or(self.viewport.0);
         let wrapper = tree
             .new_with_children(
                 Style {
                     display: Display::Flex,
                     align_items: AlignItems::START,
+                    size: Size {
+                        width: length(avail),
+                        height: Dimension::auto(),
+                    },
                     ..Default::default()
                 },
                 &[node],
             )
             .unwrap();
-        self.compute(
-            &mut tree,
-            wrapper,
-            self.viewport.0,
-            AvailableSpace::MaxContent,
-        );
+        self.compute(&mut tree, wrapper, avail, AvailableSpace::MaxContent);
         let index = self.collect(&tree, node);
         let l = tree.layout(node).unwrap();
         let css = self.style(id).cloned().unwrap_or_default();
@@ -506,6 +538,16 @@ impl Builder<'_> {
         let padding = side(l.padding);
         let inline = ctx.and_then(|c| c.inline.as_ref()).map(|content| {
             let w = l.size.width - border[1] - border[3] - padding[1] - padding[3];
+            for item in &content.items {
+                if let inline::Item::Atomic { index, width, .. } = *item {
+                    let node = self.boxes[index].node;
+                    if let Some(n) = node.filter(|_| width > w + 0.5 && w > 0.0) {
+                        if !self.caps.contains_key(&n) {
+                            self.overflow.insert(n, w);
+                        }
+                    }
+                }
+            }
             let mut il = inline::layout(content, w.max(0.0), self.styles, self.fonts);
             if let Some(owner) = self.style(content.owner) {
                 inline::align(&mut il, owner.text_align, w);

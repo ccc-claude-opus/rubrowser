@@ -175,6 +175,15 @@ fn in_parens(c: &str, env: &MediaEnv) -> bool {
 /// A length in px (for media features: em = 16px).
 fn length(v: &str) -> Option<f32> {
     let v = v.trim();
+    if v.contains('(') {
+        let fc = super::values::FontContext {
+            em: 16.0,
+            rem: 16.0,
+            vw: 0.0,
+            vh: 0.0,
+        };
+        return super::values::px(v, fc);
+    }
     for (unit, k) in [("px", 1.0), ("em", 16.0), ("rem", 16.0), ("pt", 4.0 / 3.0)] {
         if let Some(n) = v.strip_suffix(unit) {
             return n.trim().parse::<f32>().ok().map(|n| n * k);
@@ -401,6 +410,8 @@ mod tests {
         assert!(m("(400px <= width < 700px)", 500.0));
         assert!(!m("(400px <= width < 700px)", 700.0));
         assert!(m("(min-width: 100px) and (max-width: 200px)", 150.0));
+        assert!(!m("all and (max-width: calc(640px - 1px))", 1280.0));
+        assert!(m("all and (max-width: calc(640px - 1px))", 600.0));
         assert!(m("((min-width: 100px) or (hover: none))", 150.0));
         assert!(m("(hover: hover) and (pointer: fine)", 1.0));
         assert!(!m("(unknown-feature)", 1.0));

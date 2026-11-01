@@ -612,6 +612,12 @@ impl Browser {
         self.dirty = true;
     }
 
+    /// Debug dump of the active page's layout (see
+    /// [`Document::dump_layout`]).
+    pub fn dump_layout(&self, selector: &str, depth: usize) -> String {
+        self.tabs[self.active].doc.dump_layout(selector, depth)
+    }
+
     /// Called by the platform when fetch `id` was redirected to `url`
     /// (before [`Browser::fetch_done`]), so the page uses its real address.
     pub fn fetch_redirected(&mut self, id: u32, final_url: &str) {

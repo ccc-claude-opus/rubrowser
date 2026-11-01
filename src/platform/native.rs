@@ -264,6 +264,10 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
             }
         }
     }
+    browser.render(now(&start), &mut host);
+    if let Ok(sel) = std::env::var("RUBROWSER_DUMP") {
+        eprint!("{}", browser.dump_layout(&sel, 12));
+    }
     let canvas = browser.render(now(&start), &mut host);
     let rgba: Vec<u8> = canvas
         .pixels()

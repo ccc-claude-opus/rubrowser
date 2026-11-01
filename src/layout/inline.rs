@@ -284,7 +284,7 @@ pub fn layout(
                 if at_line_start && text.trim().is_empty() {
                     continue; // collapsible space at line start
                 }
-                if !at_line_start && wraps && breakable && x + width - space > max_width {
+                if !at_line_start && wraps && breakable && x + width - space > max_width + 0.01 {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                     if text.trim().is_empty() {
                         continue;
@@ -324,7 +324,7 @@ pub fn layout(
                 height,
                 baseline,
             } => {
-                if !line.items.is_empty() && x + width > max_width {
+                if !line.items.is_empty() && x + width > max_width + 0.01 {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
                 }
                 trailing = 0.0;
