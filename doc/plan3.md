@@ -54,14 +54,21 @@ rubrowser --screenshot out.png --width 1280 --height 900 https://en.wikipedia.or
 | W3 | 完成 | grid、float 旁的文字、`display: contents`、`position: sticky`（繪製與 hit-test 時位移）；inline-block 依容器寬度 shrink-to-fit（第二次排版）；行內元素的左右 margin / padding；空區塊的 margin 可以穿透合併 |
 | W4 | 完成 | `resvg`：SVG 圖片依繪製大小點陣化、內嵌 `<svg>`（還原 SVG 標籤大小寫、`currentColor`）、`mask-image`；`srcset` / `<picture>` 尚未支援 |
 | W5 | 完成 | 原生版優先使用系統的 Arial / Georgia（或 Liberation），斷行位置與 Chrome 幾乎一致；DejaVu Serif；缺字退回 DejaVu |
-| W6 | 部分 | Wikipedia 樣式計算約 40–100 ms、排版約 40–60 ms；GitHub（4.8 MB CSS）樣式約 100 ms。滑鼠移動造成的重算尚未做增量 |
+| W6 | 完成 | 首次樣式計算：Wikipedia 約 40–100 ms、GitHub（4.8 MB CSS）約 100 ms；排版約 40–60 ms。滑鼠移動（hover / active / focus）只重算受影響的元素：Wikipedia 約 0–1 ms、GitHub 約 5–11 ms |
 | W7 | Wikipedia、GitHub 完成 | 兩站的版面位置與 Chrome 對齊到數個像素以內；GitHub 由 React 產生的內容（最後提交、分支數）不會出現 |
 | W8 | 完成 | `#片段` 連結在頁內捲動、上一頁不重新載入、載入中保持錨點位置；`html { height: 100% }` 的網站可以捲動 |
 | W9 | 部分 | 中文、日文以系統字型顯示；韓文需要另外的字型；IME 尚未支援 |
 
 ### 已知差異
 
-- Wikipedia 頁首的 Log in 會換行（搜尋框的 flex basis 比 Chrome 大）；主選單圖示只顯示一條線。
+- Wikipedia 主選單圖示只顯示一條線。
 - 需要 JS 的部分（Wikipedia 的外觀設定面板、目錄折疊，GitHub 的檔案列表最後提交欄）不會出現。
-- X：個人頁的文字、推文、按鈕與側欄都會出現，但頭像畫得過大、蓋住名稱；彩色 emoji 沒有字型。
+- X：個人頁與 Chrome 相近（橫幅、圓形頭像、按鈕、推文）；推文下方的動作圖示與彩色 emoji 沒有出現。
 - Threads：頁面全由 JS 產生，只保證不當掉。
+
+### 之後補上的修正
+
+- `translate` / `transform: translate()`、`aspect-ratio`、`@property` 的 `initial-value`（Tailwind v4 需要）、容器查詢單位 `cqw` 等（以視窗近似）。
+- 圖片依自身或 `overflow: hidden` 祖先的圓角裁切。
+- taffy 不再把尺寸四捨五入成整數像素：剛好放得下的文字不會被擠到下一行。
+- 百分比寬度的 inline-block 先以內在寬度排版，第二次排版再依容器寬度計算。
