@@ -2,7 +2,7 @@
 name = "rubrowser"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "A browser whose pages are Rust programs compiled to WebAssembly, drawn entirely on a single canvas."
 license = "MIT"
 repository = "https://github.com/ccc-claude-opus/rubrowser"
@@ -16,17 +16,22 @@ default = ["native"]
 # API for page authors; no dependencies.
 sdk = []
 # Platform-independent browser core: graphics, UI, page runtime.
-core = ["dep:font8x8"]
+core = ["dep:font8x8", "dep:wasmi"]
 # Native window version (main).
-native = ["core", "dep:winit", "dep:softbuffer"]
+native = ["core", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard"]
 # Canvas version running inside a web browser (extra).
 web = ["core"]
-font8x8 = ["dep:font8x8"]
 
 [dependencies]
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 font8x8 = { version = "0.3", default-features = false, optional = true }
+wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"], optional = true }
+ureq = { version = "3", optional = true }
+arboard = { version = "3", default-features = false, optional = true }
+
+[dev-dependencies]
+wasmi = { version = "2", features = ["wat"] }
 
 [[bin]]
 name = "rubrowser"
@@ -35,3 +40,11 @@ required-features = ["native"]
 [profile.release]
 opt-level = 3
 lto = true
+
+# Small wasm for pages: cargo build --profile page --example NAME ...
+[profile.page]
+inherits = "release"
+opt-level = "s"
+panic = "abort"
+strip = true
+codegen-units = 1

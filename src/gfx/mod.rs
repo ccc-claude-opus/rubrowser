@@ -188,6 +188,25 @@ impl Canvas {
     }
 }
 
+impl Canvas {
+    /// Copies `src` (`w × h` pixels) stretched to fill `dst` (nearest
+    /// neighbor), clipped.
+    pub fn blit_scaled(&mut self, dst: Rect, w: usize, h: usize, src: &[Color]) {
+        if dst.w <= 0 || dst.h <= 0 || w == 0 || h == 0 || src.len() < w * h {
+            return;
+        }
+        let r = dst.intersect(&self.clip);
+        for row in r.y..r.bottom() {
+            let sy = ((row - dst.y) as usize * h) / dst.h as usize;
+            let line = row as usize * self.width;
+            for col in r.x..r.right() {
+                let sx = ((col - dst.x) as usize * w) / dst.w as usize;
+                self.pixels[line + col as usize] = src[sy * w + sx];
+            }
+        }
+    }
+}
+
 /// Draws on a [`Canvas`] in logical pixels, relative to an origin.
 pub struct Painter<'a> {
     canvas: &'a mut Canvas,
@@ -357,6 +376,13 @@ mod tests {
         let mut c = Canvas::new(3, 2);
         c.blit(1, 1, 3, 1, &[1, 2, 3]);
         assert_eq!(c.pixels(), &[0, 0, 0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn blit_scaled_doubles() {
+        let mut c = Canvas::new(4, 2);
+        c.blit_scaled(Rect::new(0, 0, 4, 2), 2, 1, &[1, 2]);
+        assert_eq!(c.pixels(), &[1, 1, 2, 2, 1, 1, 2, 2]);
     }
 
     #[test]

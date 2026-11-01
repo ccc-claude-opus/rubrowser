@@ -7,11 +7,21 @@
 //!
 //! Page authors only need the `sdk` feature, which has no dependencies.
 
+#[cfg(any(feature = "core", feature = "sdk"))]
+pub mod abi;
 #[cfg(feature = "core")]
 pub mod browser;
 #[cfg(feature = "core")]
 pub mod gfx;
+#[cfg(feature = "core")]
+pub mod input;
+#[cfg(feature = "core")]
+pub mod net;
 #[cfg(any(feature = "native", feature = "web"))]
 pub mod platform;
+#[cfg(feature = "core")]
+pub mod runtime;
 #[cfg(feature = "sdk")]
 pub mod sdk;
+#[cfg(feature = "core")]
+pub mod ui;
