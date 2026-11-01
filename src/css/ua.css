@@ -1,0 +1,76 @@
+/* rubrowser user-agent stylesheet: defaults applied before page styles. */
+
+html, body, div, p, h1, h2, h3, h4, h5, h6, ul, ol, pre, hr, blockquote,
+header, footer, main, nav, section, article, aside, figure, figcaption,
+address, details, summary, dl, dt, dd, form, fieldset, legend, center,
+table, tr, td, th, thead, tbody, tfoot, caption {
+  display: block;
+}
+
+head, style, script, title, meta, link, base, template, noscript {
+  display: none;
+}
+
+li { display: list-item; }
+
+body { margin: 8px; }
+
+p, blockquote, figure, dl, pre { margin: 1em 0; }
+blockquote, figure { margin-left: 40px; margin-right: 40px; }
+dd { margin-left: 40px; }
+
+h1 { font-size: 2em; font-weight: bold; margin: 0.67em 0; }
+h2 { font-size: 1.5em; font-weight: bold; margin: 0.83em 0; }
+h3 { font-size: 1.17em; font-weight: bold; margin: 1em 0; }
+h4 { font-size: 1em; font-weight: bold; margin: 1.33em 0; }
+h5 { font-size: 0.83em; font-weight: bold; margin: 1.67em 0; }
+h6 { font-size: 0.67em; font-weight: bold; margin: 2.33em 0; }
+
+ul, ol { margin: 1em 0; padding-left: 40px; }
+ul { list-style-type: disc; }
+ol { list-style-type: decimal; }
+ul ul, ol ul { list-style-type: circle; margin: 0; }
+ol ol, ul ol { margin: 0; }
+
+b, strong, th { font-weight: bold; }
+i, em, cite, var, dfn { font-style: italic; }
+u, ins { text-decoration: underline; }
+s, del, strike { text-decoration: line-through; }
+small { font-size: smaller; }
+big { font-size: larger; }
+center { text-align: center; }
+
+pre, code, kbd, samp, tt { font-family: monospace; }
+pre { white-space: pre; }
+
+a[href] { color: #0645ad; text-decoration: underline; cursor: pointer; }
+
+hr {
+  border: 1px solid #c0c0c0;
+  margin: 0.5em 0;
+}
+
+td, th { padding: 1px; }
+
+input, button, textarea, select {
+  display: inline-block;
+  font-size: 13px;
+  border: 1px solid #8f8f9d;
+  padding: 2px 4px;
+  background-color: #ffffff;
+  color: #000000;
+}
+
+input { cursor: text; width: 150px; }
+textarea { cursor: text; }
+
+button {
+  padding: 2px 8px;
+  border-radius: 3px;
+  background-color: #e9e9ed;
+  cursor: default;
+}
+
+button:hover { background-color: #d0d0d7; }
+button:active { background-color: #b1b1b9; }
+input:focus { border-color: #0060df; }
