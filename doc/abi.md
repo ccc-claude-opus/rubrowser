@@ -159,3 +159,15 @@ JavaScript 等直譯式語言以「runtime 模組」執行：一個額外匯出�
 | `rb_event` / `rb_timer` | 和一般模組相同，由 runtime 轉給語言內的處理函式 |
 
 瀏覽器每頁每種語言只建立一個 runtime instance，依文件順序對每個 `<script>` 呼叫一次 `rb_eval`。runtime 的 fuel 上限是每次呼叫 20 億條指令、記憶體 512 MiB。
+
+網頁可以用 `<link rel="rubrowser-runtime" type="text/python" href="python.wasm">` 提供自己的 runtime；詳見 [languages.md](languages.md)。
+
+## 7. 表單控制項
+
+| 函式 | 說明 |
+|---|---|
+| `get_checked(h) -> i32` / `set_checked(h, v)` | checkbox / radio 是否勾選（radio 會取消同組其他項） |
+| `get_selected(h) -> i32` / `set_selected(h, i)` | `<select>` 選中的 option 索引（-1 表示沒有） |
+| `form_action(h, op)` | 對 `<form>`：0 送出（不觸發 submit 事件）、1 重設 |
+
+`get_value` / `set_value` 也適用於 `<select>`（option 的 value）與 `<textarea>`。

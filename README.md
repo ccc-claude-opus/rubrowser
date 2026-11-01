@@ -26,7 +26,7 @@ Open a file or URL directly:
 rubrowser page.html
 ```
 
-Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`, `about:events` (Rust/wasm) and `about:js-todo`, `about:calc` (JavaScript).
+Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`, `about:events` (Rust/wasm), `about:js-todo`, `about:calc` (JavaScript) and `about:form`.
 
 Shortcuts: <kbd>Cmd/Ctrl</kbd>+<kbd>L</kbd> address bar, +<kbd>T</kbd> new tab, +<kbd>W</kbd> close tab, +<kbd>R</kbd> reload, +<kbd>[</kbd>/<kbd>]</kbd> back/forward, <kbd>Tab</kbd> moves focus.
 
@@ -76,6 +76,17 @@ cargo build --release --target wasm32-unknown-unknown
 
 See [doc/scripting.md](doc/scripting.md) for the API and [doc/abi.md](doc/abi.md) for the low-level interface.
 
+## Other languages
+
+Any interpreter compiled to wasm can be plugged in by a page — the browser stays unchanged:
+
+```html
+<link rel="rubrowser-runtime" type="text/python" href="python.wasm">
+<script type="text/python">print("hello")</script>
+```
+
+See [doc/languages.md](doc/languages.md) for the runtime protocol (`rb_alloc` / `rb_eval`).
+
 ## Canvas version
 
 The same browser compiled to wasm and drawn on one `<canvas>`:
@@ -101,9 +112,9 @@ Then open <http://localhost:8000>. Append `#URL` to open a page, e.g. `http://lo
 
 ## Supported HTML and CSS
 
-A practical subset aimed at pages written for rubrowser: block, inline, inline-block and flex layout; margins, padding, borders, rounded corners, backgrounds; fonts, line height, text alignment, white-space, decorations, lists; `overflow` scrolling, absolute positioning, `:hover`, `:active`, `:focus`; links and text inputs. See [doc/plan.md](doc/plan.md) for details and [doc/architecture.md](doc/architecture.md) for how it works.
+A practical subset: block, inline, inline-block, flex and table layout; floats, absolute and fixed positioning, z-index; margins, padding, borders (solid, dashed, dotted, double), rounded corners, outlines, opacity; background colors and images; fonts, line height, text alignment, white-space, decorations, `text-transform`, sub/superscript, lists; `overflow` scrolling; `:hover`, `:active`, `:focus`; links; images (PNG, JPEG, GIF, WebP, BMP, `data:` URLs); forms (text, password, textarea, checkbox, radio, select, buttons, labels, GET submission); `<details>`. See [doc/plan.md](doc/plan.md), [doc/plan2.md](doc/plan2.md) and [doc/architecture.md](doc/architecture.md).
 
-Not supported yet: images, tables, floats, CJK fonts and IME.
+Not supported yet: CJK fonts and IME, `fetch`/`XMLHttpRequest`, `localStorage`, form POST, CSS grid/transforms/animations, video and canvas.
 
 ## License
 

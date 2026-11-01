@@ -91,10 +91,47 @@ enum Request {
 
 /// Languages a `<script>` can be written in. Every one runs as wasm: Rust
 /// (and other compiled languages) directly, JavaScript inside `js.wasm`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Lang {
+    /// A compiled wasm module, run directly.
     Wasm,
-    JavaScript,
+    /// Source code (`<script>`) for the language runtime of this MIME type.
+    Source(String),
+    /// A page-provided language runtime (`<link rel=rubrowser-runtime>`)
+    /// for this MIME type.
+    Runtime(String),
+}
+
+/// The MIME type all JavaScript `<script>` types are normalized to.
+const JS_MIME: &str = "text/javascript";
+
+/// Language runtimes built into the browser, by MIME type.
+fn builtin_runtime(mime: &str) -> Option<&'static [u8]> {
+    match mime {
+        JS_MIME => Some(JS_RUNTIME),
+        _ => None,
+    }
+}
+
+/// The script MIME type of a `<script type>` value (`None` for wasm).
+fn script_mime(ty: &str) -> Option<String> {
+    let ty = ty
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match ty.as_str() {
+        "application/wasm" | "wasm" => None,
+        ""
+        | "module"
+        | "text/javascript"
+        | "application/javascript"
+        | "application/ecmascript"
+        | "text/ecmascript"
+        | "application/x-javascript" => Some(JS_MIME.to_string()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// A `<script>` waiting to run (scripts run in document order).
@@ -158,8 +195,8 @@ struct Tab {
     timers: Vec<Timer>,
     /// Scripts not yet run, in document order.
     pending: std::collections::VecDeque<PendingScript>,
-    /// Index in `scripts` of the page's JavaScript runtime, once loaded.
-    js: Option<usize>,
+    /// Index in `scripts` of the page's runtime for each script MIME type.
+    runtimes: HashMap<String, usize>,
     /// Number of `<script>`s found when the page loaded.
     script_count: usize,
     /// Whether `DOMContentLoaded` / `load` have fired.
@@ -270,7 +307,7 @@ impl Browser {
             scripts: Vec::new(),
             timers: Vec::new(),
             pending: Default::default(),
-            js: None,
+            runtimes: HashMap::new(),
             script_count: 0,
             loaded: false,
         });
@@ -379,7 +416,7 @@ impl Browser {
         tab.scripts.clear();
         tab.timers.clear();
         tab.pending.clear();
-        tab.js = None;
+        tab.runtimes.clear();
         let (id, serial) = (tab.id, tab.serial);
         let links = tab.doc.stylesheet_links();
         let base = tab.doc.base_url();
@@ -388,7 +425,11 @@ impl Browser {
         // Inline handlers (onclick="…") are JavaScript too; register them
         // first so scripts can rely on them.
         if let Some(code) = inline_handlers(&tab.doc) {
-            scripts.insert(0, (Lang::JavaScript, None, code));
+            let at = scripts
+                .iter()
+                .take_while(|(l, _, _)| matches!(l, Lang::Runtime(_)))
+                .count();
+            scripts.insert(at, (Lang::Source(JS_MIME.to_string()), None, code));
         }
         tab.script_count = scripts.len();
         tab.loaded = false;
@@ -455,9 +496,10 @@ impl Browser {
             };
             match p.lang {
                 Lang::Wasm => self.start_wasm(i, &body, &p.name, host),
-                Lang::JavaScript => {
+                Lang::Runtime(mime) => self.start_runtime(i, &mime, &body, &p.name, host),
+                Lang::Source(mime) => {
                     let source = String::from_utf8_lossy(&body).into_owned();
-                    self.run_js(i, &source, &p.name, host);
+                    self.run_source(i, &mime, &source, &p.name, host);
                 }
             }
             if i >= self.tabs.len() {
@@ -504,21 +546,44 @@ impl Browser {
         self.dirty = true;
     }
 
-    /// Runs JavaScript in the page's JS runtime, starting it if needed.
-    fn run_js(&mut self, i: usize, source: &str, name: &str, host: &mut dyn Host) {
+    /// Loads a language runtime module for `mime` scripts in tab `i`.
+    fn start_runtime(
+        &mut self,
+        i: usize,
+        mime: &str,
+        bytes: &[u8],
+        name: &str,
+        host: &mut dyn Host,
+    ) {
         let (now, offset) = (self.now, self.wall_offset(host));
-        if self.tabs[i].js.is_none() {
-            let t = &mut self.tabs[i];
-            match Script::load_with(JS_RUNTIME, &mut t.doc, now, offset, Limits::RUNTIME) {
-                Ok(rt) => {
-                    t.scripts.push(Some(rt));
-                    t.js = Some(t.scripts.len() - 1);
-                    self.after_script(i, t_js(&self.tabs[i]), host);
-                }
-                Err(e) => return host.log(&format!("JavaScript runtime: {e}")),
+        let t = &mut self.tabs[i];
+        match Script::load_with(bytes, &mut t.doc, now, offset, Limits::RUNTIME) {
+            Ok(rt) if rt.is_runtime() => {
+                t.scripts.push(Some(rt));
+                let si = t.scripts.len() - 1;
+                t.runtimes.insert(mime.to_string(), si);
+                self.after_script(i, si, host);
+            }
+            Ok(_) => host.log(&format!(
+                "{name}: not a language runtime (needs rb_alloc and rb_eval)"
+            )),
+            Err(e) => host.log(&format!("{name}: {e}")),
+        }
+    }
+
+    /// Runs `mime` source code in the page's runtime for that language,
+    /// starting a built-in runtime if needed.
+    fn run_source(&mut self, i: usize, mime: &str, source: &str, name: &str, host: &mut dyn Host) {
+        if !self.tabs[i].runtimes.contains_key(mime) {
+            match builtin_runtime(mime) {
+                Some(wasm) => self.start_runtime(i, mime, wasm, &format!("{mime} runtime"), host),
+                None => return host.log(&format!("{name}: no runtime for scripts of type {mime}")),
             }
         }
-        let si = t_js(&self.tabs[i]);
+        let now = self.now;
+        let Some(&si) = self.tabs[i].runtimes.get(mime) else {
+            return;
+        };
         let t = &mut self.tabs[i];
         let Some(Some(rt)) = t.scripts.get_mut(si) else {
             return;
@@ -1628,43 +1693,43 @@ impl Browser {
     }
 }
 
-/// Every `<script>` the browser can run, in document order: its language,
-/// `src` (if external) and inline text.
+/// Every script the browser can run, in document order: language
+/// runtimes declared with `<link rel="rubrowser-runtime" type href>` first,
+/// then `<script>`s. Each entry is (language, `src`, inline text).
 fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
     let dom = &doc.dom;
-    dom.descendants(crate::dom::Dom::ROOT)
-        .into_iter()
-        .filter(|&n| dom.tag(n) == Some("script"))
-        .filter_map(|n| {
-            let src = dom.attr(n, "src").map(str::to_string);
-            let ty = dom
-                .attr(n, "type")
-                .unwrap_or("")
-                .trim()
-                .to_ascii_lowercase();
-            let lang = match ty.as_str() {
-                "application/wasm" | "wasm" => Lang::Wasm,
-                ""
-                | "module"
-                | "text/javascript"
-                | "application/javascript"
-                | "application/ecmascript"
-                | "text/ecmascript" => {
-                    if src.as_deref().is_some_and(|s| s.ends_with(".wasm")) {
-                        Lang::Wasm
-                    } else {
-                        Lang::JavaScript
-                    }
-                }
-                _ => return None,
-            };
-            let inline = dom.text_content(n);
-            if src.is_none() && (lang == Lang::Wasm || inline.trim().is_empty()) {
-                return None;
-            }
-            Some((lang, src, inline))
-        })
-        .collect()
+    let all = dom.descendants(crate::dom::Dom::ROOT);
+    let runtimes = all.iter().filter_map(|&n| {
+        let rel = dom.attr(n, "rel")?;
+        if dom.tag(n) != Some("link") || !rel.split_whitespace().any(|r| r == "rubrowser-runtime") {
+            return None;
+        }
+        let mime = script_mime(dom.attr(n, "type")?)?;
+        Some((
+            Lang::Runtime(mime),
+            Some(dom.attr(n, "href")?.to_string()),
+            String::new(),
+        ))
+    });
+    let scripts = all.iter().filter_map(|&n| {
+        if dom.tag(n) != Some("script") {
+            return None;
+        }
+        let src = dom.attr(n, "src").map(str::to_string);
+        let ty = dom.attr(n, "type").unwrap_or("");
+        let wasm_src = src.as_deref().is_some_and(|s| s.ends_with(".wasm"));
+        let lang = match script_mime(ty) {
+            Some(m) if m == JS_MIME && wasm_src => Lang::Wasm,
+            Some(m) => Lang::Source(m),
+            None => Lang::Wasm,
+        };
+        let inline = dom.text_content(n);
+        if src.is_none() && (lang == Lang::Wasm || inline.trim().is_empty()) {
+            return None;
+        }
+        Some((lang, src, inline))
+    });
+    runtimes.chain(scripts).collect()
 }
 
 /// JavaScript registering every `on…="code"` attribute, if there are any.
@@ -1703,10 +1768,6 @@ fn js_string(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-fn t_js(tab: &Tab) -> usize {
-    tab.js.unwrap_or(usize::MAX)
 }
 
 fn sanitize_scale(scale: f32) -> f32 {
@@ -2632,6 +2693,53 @@ mod tests {
         assert_eq!(px(&mut b, &mut h, vp.w - 10.0, 10.0), 0x00ff00);
         let hit = doc(&b).hit_test(vp.w - 10.0, 10.0).element;
         assert_eq!(hit, Some(page_el(&b, "fixed")));
+    }
+
+    /// A minimal language runtime: its "interpreter" writes the script
+    /// source into #out. (Tests accept WebAssembly text.)
+    const SHOUT_RUNTIME: &str = r##"(module
+        (import "rb" "query" (func $query (param i32 i32) (result i32)))
+        (import "rb" "set_text" (func $set_text (param i32 i32 i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "#out")
+        (global $next (mut i32) (i32.const 1024))
+        (func (export "rb_alloc") (param $len i32) (result i32)
+          (local $p i32)
+          (local.set $p (global.get $next))
+          (global.set $next (i32.add (global.get $next) (local.get $len)))
+          (local.get $p))
+        (func (export "rb_eval") (param $src i32) (param $len i32) (param i32 i32)
+          (call $set_text (call $query (i32.const 0) (i32.const 4))
+                          (local.get $src) (local.get $len))))"##;
+
+    #[test]
+    fn page_provided_language_runtime() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(800, 600, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://lang.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<link rel="rubrowser-runtime" type="text/x-shout" href="shout.wasm">
+            <p id=out>before</p>
+            <script type="text/x-shout">hello from a new language</script>
+            <script type="text/x-unknown">ignored</script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        let (rid, url) = h.inner.fetched.last().unwrap().clone();
+        assert_eq!(url, "https://lang.test/shout.wasm");
+        b.fetch_done(rid, Ok(SHOUT_RUNTIME.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let doc = &b.tabs[b.active].doc;
+        assert_eq!(
+            doc.dom.text_content(page_el(&b, "out")),
+            "hello from a new language"
+        );
+        assert!(
+            h.logs
+                .iter()
+                .any(|l| l.contains("no runtime for scripts of type text/x-unknown")),
+            "{:?}",
+            h.logs
+        );
     }
 
     #[test]

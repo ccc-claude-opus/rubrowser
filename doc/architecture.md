@@ -43,6 +43,8 @@ flowchart TB
 | `paint` | 背景、邊框、圓角、文字、底線、清單符號、輸入框、捲軸 |
 | `document` | 把上面串成一份文件：重新計算、hit-test、hover / focus、捲動、輸入框狀態 |
 | `script` | 在 wasmi 中執行網頁的 wasm，提供 DOM API（見 [abi.md](abi.md)） |
+| `lang` | 語言 runtime：`lang::js` 把 boa 編成 `js.wasm`（見 [javascript.md](javascript.md)、[languages.md](languages.md)） |
+| `document::forms` / `document::image` | 表單控制項狀態、圖片解碼與縮放快取 |
 | `browser` | 外框文件、分頁、歷史、載入、事件分派、快捷鍵 |
 | `net::url` | 網址列輸入、相對網址解析 |
 | `ui::TextField` | `<input>` 的編輯邏輯：游標、選取、單字移動、剪貼簿 |
