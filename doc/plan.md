@@ -1,202 +1,172 @@
 # rubrowser 開發規劃
 
-rubrowser 是一個用 Rust 寫的瀏覽器。它不跑 HTML / JavaScript，跑的是 **用 Rust 寫、編譯成 WebAssembly 的頁面程式**。
+rubrowser 是一個用 Rust 寫的瀏覽器，畫在**一塊空白畫布**上（原生視窗的像素緩衝區，或網頁上的單一 `<canvas>`）。
 
-整個瀏覽器只有一塊「畫板」（像素緩衝區），網址列、分頁、按鈕、捲軸等所有控制項都由 Rust 自己畫出來，並自己處理滑鼠與鍵盤。
+- 網頁使用 **HTML + CSS**，由 rubrowser 自己排版、自己畫。
+- **不支援 JavaScript**，網頁的行為改用 **WebAssembly**（例如 Rust 編成的 wasm）撰寫。
+- 瀏覽器本身的控制項（網址列、分頁、按鈕）**也是一份 HTML + CSS 文件**，和網頁共用同一套引擎。
 
 ## 1. 已確定的決策
 
 | 項目 | 決定 |
 |---|---|
-| 名稱 | `rubrowser`，發佈到 crates.io |
-| Crate 數量 | **只有一個 crate**，用 features 區分用途 |
-| 主要版本 | **原生版**：`cargo install rubrowser` 後直接執行 |
-| 附加版本 | 網頁 canvas 版：瀏覽器編成 wasm，在 `<canvas>` 上執行 |
-| 執行頁面 wasm | 內嵌 `wasmi`（純 Rust 直譯器），兩個版本共用 |
-| 繪圖 | 自寫軟體繪圖，輸出 `&[u32]` 像素陣列 |
-| 字型 | 第一版內嵌 8×16 點陣 ASCII 字型；之後再用 `fontdue` 支援中文 |
-| UI | 自寫 immediate-mode 控制項 |
-| 授權 | MIT |
+| 名稱 | `rubrowser`，發佈到 crates.io，**只有一個 crate** |
+| 主要版本 | 原生版（`winit` + `softbuffer`），`cargo install rubrowser` |
+| 附加版本 | 網頁 canvas 版（編成 wasm，`extern "C"` + `glue.js`） |
+| HTML 解析 | `html5ever`，透過 `TreeSink` 直接建立 rubrowser 自己的 DOM |
+| CSS 解析與選擇器 | `simplecss`（CSS 2 選擇器、specificity），顏色用 `csscolorparser` |
+| 排版 | `taffy`（block、flex），行內文字排版自己寫，作為 taffy 的量測葉節點 |
+| 字型 | `fontdue` 繪製字形，字型用 `dejavu` crate 內附的 DejaVu Sans / Bold / Mono |
+| 腳本 | `wasmi` 執行網頁的 wasm，有 fuel 與記憶體上限 |
+| 介面語言 | 先做英文介面；中文顯示列為後期 |
+| 授權 | MIT（DejaVu 字型為 Bitstream Vera 授權，可隨程式散佈） |
 
 ## 2. 架構
 
 ```mermaid
 flowchart TB
-  subgraph Native["原生版（主要）"]
-    W[winit：視窗、滑鼠、鍵盤、IME]
-    S[softbuffer：把像素貼到視窗]
-    U[ureq：下載頁面 .wasm]
+  subgraph Platform["平台層"]
+    N["原生：winit + softbuffer"]
+    W["網頁：canvas + glue.js"]
   end
-  subgraph Web["網頁版（附加）"]
-    C["index.html：只有一個 canvas"]
-    J["glue.js：轉送事件、putImageData、fetch"]
+  subgraph Browser["browser：分頁、歷史、事件分派"]
+    CH["瀏覽器外框文件<br/>chrome.html + chrome.css"]
+    TAB["分頁：各自一份 Document"]
   end
-  subgraph Core["rubrowser 核心（與平台無關）"]
-    BR[browser：分頁、網址列、歷史、導覽]
-    UI[ui：自繪控制項]
-    GFX[gfx：framebuffer、圖形、字型]
-    RT[runtime：wasmi、ABI、沙箱]
+  subgraph Engine["排版引擎"]
+    HTML["html（html5ever）"] --> DOM[dom：節點樹]
+    CSS["css（simplecss）"] --> STY[style：computed style]
+    DOM --> STY --> LAY["layout（taffy + 行內排版）"]
+    LAY --> PAINT[paint：display list]
+    TEXT["text（fontdue + DejaVu）"] --> LAY
   end
-  subgraph Pages["頁面程式 *.wasm（使用 sdk feature）"]
-    P1[hello] --- P2[paint] --- P3[snake]
+  subgraph Script["script：wasm 取代 JS"]
+    RT["wasmi + fuel 沙箱"]
+    API["DOM API"]
   end
-  W --> BR
-  J --> BR
-  BR --> UI --> GFX
-  GFX --> S
-  GFX --> J
-  BR --> RT --> Pages
-  U --> RT
+  GFX[gfx：軟體繪圖]
+  NET[net：URL、載入]
+
+  N & W --> Browser
+  CH --> Engine
+  TAB --> Engine
+  PAINT --> GFX --> Platform
+  TAB --> Script --> DOM
+  Browser --> NET
 ```
 
-核心對外只有兩個介面：
+### 一份文件的處理流程
 
-- **輸入**：滑鼠、鍵盤、視窗尺寸等事件
-- **輸出**：一個 `width × height` 的 `u32` 像素陣列（`0x00RRGGBB`）
-
-所以兩種平台都只需要一層很薄的轉接。
-
-## 3. 依賴套件
-
-| 套件 | 版本 | 用途 | feature |
-|---|---|---|---|
-| `wasmi` | 2.x | 執行頁面 wasm | `core` |
-| `winit` | 0.30 | 視窗、輸入、IME | `native` |
-| `softbuffer` | 0.4 | 把像素貼到視窗 | `native` |
-| `ureq` | 3.x | HTTP 下載頁面 | `native` |
-| `arboard` | 3.x | 剪貼簿（可選） | `native` |
-| `fontdue` | 0.9 | TTF 字型（第二階段） | `core` |
-
-網頁版**不使用** wasm-bindgen / web-sys，只用 `extern "C"` 匯出函式，再加一個手寫的 `glue.js`。
-
-`sdk` feature **沒有任何依賴**。
-
-## 4. 專案結構
-
-```
-rubrowser/
-├─ Cargo.toml
-├─ src/
-│  ├─ lib.rs          # 依 feature 決定要編進哪些模組
-│  ├─ main.rs         # 原生執行檔（需要 native feature）
-│  ├─ gfx/            # framebuffer、圖形、點陣字型
-│  ├─ ui/             # 自繪控制項
-│  ├─ runtime/        # wasmi 包裝、ABI、沙箱
-│  ├─ browser/        # 分頁、網址列、歷史、導覽
-│  ├─ platform/
-│  │  ├─ native.rs    # winit + softbuffer
-│  │  └─ web.rs       # extern "C" 匯出給 glue.js
-│  └─ sdk/            # 頁面作者用的 API
-├─ examples/          # 範例頁面：hello、links、paint、calc、snake
-├─ web/               # index.html + glue.js
-├─ assets/            # 預先編好的範例頁面 .wasm（打包進原生版當內建首頁）
-├─ scripts/build.sh   # 編譯網頁版與範例頁面
-└─ doc/
+```mermaid
+flowchart LR
+  A[HTML 文字] -->|html5ever| B[DOM]
+  C["CSS：UA 樣式表、style、link、style 屬性"] -->|simplecss| D[規則]
+  B & D -->|選擇器比對 + cascade + 繼承| E[computed style]
+  E -->|box tree| F["taffy 節點 + 文字量測"]
+  F -->|compute_layout| G[每個盒子的位置大小]
+  G --> H[display list] --> I[像素]
 ```
 
-### Cargo features
+### 瀏覽器外框也是 HTML
 
-```toml
-[features]
-default = ["native"]
-sdk     = []
-core    = ["dep:wasmi"]
-native  = ["core", "dep:winit", "dep:softbuffer", "dep:ureq"]
-web     = ["core"]
+- `chrome.html` 裡有網址列 `<input>`、分頁、按鈕，以及一個佔位元素 `<div id="viewport">`。
+- 引擎先排版外框，再把目前分頁的 Document 畫進 `#viewport` 的矩形範圍。
+- 外框的行為第一版用 Rust 內建程式碼，透過**和網頁 wasm 相同的 DOM 操作**控制外框文件。
 
-[lib]
-crate-type = ["rlib", "cdylib"]
+## 3. wasm 取代 JavaScript
 
-[[bin]]
-name = "rubrowser"
-required-features = ["native"]
-
-[[example]]
-name = "hello"
-crate-type = ["cdylib"]
-required-features = ["sdk"]
+```html
+<button id="inc">+1</button> <span id="count">0</span>
+<script type="application/wasm" src="counter.wasm"></script>
 ```
-
-### 使用方式
-
-| 用途 | 指令 |
-|---|---|
-| 安裝原生版 | `cargo install rubrowser` |
-| 開啟頁面 | `rubrowser https://example.com/hello.wasm` |
-| 開啟本機頁面 | `rubrowser ./hello.wasm` |
-| 編譯網頁版 | `cargo build --lib --target wasm32-unknown-unknown --no-default-features --features web` |
-| 編譯範例頁面 | `cargo build --example hello --target wasm32-unknown-unknown --no-default-features --features sdk` |
-| 寫自己的頁面 | `rubrowser = { version = "0.1", default-features = false, features = ["sdk"] }` |
-
-## 5. 頁面程式介面（ABI v0）
-
-### 頁面匯出（export）
-
-| 函式 | 說明 |
-|---|---|
-| `rb_init()` | 載入後呼叫一次 |
-| `rb_frame(w: i32, h: i32, t_ms: f64)` | 每幀呼叫一次，頁面在此繪圖 |
-| `rb_event(kind: i32, a: i32, b: i32, c: i32)` | 滑鼠與鍵盤事件，座標已轉成頁面座標 |
-
-### 瀏覽器提供（import，模組名 `rb`）
-
-| 函式 | 說明 |
-|---|---|
-| `clear(color)` | 清除內容區 |
-| `fill_rect(x, y, w, h, color)` | 填滿矩形 |
-| `line(x0, y0, x1, y1, color)` | 畫線 |
-| `draw_text(ptr, len, x, y, size, color)` | 畫 UTF-8 文字（用瀏覽器的字型） |
-| `text_width(ptr, len, size) -> i32` | 量測文字寬度 |
-| `blit(ptr, w, h, x, y)` | 直接貼上一塊像素 |
-| `navigate(ptr, len)` | 開啟連結（可為相對網址） |
-| `set_title(ptr, len)` | 設定分頁標題 |
-| `log(ptr, len)` | 輸出除錯訊息 |
-| `request_redraw()` | 要求下一幀重畫 |
-| `now() -> f64` | 目前時間（毫秒） |
-
-### SDK 寫法
 
 ```rust
 use rubrowser::sdk::*;
 
-struct App { clicks: u32 }
+struct Counter;
 
-impl Page for App {
-    fn frame(&mut self, g: &mut Gfx) {
-        g.clear(0x202020);
-        g.text(20, 20, 16, "Hello rubrowser", 0xffffff);
+impl Script for Counter {
+    fn init(&mut self) {
+        query("#inc").on("click");
     }
     fn event(&mut self, e: Event) {
-        if let Event::MouseDown { .. } = e { self.clicks += 1; }
+        let count = query("#count");
+        let n: i32 = count.text().parse().unwrap_or(0);
+        count.set_text(&(n + 1).to_string());
     }
 }
 
-page!(App { clicks: 0 });
+script!(Counter);
 ```
 
-### 沙箱
+| 項目 | 設計 |
+|---|---|
+| 節點參照 | 整數 handle |
+| DOM API | `query`、`query_all`、`text` / `set_text`、`attr` / `set_attr`、`add_class` / `remove_class`、`set_style`、`create_element`、`append`、`remove`、`value` / `set_value` |
+| 事件 | `on(handle, "click")` 登記，事件發生時呼叫 wasm 匯出的 `rb_event` |
+| 其他 | `navigate`、`log`、`set_timeout` |
+| 沙箱 | 每次呼叫有 fuel 上限、記憶體上限；崩潰只影響自己的分頁 |
 
-- 用 wasmi 的 **fuel** 限制每次呼叫可執行的指令數，避免無窮迴圈卡住瀏覽器。
-- 限制頁面的線性記憶體上限。
-- 頁面 trap 或超時時，只顯示錯誤頁，瀏覽器本身不受影響。
-- 頁面只能透過上述 import 和外界互動，無法存取檔案或網路。
+完整 ABI 寫在 `doc/abi.md`（H8）。
+
+## 4. HTML / CSS 支援範圍（第一版）
+
+**HTML**：html5ever 處理完整的 HTML5 語法。排版支援的元素有 `div span p h1–h6 a ul ol li br hr pre code b i strong em input button`；`style`、`link`、`script`、`title` 有特別處理。暫不支援 `img`、`table`、`form` 送出。
+
+**CSS**
+
+| 類別 | 屬性 |
+|---|---|
+| 選擇器 | `*`、標籤、`.class`、`#id`、`[attr]`、後代、`>`、`+`、`:hover` `:active` `:focus` `:first-child` |
+| display | `block` `inline` `inline-block` `flex` `none` |
+| 盒模型 | `margin` `padding` `border`（solid）`width` `height` `min-*` `max-*` `box-sizing` |
+| 文字 | `color` `font-size` `font-weight` `font-family`（sans / monospace）`line-height` `text-align` `white-space` `text-decoration` |
+| 背景 | `background-color`、`background` 的顏色部分 |
+| Flex | `flex-direction` `flex-wrap` `justify-content` `align-items` `align-self` `gap` `flex` `flex-grow` `flex-shrink` `flex-basis` |
+| 其他 | `overflow`（hidden / auto / scroll）`cursor` |
+| 單位 | `px` `em` `rem` `%` |
+| 顏色 | 顏色名稱、`#hex`、`rgb()`、`rgba()`（alpha 混色） |
+
+## 5. 模組結構
+
+```
+src/
+├─ gfx/       軟體繪圖：framebuffer、裁切、blit、alpha 混色
+├─ text/      fontdue、字型、量測、字形快取
+├─ dom/       節點樹（arena + NodeId）、html5ever TreeSink
+├─ css/       樣式表、選擇器比對、cascade、值的解析
+├─ layout/    box tree、taffy、行內排版
+├─ paint/     display list → gfx
+├─ document/  把上面串成一份可互動的 Document（hover、focus、捲動、hit-test）
+├─ script/    wasmi 執行網頁 wasm、DOM API
+├─ net/       URL、載入
+├─ ui/        TextField（<input> 的編輯邏輯）
+├─ browser/   外框文件、分頁、歷史
+├─ platform/  native.rs、web.rs
+└─ sdk/       網頁 wasm 用的 API
+```
 
 ## 6. 里程碑
 
-| 階段 | 內容 | 完成條件 |
-|---|---|---|
-| **M0** 骨架 | `Cargo.toml`（含發佈資訊與 features）；原生版開視窗、填滿單色；網頁版在 canvas 填滿單色 | 兩個版本都能顯示畫面，`cargo publish --dry-run` 通過 |
-| **M1** 繪圖 | 矩形、線、裁切區、點陣字型、高 DPI 縮放 | 畫出靜態的瀏覽器外框 |
-| **M2** UI 與輸入 | 按鈕（hover / 按下）、文字框（游標、選取、方向鍵、Backspace、剪貼簿）、焦點與 Tab 切換、分頁列 | 網址列可以輸入與編輯 |
-| **M3** 執行頁面 | wasmi 載入頁面，ABI v0，SDK，`examples/hello` | 輸入網址後顯示 hello 頁面並能點擊互動 |
-| **M4** 瀏覽 | `navigate`、上一頁 / 下一頁 / 重新整理、多分頁、載入中與錯誤頁、內建首頁 | 在多個範例頁面之間跳轉 |
-| **M5** 沙箱與範例 | fuel、記憶體上限；範例 paint、calc、snake | 寫一個無窮迴圈的頁面也不會卡住瀏覽器 |
-| **M6** 文件 | `doc/` 架構說明、ABI 規格、頁面撰寫教學；README | 新使用者能照文件寫出自己的頁面 |
-| **M7** 發佈 | 版本號、`cargo publish --dry-run`、CI | 交給作者執行 `cargo publish` |
+| 階段 | 內容 | 完成條件 | 狀態 |
+|---|---|---|---|
+| M0 | 單一 crate 骨架，原生與網頁版都能顯示畫面 | `cargo publish --dry-run` 通過 | ✅ |
+| M1 | 軟體繪圖、點陣字、高 DPI | 畫出靜態外框 | ✅ |
+| 基礎 | 輸入事件、URL、TextField、wasm 執行環境 | 單元測試通過 | ✅ |
+| **H1** 文字 | fontdue、DejaVu、量測、字形快取 | 畫出不同大小、粗細的比例字 | |
+| **H2** DOM + HTML | 自己的 DOM、html5ever TreeSink | 解析 HTML 得到正確 DOM 樹 | |
+| **H3** CSS | UA 樣式表、選擇器比對、cascade、繼承、值解析 | 每個節點算得出 computed style | |
+| **H4** 排版 + 繪製 | box tree、taffy、行內排版、背景、邊框、文字 | `rubrowser page.html` 畫出靜態網頁 | |
+| **H5** 互動 | hit-test、`:hover` `:active` `:focus`、連結、捲動 | 點擊連結能換頁 | |
+| **H6** HTML 外框 | `chrome.html` / `chrome.css`、分頁、歷史、載入 http / file | 整個瀏覽器由 HTML + CSS 畫出 | |
+| **H7** 表單 | `<input>` 編輯、`<button>`、Tab 切換焦點 | 網址列可完整編輯 | |
+| **H8** wasm 腳本 | `<script type="application/wasm">`、DOM API、SDK、範例 | counter、todo 範例可運作 | |
+| **H9** 收尾 | 網頁 canvas 版、文件、`cargo publish --dry-run` | 交給作者發佈 | |
+| 後期 | `img`、`table`、`position`、`border-radius`、中文字型、IME | | |
 
 ## 7. 已知風險
 
-- **中文輸入**：原生版可用 winit 的 IME 事件實作（M2 之後）；網頁版因為只有 canvas，暫不支援。
-- **中文顯示**：需要中文字型，檔案較大，第二階段再處理（例如字型子集或讀系統字型）。
-- **效能**：wasmi 是直譯器，比 JIT 慢，但畫 UI 與小遊戲足夠；畫面只在有變動時重畫。
-- **發佈時的 wasm 檔**：`assets/` 中預先編好的範例頁面要和原始碼一起提交，並注意 crates.io 單一 crate 10 MB 的上限。
+- **相容性**：只支援上面列出的子集，一般網站不會正確顯示；目標是「為 rubrowser 寫的網頁」。
+- **行內排版**：taffy 不處理文字，行內排版（斷行、混合樣式）要自己寫，是最複雜的部分。
+- **效能**：純軟體繪製；只在有變動時重新排版與重畫。
+- **中文**：DejaVu 沒有中文字形，第一版中文會顯示成方框。
