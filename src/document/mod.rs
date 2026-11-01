@@ -275,6 +275,7 @@ impl Document {
                 self.needs_layout = true;
             }
             self.needs_style = false;
+            self.sync_inline_svgs();
         }
         if self.needs_layout {
             let replaced = self.replaced_sizes(fonts);
@@ -367,6 +368,37 @@ impl Document {
 
     /// Natural sizes of images: the bitmap's, or room for the `alt` text
     /// when there is no image to show.
+    /// Parses each rendered outermost `<svg>` whose markup changed.
+    fn sync_inline_svgs(&mut self) {
+        for n in self.dom.descendants(Dom::ROOT) {
+            if self.dom.tag(n) != Some("svg") {
+                continue;
+            }
+            let Some(color) = self.style(n).map(|s| s.color) else {
+                continue;
+            };
+            let mut up = self.dom.parent(n);
+            let mut nested = false;
+            while let Some(p) = up {
+                nested |= self.dom.tag(p) == Some("svg");
+                up = self.dom.parent(p);
+            }
+            if nested {
+                continue; // drawn as part of the outer <svg>
+            }
+            let markup = image::svg_markup(&self.dom, n, color);
+            if self.images.get(n).is_some_and(|s| s.src() == markup) {
+                continue;
+            }
+            let state = match Bitmap::svg(markup.as_bytes()) {
+                Ok(b) => ImageState::Ready(markup, std::rc::Rc::new(b)),
+                Err(_) => ImageState::Failed(markup),
+            };
+            self.images.set(n, state);
+            self.needs_layout = true;
+        }
+    }
+
     fn replaced_sizes(&self, fonts: &Fonts) -> Replaced {
         let mut out = Replaced::new();
         for n in self.dom.descendants(Dom::ROOT) {
@@ -374,7 +406,7 @@ impl Document {
                 out.insert(n, size);
                 continue;
             }
-            if self.dom.tag(n) != Some("img") {
+            if !matches!(self.dom.tag(n), Some("img" | "svg")) {
                 continue;
             }
             let size = match self.images.get(n) {
@@ -498,11 +530,11 @@ impl Document {
     pub fn image_requests(&mut self) -> Vec<(Option<NodeId>, String)> {
         let mut out = Vec::new();
         for st in self.styles.iter().flatten() {
-            if let Some(url) = &st.background_image
-                && !self.images.urls.contains_key(url)
-            {
-                self.images.set_url(url, ImageState::Loading(url.clone()));
-                out.push((None, url.clone()));
+            for url in [&st.background_image, &st.mask.image].into_iter().flatten() {
+                if !self.images.urls.contains_key(url) {
+                    self.images.set_url(url, ImageState::Loading(url.clone()));
+                    out.push((None, url.clone()));
+                }
             }
         }
         for n in self.dom.descendants(Dom::ROOT) {

@@ -89,6 +89,27 @@ pub enum BackgroundSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Repeat(pub bool, pub bool);
 
+/// `mask-image` and its size, position and repeat (the image's alpha
+/// masks the element's background color; used for icons).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Mask {
+    pub image: Option<String>,
+    pub size: BackgroundSize,
+    pub repeat: Repeat,
+    pub position: (Dim, Dim),
+}
+
+impl Default for Mask {
+    fn default() -> Self {
+        Mask {
+            image: None,
+            size: BackgroundSize::Auto,
+            repeat: Repeat(true, true),
+            position: (Dim::Percent(0.0), Dim::Percent(0.0)),
+        }
+    }
+}
+
 impl Default for Repeat {
     fn default() -> Self {
         Repeat(true, true)
@@ -276,6 +297,7 @@ pub struct Style {
     /// `background-position` as fractions (0 = left/top, 1 = right/bottom)
     /// or pixel offsets.
     pub background_position: (Dim, Dim),
+    pub mask: Rc<Mask>,
     /// Grid container and item properties, kept as CSS text and parsed at
     /// layout time.
     pub grid: Rc<GridProps>,
@@ -354,6 +376,7 @@ impl Default for Style {
             background_size: BackgroundSize::Auto,
             background_repeat: Repeat(true, true),
             background_position: (Dim::Percent(0.0), Dim::Percent(0.0)),
+            mask: Rc::default(),
             grid: Rc::default(),
             justify_items: Align::Normal,
             justify_self: Align::Normal,
@@ -613,6 +636,29 @@ impl Style {
                 }
             }
             "background-image" => self.background_image = url_value(value),
+            "mask-image" | "-webkit-mask-image" => {
+                Rc::make_mut(&mut self.mask).image = url_value(value)
+            }
+            "mask" | "-webkit-mask" => {
+                let m = Rc::make_mut(&mut self.mask);
+                m.image = tokens(value).iter().find_map(|t| url_value(t));
+            }
+            "mask-repeat" | "-webkit-mask-repeat" => {
+                if let Some(r) = repeat(v) {
+                    Rc::make_mut(&mut self.mask).repeat = r;
+                }
+            }
+            "mask-size" | "-webkit-mask-size" => {
+                if let Some(sz) = background_size(v, fc) {
+                    Rc::make_mut(&mut self.mask).size = sz;
+                }
+            }
+            "mask-position" | "-webkit-mask-position" => {
+                let t = tokens(v);
+                if let Some(p) = background_position(&t, fc) {
+                    Rc::make_mut(&mut self.mask).position = p;
+                }
+            }
             "background-repeat" => set(&mut self.background_repeat, repeat(v)),
             "background-size" => set(&mut self.background_size, background_size(v, fc)),
             "background-position" => {

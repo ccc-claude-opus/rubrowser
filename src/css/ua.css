@@ -22,6 +22,7 @@ head, style, script, title, meta, link, base, template, noscript {
 li { display: list-item; }
 
 img { display: inline-block; }
+svg { display: inline-block; overflow: hidden; }
 
 body { margin: 8px; }
 

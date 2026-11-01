@@ -5,22 +5,93 @@ use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
 
-use crate::dom::NodeId;
+use resvg::{tiny_skia, usvg};
+
+use crate::css::values::Rgba;
+use crate::dom::{Dom, NodeId};
 
 /// Largest image (each side) the browser decodes.
 const MAX_SIDE: u32 = 8192;
 
-/// A decoded image in `0xAARRGGBB` pixels.
+/// A decoded image in `0xAARRGGBB` pixels, or an SVG drawing that is
+/// rasterized at whatever size it is painted.
 #[derive(Debug, PartialEq)]
 pub struct Bitmap {
+    /// Natural size in CSS pixels.
     pub width: u32,
     pub height: u32,
+    /// Empty for SVG.
     pub pixels: Vec<u32>,
+    pub svg: Option<Svg>,
+}
+
+/// A parsed SVG document.
+#[derive(Clone)]
+pub struct Svg(pub Rc<usvg::Tree>);
+
+impl PartialEq for Svg {
+    fn eq(&self, other: &Svg) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl std::fmt::Debug for Svg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = self.0.size();
+        write!(f, "Svg({}x{})", s.width(), s.height())
+    }
+}
+
+/// Whether `bytes` look like an SVG document.
+fn is_svg(bytes: &[u8]) -> bool {
+    let head = &bytes[..bytes.len().min(1024)];
+    let head = String::from_utf8_lossy(head);
+    let t = head.trim_start_matches('\u{feff}').trim_start();
+    (t.starts_with('<') && head.contains("<svg")) || t.starts_with("<svg")
 }
 
 impl Bitmap {
-    /// Decodes PNG, JPEG, GIF (first frame), WebP or BMP.
+    /// Parses an SVG document (text is not rendered: no fonts are loaded).
+    pub fn svg(bytes: &[u8]) -> Result<Bitmap, String> {
+        let tree =
+            usvg::Tree::from_data(bytes, &usvg::Options::default()).map_err(|e| e.to_string())?;
+        let size = tree.size();
+        Ok(Bitmap {
+            width: size.width().ceil() as u32,
+            height: size.height().ceil() as u32,
+            pixels: Vec::new(),
+            svg: Some(Svg(Rc::new(tree))),
+        })
+    }
+
+    /// Rasterizes an SVG at `w × h`.
+    fn render_svg(svg: &Svg, w: u32, h: u32) -> Vec<u32> {
+        let Some(mut pm) = tiny_skia::Pixmap::new(w.max(1), h.max(1)) else {
+            return Vec::new();
+        };
+        let size = svg.0.size();
+        let ts = tiny_skia::Transform::from_scale(
+            w as f32 / size.width().max(1e-3),
+            h as f32 / size.height().max(1e-3),
+        );
+        resvg::render(&svg.0, ts, &mut pm.as_mut());
+        pm.pixels()
+            .iter()
+            .map(|p| {
+                let c = p.demultiply();
+                (c.alpha() as u32) << 24
+                    | (c.red() as u32) << 16
+                    | (c.green() as u32) << 8
+                    | c.blue() as u32
+            })
+            .collect()
+    }
+
+    /// Decodes PNG, JPEG, GIF (first frame), WebP, BMP or SVG.
     pub fn decode(bytes: &[u8]) -> Result<Bitmap, String> {
+        if is_svg(bytes) {
+            return Self::svg(bytes);
+        }
         let mut limits = image::Limits::default();
         limits.max_image_width = Some(MAX_SIDE);
         limits.max_image_height = Some(MAX_SIDE);
@@ -46,11 +117,15 @@ impl Bitmap {
             width,
             height,
             pixels,
+            svg: None,
         }
     }
 
     /// A copy resized to `w × h` (smooth filtering).
     pub fn resized(&self, w: u32, h: u32) -> Vec<u32> {
+        if let Some(svg) = &self.svg {
+            return Self::render_svg(svg, w, h);
+        }
         if (w, h) == (self.width, self.height) {
             return self.pixels.clone();
         }
@@ -152,6 +227,88 @@ impl Images {
     }
 }
 
+/// SVG element names that HTML parsing lowercased.
+const SVG_NAMES: &[&str] = &[
+    "altGlyph",
+    "animateMotion",
+    "animateTransform",
+    "clipPath",
+    "feBlend",
+    "feColorMatrix",
+    "feComponentTransfer",
+    "feComposite",
+    "feConvolveMatrix",
+    "feDiffuseLighting",
+    "feDisplacementMap",
+    "feDistantLight",
+    "feDropShadow",
+    "feFlood",
+    "feFuncA",
+    "feFuncB",
+    "feFuncG",
+    "feFuncR",
+    "feGaussianBlur",
+    "feImage",
+    "feMerge",
+    "feMergeNode",
+    "feMorphology",
+    "feOffset",
+    "fePointLight",
+    "feSpecularLighting",
+    "feSpotLight",
+    "feTile",
+    "feTurbulence",
+    "foreignObject",
+    "linearGradient",
+    "radialGradient",
+    "textPath",
+];
+
+/// Serializes inline `<svg>` element `id` as a standalone SVG document,
+/// with `currentColor` resolved to `color`.
+pub fn svg_markup(dom: &Dom, id: NodeId, color: Rgba) -> String {
+    fn write(dom: &Dom, id: NodeId, out: &mut String, root: bool, color: Rgba) {
+        if let Some(t) = dom.text(id) {
+            out.push_str(&crate::dom::escape(t, false));
+            return;
+        }
+        let Some(e) = dom.element(id) else { return };
+        let name = SVG_NAMES
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case(&e.name))
+            .copied()
+            .unwrap_or(&e.name);
+        out.push('<');
+        out.push_str(name);
+        for (n, v) in &e.attrs {
+            if root && (n == "xmlns" || n == "color") {
+                continue;
+            }
+            out.push(' ');
+            out.push_str(if n == "href" { "xlink:href" } else { n });
+            out.push_str("=\"");
+            out.push_str(&crate::dom::escape(v, true));
+            out.push('"');
+        }
+        if root {
+            out.push_str(&format!(
+                " xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" color=\"#{:06x}\"",
+                color.rgb()
+            ));
+        }
+        out.push('>');
+        for &c in dom.children(id) {
+            write(dom, c, out, false, color);
+        }
+        out.push_str("</");
+        out.push_str(name);
+        out.push('>');
+    }
+    let mut out = String::new();
+    write(dom, id, &mut out, true, color);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,5 +330,16 @@ mod tests {
         assert_eq!(b.pixels, vec![0xff_ff0000, 0x80_0000ff]);
         assert_eq!(b.resized(4, 2).len(), 8);
         assert!(Bitmap::decode(b"not an image").is_err());
+    }
+
+    #[test]
+    fn svg_renders_at_any_size() {
+        let svg = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="10" height="10" fill="red"/></svg>"#;
+        let b = Bitmap::decode(svg).unwrap();
+        assert_eq!((b.width, b.height), (20, 10));
+        let px = b.resized(40, 20);
+        assert_eq!(px.len(), 800);
+        assert_eq!(px[0], 0xff_ff0000);
+        assert_eq!(px[39] >> 24, 0, "right half is transparent");
     }
 }

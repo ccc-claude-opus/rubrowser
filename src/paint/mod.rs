@@ -200,7 +200,9 @@ impl Painter<'_> {
                 Control::Hidden => {}
             }
         }
-        if let Some(node) = b.node.filter(|&n| self.dom.tag(n) == Some("img"))
+        if let Some(node) = b
+            .node
+            .filter(|&n| matches!(self.dom.tag(n), Some("img" | "svg")))
             && style.visible
         {
             self.image(c, b, node, style, r);
@@ -320,6 +322,27 @@ impl Painter<'_> {
         let Some(url) = &style.background_image else {
             return;
         };
+        let layer = cs::Mask {
+            image: None,
+            size: style.background_size,
+            repeat: style.background_repeat,
+            position: style.background_position,
+        };
+        self.image_layer(c, b, r, url, &layer, None);
+    }
+
+    /// Paints image `url` sized, positioned and tiled per `layer` in the
+    /// padding box of `b`. With `mask`, the image's alpha is used to paint
+    /// that color instead (`mask-image`).
+    fn image_layer(
+        &self,
+        c: &mut Canvas,
+        b: &LBox,
+        r: RectF,
+        url: &str,
+        layer: &cs::Mask,
+        mask: Option<Rgba>,
+    ) {
         let Some(bm) = self.images.urls.get(url).and_then(|s| s.bitmap()) else {
             return;
         };
@@ -333,7 +356,7 @@ impl Painter<'_> {
         if iw <= 0.0 || ih <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
             return;
         }
-        let (tw, th) = match style.background_size {
+        let (tw, th) = match layer.size {
             cs::BackgroundSize::Auto => (iw, ih),
             cs::BackgroundSize::Cover => {
                 let k = (area.w / iw).max(area.h / ih);
@@ -361,8 +384,8 @@ impl Painter<'_> {
             Dim::Percent(p) => room * p / 100.0,
             other => other.px_or_zero(room),
         };
-        let x0 = area.x + place(style.background_position.0, area.w - tw);
-        let y0 = area.y + place(style.background_position.1, area.h - th);
+        let x0 = area.x + place(layer.position.0, area.w - tw);
+        let y0 = area.y + place(layer.position.1, area.h - th);
         let s = self.scale;
         let (pw, ph) = (
             (tw * s).round().max(1.0) as u32,
@@ -373,7 +396,8 @@ impl Painter<'_> {
         };
         let saved = c.clip();
         c.set_clip(self.phys(r).intersect(&saved));
-        let cs::Repeat(rx, ry) = style.background_repeat;
+        let alpha: Option<Vec<u8>> = mask.map(|_| px.iter().map(|&p| (p >> 24) as u8).collect());
+        let cs::Repeat(rx, ry) = layer.repeat;
         let start = |p0: f32, size: f32, lo: f32, rep: bool| {
             if rep {
                 p0 - ((p0 - lo) / size).ceil().max(0.0) * size
@@ -386,7 +410,12 @@ impl Painter<'_> {
             let mut x = start(x0, tw, r.x, rx);
             while x < r.x + r.w {
                 let (dx, dy) = ((x * s).round() as i32, (y * s).round() as i32);
-                c.draw_argb(dx, dy, pw as usize, ph as usize, &px);
+                match (&alpha, mask) {
+                    (Some(a), Some(col)) => {
+                        c.draw_mask(dx, dy, pw as usize, ph as usize, a, col.rgb())
+                    }
+                    _ => c.draw_argb(dx, dy, pw as usize, ph as usize, &px),
+                }
                 if !rx {
                     break;
                 }
@@ -712,6 +741,13 @@ impl Painter<'_> {
                 .border_style
                 .iter()
                 .all(|&ls| matches!(ls, cs::LineStyle::Solid | cs::LineStyle::None));
+        if let Some(url) = &style.mask.image {
+            // An icon: the mask shapes the background color.
+            if style.background.is_visible() {
+                self.image_layer(c, b, r, url, &style.mask, Some(style.background));
+            }
+            return;
+        }
         if style.background_image.is_some() && radius <= 0.0 {
             self.fill(c, r, style.background);
             self.background_image(c, b, style, r);
