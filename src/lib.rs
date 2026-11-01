@@ -24,4 +24,6 @@ pub mod runtime;
 #[cfg(feature = "sdk")]
 pub mod sdk;
 #[cfg(feature = "core")]
+pub mod text;
+#[cfg(feature = "core")]
 pub mod ui;

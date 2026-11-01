@@ -188,7 +188,57 @@ impl Canvas {
     }
 }
 
+/// Mixes `fg` over `bg` with coverage `alpha` (0–255).
+pub fn blend(bg: Color, fg: Color, alpha: u8) -> Color {
+    match alpha {
+        0 => bg,
+        255 => fg,
+        a => {
+            let a = a as u32;
+            let mix = |shift: u32| {
+                let b = (bg >> shift) & 0xff;
+                let f = (fg >> shift) & 0xff;
+                ((f * a + b * (255 - a) + 127) / 255) << shift
+            };
+            mix(16) | mix(8) | mix(0)
+        }
+    }
+}
+
 impl Canvas {
+    /// Fills a rectangle with `color` at opacity `alpha`, clipped.
+    pub fn fill_rect_alpha(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color, alpha: u8) {
+        if alpha == 255 {
+            return self.fill_rect(x, y, w, h, color);
+        }
+        let r = Rect::new(x, y, w.max(0), h.max(0)).intersect(&self.clip);
+        for row in r.y..r.bottom() {
+            let start = row as usize * self.width;
+            for p in &mut self.pixels[start + r.x as usize..start + r.right() as usize] {
+                *p = blend(*p, color, alpha);
+            }
+        }
+    }
+
+    /// Draws `color` through a `w × h` coverage mask at `(x, y)`, clipped.
+    pub fn draw_mask(&mut self, x: i32, y: i32, w: usize, h: usize, mask: &[u8], color: Color) {
+        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
+        if r.w == 0 || r.h == 0 || mask.len() < w * h {
+            return;
+        }
+        for row in r.y..r.bottom() {
+            let my = (row - y) as usize;
+            let line = row as usize * self.width;
+            for col in r.x..r.right() {
+                let a = mask[my * w + (col - x) as usize];
+                if a != 0 {
+                    let p = &mut self.pixels[line + col as usize];
+                    *p = blend(*p, color, a);
+                }
+            }
+        }
+    }
+
     /// Copies `src` (`w × h` pixels) stretched to fill `dst` (nearest
     /// neighbor), clipped.
     pub fn blit_scaled(&mut self, dst: Rect, w: usize, h: usize, src: &[Color]) {
@@ -376,6 +426,16 @@ mod tests {
         let mut c = Canvas::new(3, 2);
         c.blit(1, 1, 3, 1, &[1, 2, 3]);
         assert_eq!(c.pixels(), &[0, 0, 0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn blending() {
+        assert_eq!(blend(0x000000, 0xffffff, 255), 0xffffff);
+        assert_eq!(blend(0x000000, 0xffffff, 0), 0);
+        assert_eq!(blend(0x000000, 0xff0000, 128), 0x800000);
+        let mut c = Canvas::new(2, 1);
+        c.draw_mask(0, 0, 2, 1, &[255, 0], 0x123456);
+        assert_eq!(c.pixels(), &[0x123456, 0]);
     }
 
     #[test]

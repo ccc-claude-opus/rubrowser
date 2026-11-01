@@ -16,7 +16,16 @@ default = ["native"]
 # API for page authors; no dependencies.
 sdk = []
 # Platform-independent browser core: graphics, UI, page runtime.
-core = ["dep:font8x8", "dep:wasmi"]
+core = [
+    "dep:font8x8",
+    "dep:wasmi",
+    "dep:fontdue",
+    "dep:dejavu",
+    "dep:html5ever",
+    "dep:simplecss",
+    "dep:csscolorparser",
+    "dep:taffy",
+]
 # Native window version (main).
 native = ["core", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard"]
 # Canvas version running inside a web browser (extra).
@@ -29,6 +38,12 @@ font8x8 = { version = "0.3", default-features = false, optional = true }
 wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"], optional = true }
 ureq = { version = "3", optional = true }
 arboard = { version = "3", default-features = false, optional = true }
+fontdue = { version = "0.9", optional = true }
+dejavu = { version = "2.37", optional = true }
+html5ever = { version = "0.40", optional = true }
+simplecss = { version = "0.2", optional = true }
+csscolorparser = { version = "0.9", optional = true }
+taffy = { version = "0.15", optional = true }
 
 [dev-dependencies]
 wasmi = { version = "2", features = ["wat"] }
