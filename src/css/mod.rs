@@ -91,12 +91,19 @@ struct Indexed {
     decls: Rc<[Decl]>,
     /// 0 = user agent, 2 = author (1 and 3 are hints and inline styles).
     origin: u8,
+    /// Cascade layer rank ([`UNLAYERED`] for rules outside layers).
+    layer: u16,
     order: u32,
 }
+
+/// Layer rank of rules outside any `@layer` (they beat layered ones).
+const UNLAYERED: u16 = u16::MAX;
 
 /// Every rule that applies at one viewport, filed by selector key.
 pub struct Cascade {
     rules: Vec<Indexed>,
+    /// Layer names (dotted paths) in order of first appearance.
+    layers: HashMap<String, u16>,
     buckets: HashMap<Key, Vec<u32>>,
     /// Whether any rule depends on :hover/:active/:focus.
     pub dynamic: bool,
@@ -108,20 +115,40 @@ impl Cascade {
     pub fn new(author: &[(Rc<Sheet>, MediaList)], env: &MediaEnv) -> Cascade {
         let mut c = Cascade {
             rules: Vec::new(),
+            layers: HashMap::new(),
             buckets: HashMap::new(),
             dynamic: false,
         };
         let ua = ua_sheet();
-        c.add(&ua.rules, 0, env);
+        c.add(&ua.rules, 0, env, "");
         for (sheet, media) in author {
             if media.matches(env) {
-                c.add(&sheet.rules, 2, env);
+                c.add(&sheet.rules, 2, env, "");
             }
         }
         c
     }
 
-    fn add(&mut self, rules: &[Rule], origin: u8, env: &MediaEnv) {
+    /// The rank of layer `path`, registering it on first sight.
+    fn layer(&mut self, path: &str) -> u16 {
+        let next = self.layers.len().min(UNLAYERED as usize - 1) as u16;
+        *self.layers.entry(path.to_string()).or_insert(next)
+    }
+
+    /// Adds `rules` inside layer `layer` (a dotted path; "" = unlayered).
+    fn add(&mut self, rules: &[Rule], origin: u8, env: &MediaEnv, layer: &str) {
+        let rank = if layer.is_empty() {
+            UNLAYERED
+        } else {
+            self.layer(layer)
+        };
+        let child = |name: &str| {
+            if layer.is_empty() {
+                name.to_string()
+            } else {
+                format!("{layer}.{name}")
+            }
+        };
         for r in rules {
             match r {
                 Rule::Style { selectors, decls } => {
@@ -132,13 +159,20 @@ impl Cascade {
                             selector: sel.clone(),
                             decls: decls.clone(),
                             origin,
+                            layer: rank,
                             order,
                         });
                     }
                 }
                 Rule::Media(list, inner) => {
                     if list.matches(env) {
-                        self.add(inner, origin, env);
+                        self.add(inner, origin, env, layer);
+                    }
+                }
+                Rule::Layer(name, inner) => self.add(inner, origin, env, &child(name)),
+                Rule::LayerOrder(names) => {
+                    for n in names {
+                        self.layer(&child(n));
                     }
                 }
                 Rule::Import(..) => {}
@@ -190,14 +224,22 @@ pub struct Generated {
 
 /// One declaration in cascade order.
 struct Matched<'a> {
-    rank: (u8, [u16; 3], u32),
+    rank: (u8, u16, [u16; 3], u32),
     name: &'a str,
     value: &'a str,
 }
 
 /// Cascade rank: normal declarations by origin; `!important` ones above
-/// all normal ones, with the user agent's on top.
-fn rank(important: bool, origin: u8, specificity: [u16; 3], order: u32) -> (u8, [u16; 3], u32) {
+/// all normal ones, with the user agent's on top. Within an origin, later
+/// layers beat earlier ones and unlayered rules beat all layers; for
+/// `!important` that order is reversed.
+fn rank(
+    important: bool,
+    origin: u8,
+    layer: u16,
+    specificity: [u16; 3],
+    order: u32,
+) -> (u8, u16, [u16; 3], u32) {
     let level = if important {
         10 + match origin {
             0 => 3,
@@ -207,7 +249,8 @@ fn rank(important: bool, origin: u8, specificity: [u16; 3], order: u32) -> (u8, 
     } else {
         origin
     };
-    (level, specificity, order)
+    let layer = if important { UNLAYERED - layer } else { layer };
+    (level, layer, specificity, order)
 }
 
 /// Inputs that `em`, `rem`, `vw` and `vh` depend on.
@@ -519,7 +562,13 @@ fn cascade_element(
         }
         for d in r.decls.iter() {
             decls.push(Matched {
-                rank: rank(d.important, r.origin, r.selector.specificity, r.order),
+                rank: rank(
+                    d.important,
+                    r.origin,
+                    r.layer,
+                    r.selector.specificity,
+                    r.order,
+                ),
                 name: &d.name,
                 value: &d.value,
             });
@@ -539,7 +588,7 @@ fn cascade_element(
         hints = presentational_hints(dom, id);
         for (k, (name, value)) in hints.iter().enumerate() {
             decls.push(Matched {
-                rank: rank(false, 1, [0; 3], base + k as u32),
+                rank: rank(false, 1, UNLAYERED, [0; 3], base + k as u32),
                 name,
                 value,
             });
@@ -550,7 +599,7 @@ fn cascade_element(
             .unwrap_or_default();
         for (k, d) in inline.iter().enumerate() {
             decls.push(Matched {
-                rank: rank(d.important, 3, [0; 3], base + 1000 + k as u32),
+                rank: rank(d.important, 3, UNLAYERED, [0; 3], base + 1000 + k as u32),
                 name: &d.name,
                 value: &d.value,
             });
@@ -867,6 +916,31 @@ mod tests {
             "hovering a child hovers the link"
         );
         assert_eq!(by_id(&d, &s, "i").color, BLUE);
+    }
+
+    #[test]
+    fn cascade_layers() {
+        let html = r#"<style>
+            @layer base, theme;
+            @layer theme { p { color: green; padding: 1px } }
+            @layer base { p { color: red !important; padding: 2px } }
+            p { padding: 3px }
+            @layer base { #x { margin: 5px } }
+            p { margin: 6px }
+            </style><p id=x>a</p>"#;
+        let dom = parse_html(html);
+        let sheets = author_sheets(&dom, &[]);
+        let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
+        let st = compute_styles(&dom, &refs, &ElementState::default());
+        let p = dom.find_tag(Dom::ROOT, "p").unwrap();
+        let s = st[p].as_ref().unwrap();
+        assert_eq!(s.padding[0], Dim::Px(3.0), "unlayered beats layers");
+        assert_eq!(s.margin[0], Dim::Px(6.0), "even with lower specificity");
+        assert_eq!(
+            s.color,
+            Rgba::new(255, 0, 0, 255),
+            "!important: earlier layer wins"
+        );
     }
 
     #[test]

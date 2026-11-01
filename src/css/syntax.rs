@@ -27,6 +27,11 @@ pub enum Rule {
     },
     Media(MediaList, Vec<Rule>),
     Import(String, MediaList),
+    /// `@layer name { … }` (anonymous layers get a unique name). Nested
+    /// layer names are relative to the enclosing one.
+    Layer(String, Vec<Rule>),
+    /// `@layer a, b;`: declares layer order.
+    LayerOrder(Vec<String>),
 }
 
 /// A parsed stylesheet.
@@ -204,7 +209,20 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                         out.extend(parse_rules(body, base));
                     }
                 }
-                "layer" | "scope" | "-moz-document" if has_block => {
+                "layer" if has_block => {
+                    let name = if prelude.is_empty() {
+                        use std::sync::atomic::{AtomicU32, Ordering};
+                        static ANON: AtomicU32 = AtomicU32::new(0);
+                        format!("\u{0}{}", ANON.fetch_add(1, Ordering::Relaxed))
+                    } else {
+                        prelude.to_string()
+                    };
+                    out.push(Rule::Layer(name, parse_rules(body, base)));
+                }
+                "layer" => out.push(Rule::LayerOrder(
+                    prelude.split(',').map(|n| n.trim().to_string()).collect(),
+                )),
+                "scope" | "-moz-document" if has_block => {
                     out.extend(parse_rules(body, base));
                 }
                 "import" => {
@@ -378,8 +396,8 @@ mod tests {
                     Rule::Style { selectors, decls } => {
                         out.push((format!("{} selector(s)", selectors.len()), decls.to_vec()))
                     }
-                    Rule::Media(_, inner) => walk(inner, out),
-                    Rule::Import(..) => {}
+                    Rule::Media(_, inner) | Rule::Layer(_, inner) => walk(inner, out),
+                    Rule::Import(..) | Rule::LayerOrder(_) => {}
                 }
             }
         }

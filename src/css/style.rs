@@ -472,6 +472,12 @@ impl Style {
 
     /// Applies one declaration with the viewport known (for `vw`/`vh`).
     pub fn apply_in(&mut self, name: &str, value: &str, parent: &Style, env: &super::ValueEnv) {
+        if let Some(physical) = logical(name, value) {
+            for (n, v) in physical {
+                self.apply_in(&n, &v, parent, env);
+            }
+            return;
+        }
         let root_font_size = env.root_font;
         let value = value.trim();
         let lower = value.to_ascii_lowercase();
@@ -1119,6 +1125,60 @@ impl Style {
     }
 }
 
+/// Maps a logical property (`margin-inline`, `padding-block-start`,
+/// `inset-inline-end`, `inline-size`, …) to physical ones, for horizontal
+/// left-to-right text.
+fn logical(name: &str, value: &str) -> Option<Vec<(String, String)>> {
+    let sizes = [
+        ("inline-size", "width"),
+        ("block-size", "height"),
+        ("min-inline-size", "min-width"),
+        ("min-block-size", "min-height"),
+        ("max-inline-size", "max-width"),
+        ("max-block-size", "max-height"),
+    ];
+    if let Some((_, p)) = sizes.iter().find(|(l, _)| *l == name) {
+        return Some(vec![(p.to_string(), value.to_string())]);
+    }
+    // prefix, physical name for a side, and whether it is `border-*`
+    let (prefix, rest) = ["margin", "padding", "inset", "border"]
+        .iter()
+        .find_map(|p| name.strip_prefix(p).map(|r| (*p, r)))?;
+    let rest = rest.strip_prefix('-')?;
+    let (axis, rest) = if let Some(r) = rest.strip_prefix("inline") {
+        ("inline", r)
+    } else if let Some(r) = rest.strip_prefix("block") {
+        ("block", r)
+    } else {
+        return None;
+    };
+    let (start, end) = if axis == "inline" {
+        ("left", "right")
+    } else {
+        ("top", "bottom")
+    };
+    let side = |s: &str, suffix: &str| match prefix {
+        "inset" => s.to_string(),
+        _ => format!("{prefix}-{s}{suffix}"),
+    };
+    // `-start` / `-end`, possibly followed by `-width` etc. for borders.
+    for (which, phys) in [("-start", start), ("-end", end)] {
+        if let Some(suffix) = rest.strip_prefix(which) {
+            return Some(vec![(side(phys, suffix), value.to_string())]);
+        }
+    }
+    // Both sides: `margin-inline: a b`, `border-inline-width: a b`,
+    // `border-block: 1px solid` (same value on both).
+    let suffix = rest;
+    let parts = values::tokens(value);
+    let two = prefix != "border" || !suffix.is_empty();
+    let (a, b) = match parts.as_slice() {
+        [a, b] if two => (a.to_string(), b.to_string()),
+        _ => (value.to_string(), value.to_string()),
+    };
+    Some(vec![(side(start, suffix), a), (side(end, suffix), b)])
+}
+
 fn is_inherited(name: &str) -> bool {
     name.starts_with("font")
         || matches!(
@@ -1373,6 +1433,26 @@ mod tests {
             s.apply(n, v, &parent, 16.0);
         }
         s
+    }
+
+    #[test]
+    fn logical_properties() {
+        let s = styled(&[
+            ("margin-inline", "1px 2px"),
+            ("padding-block", "3px"),
+            ("padding-inline-start", "4px"),
+            ("inset-inline-end", "5px"),
+            ("border-block-start", "2px solid red"),
+            ("inline-size", "50px"),
+        ]);
+        assert_eq!(s.margin[LEFT], Dim::Px(1.0));
+        assert_eq!(s.margin[RIGHT], Dim::Px(2.0));
+        assert_eq!(s.padding[TOP], Dim::Px(3.0));
+        assert_eq!(s.padding[BOTTOM], Dim::Px(3.0));
+        assert_eq!(s.padding[LEFT], Dim::Px(4.0));
+        assert_eq!(s.inset[RIGHT], Dim::Px(5.0));
+        assert_eq!(s.border(TOP), 2.0);
+        assert_eq!(s.width, Dim::Px(50.0));
     }
 
     #[test]

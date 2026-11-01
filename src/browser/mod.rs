@@ -226,6 +226,8 @@ impl Tab {
 /// Platform-independent browser state. Platforms feed it input events and
 /// the window size, and put the rendered canvas on screen.
 pub struct Browser {
+    /// Whether web pages may run scripts (built-in pages always can).
+    javascript: bool,
     fonts: Fonts,
     canvas: Canvas,
     scale: f32,
@@ -281,6 +283,7 @@ impl Browser {
             shown_tabs: Vec::new(),
             local: Vec::new(),
             last_click: None,
+            javascript: true,
         };
         b.push_tab("about:home");
         b.tabs[0].doc = Document::from_html(HOME_HTML, "about:home");
@@ -452,10 +455,15 @@ impl Browser {
         let links = tab.doc.stylesheet_links();
         let base = tab.doc.base_url();
         let url = base.as_str();
-        let mut scripts = page_scripts(&tab.doc);
+        let web = !url.starts_with("about:");
+        let mut scripts = if web && !self.javascript {
+            Vec::new()
+        } else {
+            page_scripts(&tab.doc)
+        };
         // Inline handlers (onclick="…") are JavaScript too; register them
         // first so scripts can rely on them.
-        if let Some(code) = inline_handlers(&tab.doc) {
+        if let Some(code) = inline_handlers(&tab.doc).filter(|_| self.javascript || !web) {
             let at = scripts
                 .iter()
                 .take_while(|(l, _, _)| matches!(l, Lang::Runtime(_)))
@@ -639,6 +647,11 @@ impl Browser {
             Err(e) => self.script_failed(i, si, &e, host),
         }
         self.dirty = true;
+    }
+
+    /// Enables or disables scripts on web pages (`--no-js`).
+    pub fn set_javascript(&mut self, on: bool) {
+        self.javascript = on;
     }
 
     /// Debug dump of the active page's layout (see

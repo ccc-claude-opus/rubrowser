@@ -525,7 +525,12 @@ impl Document {
                 .unwrap_or_else(|| "-".into());
             let disp = self
                 .style(n)
-                .map(|s| format!("{:?} w={:?}", s.display, s.width))
+                .map(|s| {
+                    format!(
+                        "{:?} {:?} w={:?} m={:?} p={:?}",
+                        s.display, s.position, s.width, s.margin, s.padding
+                    )
+                })
                 .unwrap_or_else(|| "none".into());
             out.push_str(&format!("{}{label}  [{geo}]  {disp}\n", "  ".repeat(depth)));
             for &c in self.dom.children(n).iter().rev() {

@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-const USAGE: &str = "usage: rubrowser [URL]
-       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] URL";
+const USAGE: &str = "usage: rubrowser [--no-js] [URL]
+       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] URL";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -12,6 +12,7 @@ fn main() {
         height: 900,
         scale: 1.0,
         timeout: Duration::from_secs(30),
+        javascript: true,
     };
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -29,6 +30,7 @@ fn main() {
                 let secs: u64 = value("--timeout").parse().unwrap_or(30);
                 shot.timeout = Duration::from_secs(secs);
             }
+            "--no-js" => shot.javascript = false,
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -44,7 +46,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        None => rubrowser::platform::native::run(url),
+        None => rubrowser::platform::native::run(url, shot.javascript),
     };
     if let Err(e) = result {
         eprintln!("rubrowser: {e}");

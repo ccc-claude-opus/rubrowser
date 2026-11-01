@@ -24,12 +24,15 @@ use crate::text::Fonts;
 const MAX_BODY: u64 = 32 << 20;
 
 /// Opens the browser window (showing `url` if given) and runs until closed.
-pub fn run(url: Option<String>) -> Result<(), Box<dyn Error>> {
+/// Opens the browser window at `url` (or the home page). `javascript`:
+/// whether web pages may run scripts.
+pub fn run(url: Option<String>, javascript: bool) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Fetched>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App {
         state: None,
         url,
+        javascript,
         proxy,
         start: Instant::now(),
     };
@@ -48,6 +51,7 @@ struct Fetched {
 struct App {
     state: Option<State>,
     url: Option<String>,
+    javascript: bool,
     proxy: EventLoopProxy<Fetched>,
     start: Instant,
 }
@@ -190,6 +194,8 @@ pub struct Shot {
     pub width: u32,
     pub height: u32,
     pub scale: f32,
+    /// Run page scripts.
+    pub javascript: bool,
     /// Give up waiting for resources after this long.
     pub timeout: Duration,
 }
@@ -242,6 +248,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         (shot.height as f32 * shot.scale) as usize,
     );
     let mut browser = Browser::with_fonts(pw, ph, shot.scale, Fonts::with_system_fonts());
+    browser.set_javascript(shot.javascript);
     let start = Instant::now();
     let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
     browser.navigate(&url::from_input(url), &mut host);
@@ -316,6 +323,7 @@ impl ApplicationHandler<Fetched> for App {
             scale as f32,
             Fonts::with_system_fonts(),
         );
+        browser.set_javascript(self.javascript);
         let mut host = NativeHost {
             window: window.clone(),
             proxy: self.proxy.clone(),
