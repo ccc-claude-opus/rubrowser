@@ -63,9 +63,27 @@ struct Press {
 /// What an outstanding fetch is for.
 #[derive(Clone, Debug)]
 enum Request {
-    Page { tab: u64, serial: u64, url: String },
-    Stylesheet { tab: u64, serial: u64, link: NodeId },
-    Script { tab: u64, serial: u64, slot: usize },
+    Page {
+        tab: u64,
+        serial: u64,
+        url: String,
+    },
+    Stylesheet {
+        tab: u64,
+        serial: u64,
+        link: NodeId,
+    },
+    Script {
+        tab: u64,
+        serial: u64,
+        slot: usize,
+    },
+    Image {
+        tab: u64,
+        serial: u64,
+        node: NodeId,
+        src: String,
+    },
 }
 
 /// Languages a `<script>` can be written in. Every one runs as wasm: Rust
@@ -343,6 +361,9 @@ impl Browser {
                 .map(<[u8]>::to_vec)
                 .ok_or_else(|| format!("{url} does not exist"));
             self.local.push((id, result));
+        } else if url.starts_with("data:") {
+            let result = url::decode_data_url(url).ok_or_else(|| "bad data: URL".to_string());
+            self.local.push((id, result));
         } else {
             host.fetch(id, url);
         }
@@ -535,6 +556,20 @@ impl Browser {
                 if let Ok(bytes) = result {
                     let css = String::from_utf8_lossy(&bytes).into_owned();
                     self.tabs[i].doc.add_stylesheet(link, css);
+                    self.dirty = true;
+                }
+            }
+            Request::Image {
+                tab,
+                serial,
+                node,
+                src,
+            } => {
+                if let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                {
+                    self.tabs[i].doc.image_loaded(node, &src, result);
                     self.dirty = true;
                 }
             }
@@ -1239,9 +1274,27 @@ impl Browser {
         self.chrome.set_viewport(w, h);
         self.chrome.update(&self.fonts);
         let vp = self.viewport_rect();
+        self.request_images(host);
         let doc = &mut self.tabs[self.active].doc;
         doc.set_viewport(vp.w, vp.h);
         doc.update(&self.fonts);
+    }
+
+    /// Starts loading images of the active page that have a new `src`
+    /// (from the HTML or set later by scripts).
+    fn request_images(&mut self, host: &mut dyn Host) {
+        let tab = &mut self.tabs[self.active];
+        let (id, serial) = (tab.id, tab.serial);
+        let base = tab.doc.url.clone();
+        for (node, src) in tab.doc.image_requests() {
+            let req = Request::Image {
+                tab: id,
+                serial,
+                node,
+                src: src.clone(),
+            };
+            self.fetch(req, &url::resolve(&base, &src), host);
+        }
     }
 
     /// Whether a new frame should be drawn at time `now`.
@@ -2031,6 +2084,101 @@ mod tests {
         b.event(Event::MouseDown { x, y, button: 0 }, 0.0, h);
         b.event(Event::MouseUp { x, y, button: 0 }, 0.0, h);
         b.render(0.0, h);
+    }
+
+    fn png_data_url(w: u32, h: u32, rgba: [u8; 4]) -> String {
+        let img = image::RgbaImage::from_pixel(w, h, image::Rgba(rgba));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().fold(0u32, |a, &b| a << 8 | b as u32) << (8 * (3 - chunk.len()));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    b64.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    b64.push('=');
+                }
+            }
+        }
+        format!("data:image/png;base64,{b64}")
+    }
+
+    #[test]
+    fn images_load_size_and_paint() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://img.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let red = png_data_url(4, 2, [255, 0, 0, 255]);
+        let page = format!(
+            r#"<body style="margin:0">
+            <img id=a src="{red}" width=40><br>
+            <img id=b src="{red}" style="height:10px">
+            <img id=c src="missing.png" alt="Broken image">
+            <img id=d src="slow.png"></body>"#
+        );
+        b.fetch_done(id, Ok(page.into_bytes()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(0.0, &mut h);
+        let fetched: Vec<_> = h.fetched.iter().map(|(_, u)| u.clone()).collect();
+        assert!(fetched.contains(&"https://img.test/missing.png".to_string()));
+        let missing = h
+            .fetched
+            .iter()
+            .find(|(_, u)| u.ends_with("missing.png"))
+            .unwrap()
+            .0;
+        b.fetch_done(missing, Err("404".into()), &mut h);
+        b.render(0.0, &mut h);
+
+        let doc = &b.tabs[b.active].doc;
+        let rect = |id: &str| doc.content_box(doc.dom.element_by_id(id).unwrap()).unwrap();
+        let (a, bb, c, d) = (rect("a"), rect("b"), rect("c"), rect("d"));
+        assert_eq!(
+            (a.w, a.h),
+            (40.0, 20.0),
+            "width attribute keeps the aspect ratio"
+        );
+        assert_eq!(
+            (bb.w, bb.h),
+            (20.0, 10.0),
+            "CSS height keeps the aspect ratio"
+        );
+        assert!(c.w > 60.0 && c.h > 10.0, "alt text box: {c:?}");
+        assert_eq!((d.w, d.h), (0.0, 0.0), "still loading");
+
+        // The red image is painted.
+        let vp = b.viewport_rect();
+        let canvas = b.render(1.0, &mut h);
+        let (px, py) = ((vp.x + a.x + 5.0) as usize, (vp.y + a.y + 5.0) as usize);
+        assert_eq!(canvas.pixels()[py * canvas.width() + px], 0xff0000);
+    }
+
+    #[test]
+    fn wheel_scrolls_the_page() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://tall.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = "<div style='height:3000px'>tall</div>";
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        b.event(
+            Event::MouseMove {
+                x: 300,
+                y: (vp.y + 200.0) as i32,
+            },
+            0.0,
+            &mut h,
+        );
+        b.event(Event::Wheel { dx: 0, dy: 500 }, 0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 500.0);
     }
 
     #[test]

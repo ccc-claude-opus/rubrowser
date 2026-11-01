@@ -100,7 +100,11 @@ struct Builder<'a> {
     fonts: &'a Fonts,
     viewport: (f32, f32),
     boxes: Vec<LBox>,
+    replaced: &'a Replaced,
 }
+
+/// Natural sizes of replaced elements (`<img>`), by node.
+pub type Replaced = std::collections::HashMap<NodeId, (f32, f32)>;
 
 /// Lays out the document in a viewport of `width × height` logical pixels.
 pub fn layout(
@@ -109,8 +113,10 @@ pub fn layout(
     fonts: &Fonts,
     width: f32,
     height: f32,
+    replaced: &Replaced,
 ) -> LayoutTree {
     let mut b = Builder {
+        replaced,
         dom,
         styles,
         fonts,
@@ -178,9 +184,21 @@ impl Builder<'_> {
                     |_, _| 0.0,
                     |known, avail| {
                         if let Some((w, h)) = ctx.as_ref().and_then(|c| c.intrinsic) {
-                            return Size {
-                                width: known.width.unwrap_or(w),
-                                height: known.height.unwrap_or(h),
+                            // Keep the natural aspect ratio when one side is set.
+                            let ratio = (w > 0.0 && h > 0.0).then(|| h / w);
+                            return match (known.width, known.height, ratio) {
+                                (Some(kw), None, Some(r)) => Size {
+                                    width: kw,
+                                    height: kw * r,
+                                },
+                                (None, Some(kh), Some(r)) => Size {
+                                    width: kh / r,
+                                    height: kh,
+                                },
+                                _ => Size {
+                                    width: known.width.unwrap_or(w),
+                                    height: known.height.unwrap_or(h),
+                                },
                             };
                         }
                         let Some(content) = ctx.and_then(|c| c.inline.as_ref()) else {
@@ -192,8 +210,14 @@ impl Builder<'_> {
                             AvailableSpace::MaxContent => f32::INFINITY,
                         });
                         let l = inline::layout(content, max_w, styles, fonts);
+                        // Min-content probes with width 0; report the real
+                        // widest line (an unbreakable word or image).
+                        let fit = match avail.width {
+                            AvailableSpace::Definite(w) => l.width.min(w),
+                            _ => l.width,
+                        };
                         Size {
-                            width: known.width.unwrap_or(l.width.min(max_w)),
+                            width: known.width.unwrap_or(fit),
                             height: known.height.unwrap_or(l.height),
                         }
                     },
@@ -220,6 +244,19 @@ impl Builder<'_> {
                 style_node: id,
                 inline: None,
                 intrinsic: Some((0.0, css.line_height_px())),
+            };
+            return tree.new_leaf_with_context(tstyle, ctx).unwrap();
+        }
+        if self.dom.tag(id) == Some("img") {
+            let size = self.replaced.get(&id).copied().unwrap_or((0.0, 0.0));
+            if size.0 > 0.0 && size.1 > 0.0 {
+                tstyle.aspect_ratio = Some(size.0 / size.1);
+            }
+            let ctx = Ctx {
+                node: Some(id),
+                style_node: id,
+                inline: None,
+                intrinsic: Some(size),
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -601,7 +638,7 @@ mod tests {
         let sheets = author_sheets(&dom, &[]);
         let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
         let styles = compute_styles(&dom, &refs, &ElementState::default());
-        let tree = layout(&dom, &styles, &Fonts::new(), w, h);
+        let tree = layout(&dom, &styles, &Fonts::new(), w, h, &Replaced::new());
         Laid { dom, tree }
     }
 
@@ -623,7 +660,7 @@ mod tests {
                 let atomics = b.inline.iter().flat_map(|il| {
                     il.lines.iter().flat_map(move |line| {
                         line.items.iter().filter_map(move |p| match p {
-                            inline::Placed::Atomic { index, x, y } => {
+                            inline::Placed::Atomic { index, x, y, .. } => {
                                 Some((*index, r.x + cx + x, r.y + cy + line.top + y))
                             }
                             _ => None,
@@ -707,6 +744,19 @@ mod tests {
         let p = l.rect("p");
         assert!(p.y > d.y, "anonymous block for 'before' comes first");
         assert!(d.h > p.h * 2.5, "three lines tall");
+    }
+
+    #[test]
+    fn flex_items_do_not_shrink_below_unbreakable_content() {
+        let l = lay(
+            r#"<style>body{margin:0} #row{display:flex;width:100px}
+               .box{display:inline-block;width:80px;height:10px}</style>
+               <div id=row><div id=a><span class=box></span></div><div id=b><span class=box></span></div></div>"#,
+            300.0,
+            100.0,
+        );
+        assert!(l.rect("a").w >= 80.0, "{:?}", l.rect("a"));
+        assert!(l.rect("b").x >= 80.0);
     }
 
     #[test]

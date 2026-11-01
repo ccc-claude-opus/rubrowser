@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use crate::css::Style;
 use crate::css::style::{self as cs, Display, ListStyle};
 use crate::css::values::Rgba;
+use crate::document::{ImageState, Images};
 use crate::dom::{Dom, NodeId};
 use crate::gfx::{Canvas, Rect};
 use crate::layout::inline::Placed;
@@ -31,6 +32,7 @@ pub struct Painter<'a> {
     pub focus: Option<NodeId>,
     /// Whether the blinking caret is currently shown.
     pub caret: bool,
+    pub images: &'a Images,
 }
 
 const SELECTION: Rgba = Rgba::new(51, 132, 255, 90);
@@ -166,6 +168,11 @@ impl Painter<'_> {
         {
             self.input(c, b, node, style, r);
         }
+        if let Some(node) = b.node.filter(|&n| self.dom.tag(n) == Some("img"))
+            && style.visible
+        {
+            self.image(c, b, node, style, r);
+        }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);
         }
@@ -237,6 +244,57 @@ impl Painter<'_> {
             self.fill(c, bar, style.color);
         }
         c.set_clip(saved);
+    }
+
+    /// Draws an image scaled to the content box, or its `alt` text.
+    fn image(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
+        let (cx, cy) = b.content_offset();
+        let area = RectF {
+            x: r.x + cx,
+            y: r.y + cy,
+            w: (r.w - cx - b.border[cs::RIGHT] - b.padding[cs::RIGHT]).max(0.0),
+            h: (r.h - cy - b.border[cs::BOTTOM] - b.padding[cs::BOTTOM]).max(0.0),
+        };
+        let p = self.phys(area);
+        match self.images.get(node) {
+            Some(ImageState::Ready(..)) => {
+                if p.w > 0
+                    && p.h > 0
+                    && let Some(px) = self.images.scaled(node, p.w as u32, p.h as u32)
+                {
+                    c.draw_argb(p.x, p.y, p.w as usize, p.h as usize, &px);
+                }
+            }
+            Some(ImageState::Failed(_)) | None => {
+                let Some(alt) = self.dom.attr(node, "alt").filter(|a| !a.is_empty()) else {
+                    return;
+                };
+                let gray = Rgba::new(160, 160, 160, 255);
+                for side in [
+                    RectF { h: 1.0, ..area },
+                    RectF {
+                        y: area.y + area.h - 1.0,
+                        h: 1.0,
+                        ..area
+                    },
+                    RectF { w: 1.0, ..area },
+                    RectF {
+                        x: area.x + area.w - 1.0,
+                        w: 1.0,
+                        ..area
+                    },
+                ] {
+                    self.fill(c, side, gray);
+                }
+                let m = self.fonts.line_metrics(style.font(), style.font_size);
+                let saved = c.clip();
+                c.set_clip(p.intersect(&saved));
+                let baseline = area.y + (area.h - (m.ascent + m.descent)) / 2.0 + m.ascent;
+                self.text(c, style, area.x + 4.0, baseline, alt, style.color);
+                c.set_clip(saved);
+            }
+            Some(ImageState::Loading(_)) => {}
+        }
     }
 
     fn decorations(&self, c: &mut Canvas, style: &Style, r: RectF) {
@@ -413,6 +471,7 @@ impl Painter<'_> {
                         index,
                         x: ax,
                         y: ay,
+                        ..
                     } => {
                         self.paint_box(c, *index, x + ax, y + line.top + ay);
                     }

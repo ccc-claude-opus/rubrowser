@@ -91,7 +91,8 @@ pub fn matches(dom: &Dom, id: NodeId, selector: &str, state: &ElementState) -> b
 /// One matched declaration, with what decides its cascade order.
 struct Matched<'a> {
     important: bool,
-    /// 0 = user agent, 1 = author sheet, 2 = `style` attribute.
+    /// 0 = user agent, 1 = presentational attributes, 2 = author
+    /// sheet, 3 = `style` attribute.
     origin: u8,
     specificity: [u8; 3],
     order: usize,
@@ -156,7 +157,7 @@ fn cascade(
             for d in &rule.declarations {
                 decls.push(Matched {
                     important: d.important,
-                    origin: if i == 0 { 0 } else { 1 },
+                    origin: if i == 0 { 0 } else { 2 },
                     specificity: rule.selector.specificity(),
                     order,
                     name: d.name,
@@ -165,12 +166,24 @@ fn cascade(
             }
         }
     }
+    let hints = presentational_hints(dom, id);
+    for (name, value) in &hints {
+        order += 1;
+        decls.push(Matched {
+            important: false,
+            origin: 1,
+            specificity: [0; 3],
+            order,
+            name,
+            value,
+        });
+    }
     let inline = dom.attr(id, "style").unwrap_or("");
     for d in DeclarationTokenizer::from(inline) {
         order += 1;
         decls.push(Matched {
             important: d.important,
-            origin: 2,
+            origin: 3,
             specificity: [0; 3],
             order,
             name: d.name,
@@ -193,6 +206,34 @@ fn cascade(
         style.apply(d.name, d.value, parent, root_font);
     }
     style
+}
+
+/// Styling attributes from older HTML (`<img width>`, `<td bgcolor>`, …),
+/// which act like author rules with zero specificity.
+fn presentational_hints(dom: &Dom, id: NodeId) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    let Some(tag) = dom.tag(id) else {
+        return out;
+    };
+    let length = |v: &str| {
+        let v = v.trim();
+        if v.ends_with('%') {
+            Some(v.to_string())
+        } else {
+            v.parse::<f32>().ok().map(|n| format!("{n}px"))
+        }
+    };
+    if matches!(
+        tag,
+        "img" | "video" | "canvas" | "iframe" | "table" | "td" | "th" | "col"
+    ) {
+        for dim in ["width", "height"] {
+            if let Some(v) = dom.attr(id, dim).and_then(length) {
+                out.push((dim, v));
+            }
+        }
+    }
+    out
 }
 
 /// Collects author stylesheet text from `<style>` elements and the given

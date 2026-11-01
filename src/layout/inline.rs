@@ -57,7 +57,12 @@ pub enum Placed {
         text: String,
     },
     /// `y` is the top of the atomic box relative to the line top.
-    Atomic { index: usize, x: f32, y: f32 },
+    Atomic {
+        index: usize,
+        x: f32,
+        y: f32,
+        width: f32,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -322,6 +327,7 @@ pub fn layout(
                     index,
                     x,
                     y: baseline,
+                    width,
                 });
                 x += width;
             }
@@ -350,7 +356,7 @@ pub fn layout(
 fn right_edge(p: &Placed) -> f32 {
     match p {
         Placed::Text { x, width, .. } => x + width,
-        Placed::Atomic { x, .. } => *x,
+        Placed::Atomic { x, width, .. } => x + width,
     }
 }
 

@@ -1,0 +1,19 @@
+<!doctype html>
+<title>Images</title>
+<style>
+  body { font-family: sans-serif; margin: 32px; background: #f6f7f9; }
+  .row { display: flex; gap: 16px; align-items: flex-end; flex-wrap: wrap; }
+  figure { margin: 0; padding: 8px; background: #fff; border: 1px solid #dadce0; border-radius: 8px; }
+  figcaption { font-size: 13px; color: #5f6368; margin-top: 4px; }
+  .round { border-radius: 12px; }
+  .bg { background: #fde7e9; padding: 8px; display: inline-block; }
+</style>
+<h1>Images</h1>
+<div class="row">
+  <figure><img src="gradient.png"><figcaption>PNG, natural size</figcaption></figure>
+  <figure><img src="gradient.png" width="160"><figcaption>width=160</figcaption></figure>
+  <figure><img src="gradient.png" style="height: 45px"><figcaption>height: 45px</figcaption></figure>
+</div>
+<p>Inline image <img src="checker.png" width="24"> in a line of text, with a
+<span class="bg"><img src="checker.png"></span> transparent PNG on pink.</p>
+<p>Broken: <img src="nope.png" alt="nope.png could not load"></p>

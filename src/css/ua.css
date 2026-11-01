@@ -13,6 +13,8 @@ head, style, script, title, meta, link, base, template, noscript {
 
 li { display: list-item; }
 
+img { display: inline-block; }
+
 body { margin: 8px; }
 
 p, blockquote, figure, dl, pre { margin: 1em 0; }

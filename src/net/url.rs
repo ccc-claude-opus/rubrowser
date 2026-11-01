@@ -16,7 +16,7 @@ pub fn scheme(s: &str) -> Option<&str> {
         && sch
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
-    let known = matches!(sch, "about" | "file" | "http" | "https");
+    let known = matches!(sch, "about" | "data" | "file" | "http" | "https");
     (valid && (known || s[i + 1..].starts_with("//"))).then_some(sch)
 }
 
@@ -116,6 +116,64 @@ fn normalize(path: &str) -> String {
     }
 }
 
+/// Decodes a `data:` URL (`data:[type][;base64],payload`).
+pub fn decode_data_url(url: &str) -> Option<Vec<u8>> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if meta.ends_with(";base64") {
+        base64(payload)
+    } else {
+        Some(percent_decode(payload))
+    }
+}
+
+fn percent_decode(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%' {
+            if let (Some(h), Some(l)) = (
+                b.get(i + 1).and_then(|&c| hex(c)),
+                b.get(i + 2).and_then(|&c| hex(c)),
+            ) {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn base64(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
+    let mut acc = 0u32;
+    let mut bits = 0;
+    for c in s.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            b'=' => break,
+            c if c.is_ascii_whitespace() => continue,
+            _ => return None,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
 /// Short title for a URL: its last path segment.
 pub fn title(url: &str) -> String {
     let u = url.split(['?', '#']).next().unwrap_or(url);
@@ -172,6 +230,19 @@ mod tests {
             resolve("about:counter", "counter.wasm"),
             "about:counter.wasm"
         );
+    }
+
+    #[test]
+    fn data_urls() {
+        assert_eq!(
+            decode_data_url("data:text/plain;base64,SGVsbG8h").unwrap(),
+            b"Hello!"
+        );
+        assert_eq!(decode_data_url("data:,a%20b").unwrap(), b"a b");
+        assert_eq!(decode_data_url("data:;base64,YQ==").unwrap(), b"a");
+        assert!(decode_data_url("nope").is_none());
+        assert_eq!(scheme("data:image/png;base64,xx"), Some("data"));
+        assert_eq!(resolve("https://a.com/x/", "data:,hi"), "data:,hi");
     }
 
     #[test]

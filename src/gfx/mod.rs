@@ -270,6 +270,27 @@ impl Canvas {
         }
     }
 
+    /// Draws `w × h` pixels in `0xAARRGGBB` at `(x, y)`, blending by their
+    /// alpha, clipped.
+    pub fn draw_argb(&mut self, x: i32, y: i32, w: usize, h: usize, src: &[u32]) {
+        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
+        if r.w == 0 || r.h == 0 || src.len() < w * h {
+            return;
+        }
+        for row in r.y..r.bottom() {
+            let sy = (row - y) as usize;
+            let line = row as usize * self.width;
+            for col in r.x..r.right() {
+                let p = src[sy * w + (col - x) as usize];
+                let a = (p >> 24) as u8;
+                if a != 0 {
+                    let d = &mut self.pixels[line + col as usize];
+                    *d = blend(*d, p & 0xff_ffff, a);
+                }
+            }
+        }
+    }
+
     /// Copies `src` (`w × h` pixels) stretched to fill `dst` (nearest
     /// neighbor), clipped.
     pub fn blit_scaled(&mut self, dst: Rect, w: usize, h: usize, src: &[Color]) {
@@ -364,6 +385,14 @@ mod tests {
         );
         assert_eq!(c.pixels()[10 + 1], 0xffffff, "ring");
         assert_eq!(c.pixels()[5 * 10 + 5], 0, "hole");
+    }
+
+    #[test]
+    fn argb_images_blend() {
+        let mut c = Canvas::new(3, 1);
+        c.clear(0x000000);
+        c.draw_argb(0, 0, 3, 1, &[0xff_ff0000, 0x00_00ff00, 0x80_ffffff]);
+        assert_eq!(c.pixels(), &[0xff0000, 0, 0x808080]);
     }
 
     #[test]

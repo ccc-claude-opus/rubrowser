@@ -7,11 +7,15 @@ use crate::dom::{Dom, NodeId, parse_html};
 use crate::gfx::Canvas;
 use crate::input::Cursor;
 use crate::layout::inline::Placed;
-use crate::layout::{LayoutTree, RectF, layout};
+use crate::layout::{LayoutTree, RectF, Replaced, layout};
 use crate::paint::{Painter, ScrollOffsets};
 use crate::text::Fonts;
 use crate::ui::TextField;
 use std::collections::HashMap;
+
+mod image;
+
+pub use image::{Bitmap, ImageState, Images};
 
 /// Result of a hit test.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -39,6 +43,7 @@ pub struct Document {
     inputs: HashMap<NodeId, TextField>,
     /// Whether the caret is in its visible blink phase.
     pub caret_on: bool,
+    pub images: Images,
 }
 
 impl Document {
@@ -56,6 +61,7 @@ impl Document {
             needs_layout: true,
             inputs: HashMap::new(),
             caret_on: true,
+            images: Images::default(),
         }
     }
 
@@ -131,7 +137,15 @@ impl Document {
             self.needs_style = false;
         }
         if self.needs_layout {
-            self.tree = layout(&self.dom, &self.styles, fonts, self.size.0, self.size.1);
+            let replaced = self.replaced_sizes(fonts);
+            self.tree = layout(
+                &self.dom,
+                &self.styles,
+                fonts,
+                self.size.0,
+                self.size.1,
+                &replaced,
+            );
             self.needs_layout = false;
             self.clamp_scroll();
         }
@@ -148,8 +162,69 @@ impl Document {
             inputs: &self.inputs,
             focus: self.state.focus,
             caret: self.caret_on,
+            images: &self.images,
         }
         .paint(canvas, origin);
+    }
+
+    /// Natural sizes of images: the bitmap's, or room for the `alt` text
+    /// when there is no image to show.
+    fn replaced_sizes(&self, fonts: &Fonts) -> Replaced {
+        let mut out = Replaced::new();
+        for n in self.dom.descendants(Dom::ROOT) {
+            if self.dom.tag(n) != Some("img") {
+                continue;
+            }
+            let size = match self.images.get(n) {
+                Some(ImageState::Ready(_, b)) => (b.width as f32, b.height as f32),
+                Some(ImageState::Loading(_)) => (0.0, 0.0),
+                _ => match (self.dom.attr(n, "alt"), self.style(n)) {
+                    (Some(alt), Some(st)) if !alt.is_empty() => (
+                        fonts.measure(st.font(), st.font_size, alt) + 8.0,
+                        st.line_height_px() + 4.0,
+                    ),
+                    _ => (0.0, 0.0),
+                },
+            };
+            out.insert(n, size);
+        }
+        out
+    }
+
+    /// `<img>` elements whose `src` has not been requested yet: marks them
+    /// loading and returns (node, src) for the browser to fetch.
+    pub fn image_requests(&mut self) -> Vec<(NodeId, String)> {
+        let mut out = Vec::new();
+        for n in self.dom.descendants(Dom::ROOT) {
+            if self.dom.tag(n) != Some("img") {
+                continue;
+            }
+            let src = self.dom.attr(n, "src").unwrap_or("").trim().to_string();
+            if self.images.get(n).is_some_and(|s| s.src() == src) {
+                continue;
+            }
+            if src.is_empty() {
+                self.images.set(n, ImageState::Failed(src));
+                self.needs_layout = true;
+            } else {
+                self.images.set(n, ImageState::Loading(src.clone()));
+                out.push((n, src));
+            }
+        }
+        out
+    }
+
+    /// Delivers the bytes (or error) for image `node` requested with `src`.
+    pub fn image_loaded(&mut self, node: NodeId, src: &str, result: Result<Vec<u8>, String>) {
+        if self.images.get(node).is_none_or(|s| s.src() != src) {
+            return; // src changed since the request
+        }
+        let state = match result.and_then(|b| Bitmap::decode(&b)) {
+            Ok(b) => ImageState::Ready(src.to_string(), std::rc::Rc::new(b)),
+            Err(_) => ImageState::Failed(src.to_string()),
+        };
+        self.images.set(node, state);
+        self.needs_layout = true;
     }
 
     /// The editing state of input `node`, initialized from its `value`.
@@ -248,7 +323,7 @@ impl Document {
             if let Some(il) = &b.inline {
                 for line in &il.lines {
                     for item in &line.items {
-                        if let Placed::Atomic { index, x, y } = item
+                        if let Placed::Atomic { index, x, y, .. } = item
                             && let Some(found) = walk(
                                 d,
                                 *index,
@@ -398,6 +473,7 @@ impl Document {
                             index,
                             x: ax,
                             y: ay,
+                            ..
                         } => {
                             if self.hit_box(*index, x, y, bx + ax, by + line.top + ay, hit) {
                                 return true;
@@ -412,6 +488,11 @@ impl Document {
             return true;
         }
         false
+    }
+
+    /// Vertical scroll offset of the page.
+    pub fn scroll_y(&self) -> f32 {
+        self.scroll_of(None)
     }
 
     fn scroll_of(&self, node: Option<NodeId>) -> f32 {
