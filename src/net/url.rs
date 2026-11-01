@@ -46,6 +46,12 @@ pub fn resolve(base: &str, link: &str) -> String {
     if scheme(link).is_some() {
         return link.to_string();
     }
+    // Scheme-relative: //host/path
+    if let (Some(rest), Some(sch)) = (link.strip_prefix("//"), scheme(base))
+        && sch != "about"
+    {
+        return format!("{sch}://{rest}");
+    }
     match scheme(base) {
         // Files next to a built-in page are built in too.
         Some("about") => format!("about:{}", link.trim_start_matches("./")),

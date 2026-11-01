@@ -577,7 +577,18 @@ impl Browser {
         if !self.tabs[i].runtimes.contains_key(mime) {
             match builtin_runtime(mime) {
                 Some(wasm) => self.start_runtime(i, mime, wasm, &format!("{mime} runtime"), host),
-                None => return host.log(&format!("{name}: no runtime for scripts of type {mime}")),
+                None => {
+                    // Data blocks (JSON, templates) are not scripts at all.
+                    let data = mime.contains("json")
+                        || matches!(
+                            mime,
+                            "text/template" | "text/html" | "text/plain" | "text/x-template"
+                        );
+                    if !data {
+                        host.log(&format!("{name}: no runtime for scripts of type {mime}"));
+                    }
+                    return;
+                }
             }
         }
         let now = self.now;
@@ -595,6 +606,19 @@ impl Browser {
             Err(e) => self.script_failed(i, si, &e, host),
         }
         self.dirty = true;
+    }
+
+    /// Called by the platform when fetch `id` was redirected to `url`
+    /// (before [`Browser::fetch_done`]), so the page uses its real address.
+    pub fn fetch_redirected(&mut self, id: u32, final_url: &str) {
+        if let Some(Request::Page { tab, url, .. }) = self.requests.get_mut(&id) {
+            let tab = *tab;
+            *url = final_url.to_string();
+            if let Some(i) = self.tab_index(tab) {
+                let t = &mut self.tabs[i];
+                t.history[t.index] = final_url.to_string();
+            }
+        }
     }
 
     /// Called by the platform when fetch `id` completes.

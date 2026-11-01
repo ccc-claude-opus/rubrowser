@@ -40,6 +40,8 @@ pub fn run(url: Option<String>) -> Result<(), Box<dyn Error>> {
 struct Fetched {
     id: u32,
     result: Result<Vec<u8>, String>,
+    /// The URL after redirects, if it changed.
+    final_url: Option<String>,
 }
 
 struct App {
@@ -73,8 +75,15 @@ impl Host for NativeHost {
         let proxy = self.proxy.clone();
         let url = url.to_string();
         std::thread::spawn(move || {
-            let result = load(&url);
-            let _ = proxy.send_event(Fetched { id, result });
+            let (result, final_url) = match load(&url) {
+                Ok((bytes, f)) => (Ok(bytes), f),
+                Err(e) => (Err(e), None),
+            };
+            let _ = proxy.send_event(Fetched {
+                id,
+                result,
+                final_url,
+            });
         });
     }
 
@@ -118,24 +127,159 @@ impl Host for NativeHost {
     }
 }
 
-/// Loads `url` over HTTP(S) or from the file system.
-fn load(url: &str) -> Result<Vec<u8>, String> {
+/// The HTTP client shared by all loads.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .user_agent(concat!(
+                "Mozilla/5.0 (compatible; rubrowser/",
+                env!("CARGO_PKG_VERSION"),
+                "; +https://github.com/ccc-claude-opus/rubrowser)"
+            ))
+            .timeout_global(Some(Duration::from_secs(30)))
+            .http_status_as_error(false)
+            .build()
+            .into()
+    })
+}
+
+/// Loads `url` over HTTP(S) or from the file system. Returns the bytes and,
+/// if redirects led elsewhere, the final URL.
+pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    use ureq::ResponseExt;
     match url::scheme(url) {
         Some("http") | Some("https") => {
-            let mut resp = ureq::get(url).call().map_err(|e| e.to_string())?;
-            resp.body_mut()
+            let mut resp = agent().get(url).call().map_err(|e| e.to_string())?;
+            let status = resp.status();
+            let final_url = resp.get_uri().to_string();
+            let body = resp
+                .body_mut()
                 .with_config()
                 .limit(MAX_BODY)
                 .read_to_vec()
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if status.is_client_error() || status.is_server_error() {
+                // Error pages are still pages; resources fail.
+                if !status.is_success() && body.is_empty() {
+                    return Err(format!("HTTP {status}"));
+                }
+            }
+            Ok((body, (final_url != url).then_some(final_url)))
         }
         Some("file") => {
             let path = url.trim_start_matches("file://");
-            std::fs::read(path).map_err(|e| format!("{path}: {e}"))
+            std::fs::read(path)
+                .map(|b| (b, None))
+                .map_err(|e| format!("{path}: {e}"))
         }
         Some(other) => Err(format!("unsupported scheme `{other}:`")),
-        None => std::fs::read(url).map_err(|e| format!("{url}: {e}")),
+        None => std::fs::read(url)
+            .map(|b| (b, None))
+            .map_err(|e| format!("{url}: {e}")),
     }
+}
+
+/// Options for [`screenshot`].
+pub struct Shot {
+    pub width: u32,
+    pub height: u32,
+    pub scale: f32,
+    /// Give up waiting for resources after this long.
+    pub timeout: Duration,
+}
+
+/// Loads `url` without a window, waits for its resources, and writes the
+/// rendered window (chrome and page) to the PNG file `out`.
+pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error>> {
+    use std::sync::mpsc;
+    struct Headless {
+        tx: mpsc::Sender<Fetched>,
+        pending: usize,
+    }
+    impl Host for Headless {
+        fn fetch(&mut self, id: u32, url: &str) {
+            self.pending += 1;
+            let tx = self.tx.clone();
+            let url = url.to_string();
+            std::thread::spawn(move || {
+                let (result, final_url) = match load(&url) {
+                    Ok((b, f)) => (Ok(b), f),
+                    Err(e) => (Err(e), None),
+                };
+                let _ = tx.send(Fetched {
+                    id,
+                    result,
+                    final_url,
+                });
+            });
+        }
+        fn clipboard_get(&mut self) -> Option<String> {
+            None
+        }
+        fn clipboard_set(&mut self, _: &str) {}
+        fn set_cursor(&mut self, _: Cursor) {}
+        fn set_title(&mut self, _: &str) {}
+        fn log(&mut self, message: &str) {
+            eprintln!("[console] {message}");
+        }
+        fn wall_clock(&mut self) -> Option<f64> {
+            let t = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?;
+            Some(t.as_secs_f64() * 1000.0)
+        }
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut host = Headless { tx, pending: 0 };
+    let (pw, ph) = (
+        (shot.width as f32 * shot.scale) as usize,
+        (shot.height as f32 * shot.scale) as usize,
+    );
+    let mut browser = Browser::new(pw, ph, shot.scale);
+    let start = Instant::now();
+    let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
+    browser.navigate(&url::from_input(url), &mut host);
+    let deadline = start + shot.timeout;
+    loop {
+        browser.render(now(&start), &mut host);
+        if host.pending == 0 {
+            break;
+        }
+        let wait = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(f) => {
+                host.pending -= 1;
+                if let Some(u) = &f.final_url {
+                    browser.fetch_redirected(f.id, u);
+                }
+                browser.fetch_done(f.id, f.result, &mut host);
+            }
+            Err(_) => {
+                eprintln!(
+                    "rubrowser: gave up waiting for {} resource(s)",
+                    host.pending
+                );
+                break;
+            }
+        }
+    }
+    let canvas = browser.render(now(&start), &mut host);
+    let rgba: Vec<u8> = canvas
+        .pixels()
+        .iter()
+        .flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, 255])
+        .collect();
+    let img = image::RgbaImage::from_raw(canvas.width() as u32, canvas.height() as u32, rgba)
+        .ok_or("bad canvas size")?;
+    img.save(out)?;
+    eprintln!(
+        "rubrowser: wrote {out} ({}x{}) in {:.1}s",
+        canvas.width(),
+        canvas.height(),
+        start.elapsed().as_secs_f64()
+    );
+    Ok(())
 }
 
 impl App {
@@ -181,6 +325,9 @@ impl ApplicationHandler<Fetched> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, f: Fetched) {
         if let Some(s) = self.state.as_mut() {
+            if let Some(u) = &f.final_url {
+                s.browser.fetch_redirected(f.id, u);
+            }
             s.browser.fetch_done(f.id, f.result, &mut s.host);
             s.window.request_redraw();
         }
