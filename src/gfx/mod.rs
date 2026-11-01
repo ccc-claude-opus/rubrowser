@@ -57,6 +57,9 @@ pub struct Canvas {
     height: usize,
     pixels: Vec<Color>,
     clip: Rect,
+    /// Opacity applied to translucent drawing (fills with alpha, glyphs,
+    /// images, rounded shapes): 255 is opaque.
+    global_alpha: u8,
 }
 
 impl Canvas {
@@ -66,6 +69,7 @@ impl Canvas {
             height,
             pixels: vec![0; width * height],
             clip: Rect::new(0, 0, width as i32, height as i32),
+            global_alpha: 255,
         }
     }
 
@@ -103,6 +107,20 @@ impl Canvas {
 
     pub fn reset_clip(&mut self) {
         self.clip = self.bounds();
+    }
+
+    pub fn global_alpha(&self) -> u8 {
+        self.global_alpha
+    }
+
+    /// Sets the opacity (CSS `opacity`) for subsequent drawing.
+    pub fn set_global_alpha(&mut self, alpha: u8) {
+        self.global_alpha = alpha;
+    }
+
+    /// `alpha` scaled by the global opacity.
+    fn effective(&self, alpha: u8) -> u8 {
+        ((alpha as u32 * self.global_alpha as u32 + 127) / 255) as u8
     }
 
     pub fn clear(&mut self, color: Color) {
@@ -204,6 +222,10 @@ pub fn blend(bg: Color, fg: Color, alpha: u8) -> Color {
 impl Canvas {
     /// Fills a rectangle with `color` at opacity `alpha`, clipped.
     pub fn fill_rect_alpha(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color, alpha: u8) {
+        let alpha = self.effective(alpha);
+        if alpha == 0 {
+            return;
+        }
         if alpha == 255 {
             return self.fill_rect(x, y, w, h, color);
         }
@@ -227,6 +249,11 @@ impl Canvas {
             let line = row as usize * self.width;
             for col in r.x..r.right() {
                 let a = mask[my * w + (col - x) as usize];
+                let a = if self.global_alpha == 255 {
+                    a
+                } else {
+                    self.effective(a)
+                };
                 if a != 0 {
                     let p = &mut self.pixels[line + col as usize];
                     *p = blend(*p, color, a);
@@ -262,7 +289,7 @@ impl Canvas {
                     cov -= coverage(i, px, py);
                 }
                 if cov > 0.0 {
-                    let a = (cov.min(1.0) * alpha as f32).round() as u8;
+                    let a = (cov.min(1.0) * self.effective(alpha) as f32).round() as u8;
                     let p = &mut self.pixels[line + col as usize];
                     *p = blend(*p, color, a);
                 }
@@ -282,7 +309,7 @@ impl Canvas {
             let line = row as usize * self.width;
             for col in r.x..r.right() {
                 let p = src[sy * w + (col - x) as usize];
-                let a = (p >> 24) as u8;
+                let a = self.effective((p >> 24) as u8);
                 if a != 0 {
                     let d = &mut self.pixels[line + col as usize];
                     *d = blend(*d, p & 0xff_ffff, a);
@@ -385,6 +412,14 @@ mod tests {
         );
         assert_eq!(c.pixels()[10 + 1], 0xffffff, "ring");
         assert_eq!(c.pixels()[5 * 10 + 5], 0, "hole");
+    }
+
+    #[test]
+    fn global_alpha_fades_drawing() {
+        let mut c = Canvas::new(1, 1);
+        c.set_global_alpha(128);
+        c.fill_rect_alpha(0, 0, 1, 1, 0xffffff, 255);
+        assert_eq!(c.pixels()[0], 0x808080);
     }
 
     #[test]

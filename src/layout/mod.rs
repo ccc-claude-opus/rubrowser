@@ -52,6 +52,10 @@ pub struct LBox {
     pub content_w: f32,
     pub content_h: f32,
     pub absolute: bool,
+    /// `position: fixed`: placed in the viewport and not scrolled.
+    pub fixed: bool,
+    /// Paint order among positioned siblings (`z-index`).
+    pub z: i32,
     /// Downward shift of the content (table cells with `vertical-align`).
     pub content_shift: f32,
 }
@@ -97,6 +101,8 @@ struct Ctx {
 }
 
 struct Builder<'a> {
+    /// `position: fixed` elements, attached to the viewport.
+    fixed: Vec<taffy::NodeId>,
     dom: &'a Dom,
     styles: &'a [Option<Css>],
     fonts: &'a Fonts,
@@ -118,6 +124,7 @@ pub fn layout(
     replaced: &Replaced,
 ) -> LayoutTree {
     let mut b = Builder {
+        fixed: Vec::new(),
         replaced,
         dom,
         styles,
@@ -142,6 +149,8 @@ pub fn layout(
         content_w: width,
         content_h: height,
         absolute: false,
+        fixed: false,
+        z: 0,
         content_shift: 0.0,
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
@@ -155,12 +164,16 @@ pub fn layout(
             ..Default::default()
         };
         let html_node = b.build(&mut tree, html);
-        let root = tree.new_with_children(root_style, &[html_node]).unwrap();
+        let mut top = vec![html_node];
+        top.extend(std::mem::take(&mut b.fixed));
+        let root = tree.new_with_children(root_style, &top).unwrap();
         b.compute(&mut tree, root, width, AvailableSpace::Definite(height));
         let html_box = b.collect(&tree, html_node);
         let content_h = b.boxes[html_box].rect.h.max(height);
+        let fixed: Vec<usize> = top[1..].iter().map(|&n| b.collect(&tree, n)).collect();
         let vp = &mut b.boxes[LayoutTree::VIEWPORT];
         vp.children.push(html_box);
+        vp.children.extend(fixed);
         vp.content_h = content_h;
     }
     LayoutTree { boxes: b.boxes }
@@ -354,8 +367,16 @@ impl Builder<'_> {
             if self.dom.element(c).is_none() {
                 continue;
             }
-            let block_level =
-                flex || css.position == cs::Position::Absolute || !css.display.is_inline_level();
+            let block_level = flex
+                || css.position == cs::Position::Absolute
+                || css.float != cs::Float::None
+                || !css.display.is_inline_level();
+            if css.position == cs::Position::Fixed {
+                // Fixed boxes are positioned against the viewport.
+                let node = self.build(tree, c);
+                self.fixed.push(node);
+                continue;
+            }
             if self.dom.tag(c) == Some("br") && !flex {
                 push_inline(parts, Item::Break { node: c });
             } else if block_level {
@@ -458,9 +479,13 @@ impl Builder<'_> {
             }
             il
         });
-        let absolute = dom_node
+        let positioned = dom_node
             .and_then(|n| self.style(n))
-            .is_some_and(|s| s.position == cs::Position::Absolute);
+            .map(|s| (s.position, s.z_index));
+        let absolute = positioned
+            .is_some_and(|(p, _)| matches!(p, cs::Position::Absolute | cs::Position::Fixed));
+        let fixed = positioned.is_some_and(|(p, _)| p == cs::Position::Fixed);
+        let z = positioned.and_then(|(_, z)| z).unwrap_or(0);
         let overflow = l.scrollable_overflow_rect;
         let index = self.boxes.len();
         self.boxes.push(LBox {
@@ -486,6 +511,8 @@ impl Builder<'_> {
                 .max(l.size.height),
             inline,
             absolute,
+            fixed,
+            z,
             content_shift: 0.0,
         });
         let kids: Vec<usize> = tree
@@ -804,8 +831,19 @@ fn convert(s: &Css) -> Style {
             cs::BoxSizing::ContentBox => BoxSizing::ContentBox,
         },
         position: match s.position {
-            cs::Position::Absolute => Position::Absolute,
+            cs::Position::Absolute | cs::Position::Fixed => Position::Absolute,
             _ => Position::Relative,
+        },
+        float: match s.float {
+            cs::Float::Left => taffy::Float::Left,
+            cs::Float::Right => taffy::Float::Right,
+            cs::Float::None => taffy::Float::None,
+        },
+        clear: match s.clear {
+            (true, true) => taffy::Clear::Both,
+            (true, false) => taffy::Clear::Left,
+            (false, true) => taffy::Clear::Right,
+            _ => taffy::Clear::None,
         },
         inset: rect4(s.inset.map(lpa)),
         overflow: Point {

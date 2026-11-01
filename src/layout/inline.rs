@@ -55,6 +55,8 @@ pub enum Placed {
         x: f32,
         width: f32,
         text: String,
+        /// Vertical offset from the line's baseline (`sub` / `super`).
+        shift: f32,
     },
     /// `y` is the top of the atomic box relative to the line top.
     Atomic {
@@ -137,6 +139,8 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
             }
             Item::Text { node, text } => {
                 let st = style(styles, *node);
+                let transformed = transform(text, st.text_transform);
+                let text = &transformed;
                 let ws = st.white_space;
                 let font = st.font();
                 let measure = |s: &str| fonts.measure(font, st.font_size, s);
@@ -285,8 +289,9 @@ pub fn layout(
                     }
                 }
                 let st = style(styles, node);
+                let shift = baseline_shift(st);
                 let e = extents(st, fonts);
-                ext = (ext.0.max(e.0), ext.1.max(e.1));
+                ext = (ext.0.max(e.0 - shift), ext.1.max(e.1 + shift));
                 // Merge with the previous run of the same text node.
                 if let Some(Placed::Text {
                     node: n,
@@ -304,6 +309,7 @@ pub fn layout(
                         x,
                         width,
                         text,
+                        shift,
                     });
                 }
                 x += width;
@@ -361,6 +367,39 @@ fn right_edge(p: &Placed) -> f32 {
 }
 
 /// Space a style's text needs above and below the baseline (with half-leading).
+/// Baseline offset for `vertical-align: sub / super` (positive is down).
+fn baseline_shift(st: &Style) -> f32 {
+    use crate::css::style::VerticalAlign;
+    match st.vertical_align {
+        VerticalAlign::Super => -st.font_size * 0.5,
+        VerticalAlign::Sub => st.font_size * 0.3,
+        _ => 0.0,
+    }
+}
+
+/// Applies `text-transform`.
+fn transform(text: &str, t: crate::css::style::TextTransform) -> String {
+    use crate::css::style::TextTransform;
+    match t {
+        TextTransform::None => text.to_string(),
+        TextTransform::Uppercase => text.to_uppercase(),
+        TextTransform::Lowercase => text.to_lowercase(),
+        TextTransform::Capitalize => {
+            let mut out = String::with_capacity(text.len());
+            let mut start = true;
+            for c in text.chars() {
+                if start && c.is_alphabetic() {
+                    out.extend(c.to_uppercase());
+                } else {
+                    out.push(c);
+                }
+                start = c.is_whitespace();
+            }
+            out
+        }
+    }
+}
+
 fn extents(st: &Style, fonts: &Fonts) -> (f32, f32) {
     let m = fonts.line_metrics(st.font(), st.font_size);
     let lh = st.line_height_px();
@@ -451,6 +490,24 @@ mod tests {
         });
         let l = layout(&c, f.measure(Default::default(), 16.0, "aaa") + 2.0, &s, &f);
         assert_eq!(texts(&l)[0], "aaa,");
+    }
+
+    #[test]
+    fn text_transform_and_superscript() {
+        use crate::css::style::{TextTransform, VerticalAlign};
+        assert_eq!(
+            transform("hello big world", TextTransform::Capitalize),
+            "Hello Big World"
+        );
+        assert_eq!(transform("Mixed", TextTransform::Uppercase), "MIXED");
+        let f = Fonts::new();
+        let (c, mut s) = setup("x", WhiteSpace::Normal);
+        s[1].as_mut().unwrap().vertical_align = VerticalAlign::Super;
+        let l = layout(&c, f32::INFINITY, &s, &f);
+        match &l.lines[0].items[0] {
+            Placed::Text { shift, .. } => assert!(*shift < 0.0),
+            _ => unreachable!(),
+        }
     }
 
     #[test]

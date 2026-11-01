@@ -297,10 +297,31 @@ impl Document {
         })
     }
 
-    /// `<img>` elements whose `src` has not been requested yet: marks them
-    /// loading and returns (node, src) for the browser to fetch.
-    pub fn image_requests(&mut self) -> Vec<(NodeId, String)> {
+    /// The URL relative links resolve against: `<base href>` or the page.
+    pub fn base_url(&self) -> String {
+        match self
+            .dom
+            .find_tag(Dom::ROOT, "base")
+            .and_then(|b| self.dom.attr(b, "href"))
+        {
+            Some(href) => crate::net::url::resolve(&self.url, href),
+            None => self.url.clone(),
+        }
+    }
+
+    /// Images not requested yet: `<img>` elements with a new `src` (marked
+    /// loading) and CSS background images. Returns (node, src); background
+    /// images have no node.
+    pub fn image_requests(&mut self) -> Vec<(Option<NodeId>, String)> {
         let mut out = Vec::new();
+        for st in self.styles.iter().flatten() {
+            if let Some(url) = &st.background_image
+                && !self.images.urls.contains_key(url)
+            {
+                self.images.set_url(url, ImageState::Loading(url.clone()));
+                out.push((None, url.clone()));
+            }
+        }
         for n in self.dom.descendants(Dom::ROOT) {
             if self.dom.tag(n) != Some("img") {
                 continue;
@@ -314,23 +335,34 @@ impl Document {
                 self.needs_layout = true;
             } else {
                 self.images.set(n, ImageState::Loading(src.clone()));
-                out.push((n, src));
+                out.push((Some(n), src));
             }
         }
         out
     }
 
-    /// Delivers the bytes (or error) for image `node` requested with `src`.
-    pub fn image_loaded(&mut self, node: NodeId, src: &str, result: Result<Vec<u8>, String>) {
-        if self.images.get(node).is_none_or(|s| s.src() != src) {
-            return; // src changed since the request
-        }
+    /// Delivers the bytes (or error) for an image requested with `src`
+    /// (for `<img>` `node`, or a background image if `None`).
+    pub fn image_loaded(
+        &mut self,
+        node: Option<NodeId>,
+        src: &str,
+        result: Result<Vec<u8>, String>,
+    ) {
         let state = match result.and_then(|b| Bitmap::decode(&b)) {
             Ok(b) => ImageState::Ready(src.to_string(), std::rc::Rc::new(b)),
             Err(_) => ImageState::Failed(src.to_string()),
         };
-        self.images.set(node, state);
-        self.needs_layout = true;
+        match node {
+            Some(n) => {
+                if self.images.get(n).is_none_or(|s| s.src() != src) {
+                    return; // src changed since the request
+                }
+                self.images.set(n, state);
+                self.needs_layout = true;
+            }
+            None => self.images.set_url(src, state),
+        }
     }
 
     /// The editing state of text control `node`, initialized from its
@@ -621,8 +653,12 @@ impl Document {
             return hit;
         }
         let sy = self.scroll_of(None);
-        for &c in vp.children.iter().rev() {
-            if self.hit_box(c, x, y, 0.0, -sy, &mut hit) {
+        // Topmost first: fixed boxes by z-index, then the page.
+        let mut kids = vp.children.clone();
+        kids.sort_by_key(|&k| (self.tree.boxes[k].fixed, self.tree.boxes[k].z));
+        for c in kids.into_iter().rev() {
+            let dy = if self.tree.boxes[c].fixed { 0.0 } else { sy };
+            if self.hit_box(c, x, y, 0.0, -dy, &mut hit) {
                 break;
             }
         }
@@ -657,13 +693,24 @@ impl Document {
         if inside && scrolls {
             hit.scrollers.push(b.node);
         }
-        // Children on top first: absolute ones, then in-flow in reverse.
-        for pass in [true, false] {
-            for &c in b.children.iter().rev() {
-                if self.tree.boxes[c].absolute == pass && self.hit_box(c, x, y, r.x, r.y - sy, hit)
-                {
-                    return true;
-                }
+        // Children on top first: positioned ones by z-index, then in-flow
+        // ones in reverse.
+        let mut positioned: Vec<usize> = b
+            .children
+            .iter()
+            .copied()
+            .filter(|&c| self.tree.boxes[c].absolute)
+            .collect();
+        positioned.sort_by_key(|&c| std::cmp::Reverse(self.tree.boxes[c].z));
+        let in_flow = b
+            .children
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&c| !self.tree.boxes[c].absolute);
+        for c in positioned.into_iter().chain(in_flow) {
+            if self.hit_box(c, x, y, r.x, r.y - sy, hit) {
+                return true;
             }
         }
         if let Some(il) = &b.inline {

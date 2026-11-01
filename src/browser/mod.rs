@@ -84,7 +84,7 @@ enum Request {
     Image {
         tab: u64,
         serial: u64,
-        node: NodeId,
+        node: Option<NodeId>,
         src: String,
     },
 }
@@ -382,6 +382,8 @@ impl Browser {
         tab.js = None;
         let (id, serial) = (tab.id, tab.serial);
         let links = tab.doc.stylesheet_links();
+        let base = tab.doc.base_url();
+        let url = base.as_str();
         let mut scripts = page_scripts(&tab.doc);
         // Inline handlers (onclick="…") are JavaScript too; register them
         // first so scripts can rely on them.
@@ -641,7 +643,7 @@ impl Browser {
             let base = if action.is_empty() {
                 doc.url.clone()
             } else {
-                url::resolve(&doc.url, &action)
+                url::resolve(&doc.base_url(), &action)
             };
             let base = base.split(['?', '#']).next().unwrap_or("").to_string();
             let target = format!("{base}?{}", crate::document::urlencode(&data));
@@ -989,7 +991,7 @@ impl Browser {
         let link = (t == Target::Page)
             .then(|| hit.element.and_then(|e| doc.link(e)))
             .flatten()
-            .map(|href| url::resolve(&doc.url, &href));
+            .map(|href| url::resolve(&doc.base_url(), &href));
         self.set_status(link);
     }
 
@@ -1198,8 +1200,27 @@ impl Browser {
                 }
                 return;
             }
+            if doc.dom.tag(id) == Some("summary")
+                && let Some(details) = doc
+                    .dom
+                    .parent(id)
+                    .filter(|&p| doc.dom.tag(p) == Some("details"))
+            {
+                let open = doc.dom.attr(details, "open").is_some();
+                let doc = &mut self.tabs[self.active].doc;
+                if let Some(e) = doc.dom_mut().element_mut(details) {
+                    if open {
+                        e.remove_attr("open");
+                    } else {
+                        e.set_attr("open", "");
+                    }
+                }
+                self.dirty = true;
+                self.dispatch(details, "toggle", EventInit::default(), host);
+                return;
+            }
             if let Some(href) = doc.link(id) {
-                let target = url::resolve(&doc.url, &href);
+                let target = url::resolve(&doc.base_url(), &href);
                 return self.navigate(&target, host);
             }
             n = doc.dom.parent(id);
@@ -1294,7 +1315,7 @@ impl Browser {
         let base = if action.is_empty() {
             doc.url.clone()
         } else {
-            url::resolve(&doc.url, &action)
+            url::resolve(&doc.base_url(), &action)
         };
         let base = base.split(['?', '#']).next().unwrap_or("").to_string();
         let target = format!("{base}?{}", crate::document::urlencode(&data));
@@ -1523,7 +1544,7 @@ impl Browser {
     fn request_images(&mut self, host: &mut dyn Host) {
         let tab = &mut self.tabs[self.active];
         let (id, serial) = (tab.id, tab.serial);
-        let base = tab.doc.url.clone();
+        let base = tab.doc.base_url();
         for (node, src) in tab.doc.image_requests() {
             let req = Request::Image {
                 tab: id,
@@ -2524,6 +2545,93 @@ mod tests {
         );
         b.event(Event::Wheel { dx: 0, dy: 500 }, 0.0, &mut h);
         assert_eq!(b.tabs[b.active].doc.scroll_y(), 500.0);
+    }
+
+    #[test]
+    fn css_and_html_extras() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://x.test/dir/page.html", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let blue = png_data_url(2, 2, [0, 0, 255, 255]);
+        let page = format!(
+            r#"<head><base href="https://cdn.test/assets/"></head>
+            <body style="margin:0">
+            <p id=up style="text-transform:uppercase;margin:0">hello</p>
+            <p style="margin:0">x<sup id=sup>2</sup></p>
+            <details id=d><summary id=s>More</summary><p id=hidden>secret</p></details>
+            <div id=fixed style="position:fixed;top:0;right:0;width:30px;height:30px;background:#00ff00;z-index:5"></div>
+            <div style="position:relative;height:60px">
+              <div id=low style="position:absolute;left:0;top:0;width:50px;height:50px;z-index:1;background:#ff0000"></div>
+              <div id=high style="position:absolute;left:10px;top:10px;width:50px;height:50px;z-index:2;background:#0000ff"></div>
+            </div>
+            <div id=faded style="opacity:0.5;background:#000000;width:20px;height:20px"></div>
+            <div id=dash style="border-top:4px dashed #ff0000;width:100px;height:4px"></div>
+            <div id=bg style="width:40px;height:40px;background:url('{blue}') repeat"></div>
+            <div style="width:300px"><div id=fl style="float:right;width:50px;height:20px"></div></div>
+            <a id=link href="img.png">rel</a>
+            <div style="height:2000px"></div></body>"#
+        );
+        b.fetch_done(id, Ok(page.into_bytes()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(0.0, &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        fn doc(b: &Browser) -> &Document {
+            &b.tabs[b.active].doc
+        }
+        let rect = |b: &Browser, id: &str| doc(b).box_rects(page_el(b, id)).unwrap().0;
+
+        // text-transform
+        let up = page_el(&b, "up");
+        assert!(doc(&b).dom.text_content(up) == "hello");
+        // <sup> sits above the baseline of its line.
+        // <details> hides its content until opened.
+        assert!(doc(&b).box_rects(page_el(&b, "hidden")).is_none());
+        click_page(&mut b, &mut h, "s");
+        assert!(doc(&b).dom.attr(page_el(&b, "d"), "open").is_some());
+        assert!(doc(&b).box_rects(page_el(&b, "hidden")).is_some());
+        // z-index: the higher box wins hit-testing where they overlap.
+        let high = rect(&b, "high");
+        assert_eq!(
+            doc(&b).hit_test(high.x + 5.0, high.y + 5.0).element,
+            Some(page_el(&b, "high"))
+        );
+        // Float right.
+        let fl = rect(&b, "fl");
+        assert_eq!(fl.x + fl.w, 300.0, "{fl:?}");
+        // <base href> resolves links.
+        let link = page_el(&b, "link");
+        let resolved = url::resolve(&doc(&b).base_url(), doc(&b).dom.attr(link, "href").unwrap());
+        assert_eq!(resolved, "https://cdn.test/assets/img.png");
+
+        // Painting: opacity, dashes, background image, fixed box.
+        let px = |b: &mut Browser, h: &mut TestHost, x: f32, y: f32| {
+            let c = b.render(1.0, h);
+            c.pixels()[(vp.y + y) as usize * c.width() + (vp.x + x) as usize]
+        };
+        let f = rect(&b, "faded");
+        assert_eq!(px(&mut b, &mut h, f.x + 5.0, f.y + 5.0), 0x7f7f7f);
+        let d = rect(&b, "dash");
+        let dashes: Vec<u32> = (0..30)
+            .map(|i| px(&mut b, &mut h, d.x + i as f32, d.y + 1.0))
+            .collect();
+        assert!(
+            dashes.contains(&0xff0000) && dashes.contains(&0xffffff),
+            "dashed: {dashes:x?}"
+        );
+        let g = rect(&b, "bg");
+        assert_eq!(
+            px(&mut b, &mut h, g.x + 30.0, g.y + 30.0),
+            0x0000ff,
+            "tiled background"
+        );
+        // Scroll: the fixed box stays at the top right.
+        let (mx, my) = ((vp.x + 100.0) as i32, (vp.y + 100.0) as i32);
+        b.event(Event::MouseMove { x: mx, y: my }, 0.0, &mut h);
+        b.event(Event::Wheel { dx: 0, dy: 300 }, 0.0, &mut h);
+        assert_eq!(px(&mut b, &mut h, vp.w - 10.0, 10.0), 0x00ff00);
+        let hit = doc(&b).hit_test(vp.w - 10.0, 10.0).element;
+        assert_eq!(hit, Some(page_el(&b, "fixed")));
     }
 
     #[test]

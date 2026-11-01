@@ -47,6 +47,21 @@ i, em, cite, var, dfn { font-style: italic; }
 u, ins { text-decoration: underline; }
 s, del, strike { text-decoration: line-through; }
 small { font-size: smaller; }
+sup { vertical-align: super; font-size: smaller; }
+sub { vertical-align: sub; font-size: smaller; }
+mark { background-color: #ffeb3b; color: #000000; }
+kbd {
+  font-family: monospace;
+  font-size: 0.9em;
+  padding: 0 4px;
+  border: 1px solid #b5b5b5;
+  border-radius: 3px;
+  background-color: #f6f6f6;
+}
+abbr[title] { text-decoration: underline; }
+summary { display: list-item; cursor: pointer; }
+details { margin: 0.5em 0; }
+figcaption { font-size: 0.9em; }
 big { font-size: larger; }
 center { text-align: center; }
 

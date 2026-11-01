@@ -36,6 +36,56 @@ pub enum Position {
     Static,
     Relative,
     Absolute,
+    /// Positioned against the viewport; does not scroll.
+    Fixed,
+}
+
+/// How a border or outline line is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineStyle {
+    #[default]
+    None,
+    Solid,
+    Dashed,
+    Dotted,
+    Double,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextTransform {
+    #[default]
+    None,
+    Uppercase,
+    Lowercase,
+    Capitalize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Float {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+/// `background-size`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum BackgroundSize {
+    #[default]
+    Auto,
+    Cover,
+    Contain,
+    Size(Dim, Dim),
+}
+
+/// `background-repeat`: (repeat x, repeat y).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Repeat(pub bool, pub bool);
+
+impl Default for Repeat {
+    fn default() -> Self {
+        Repeat(true, true)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -111,6 +161,9 @@ pub enum ListStyle {
     Square,
     Decimal,
     None,
+    /// `<summary>` of a closed / open `<details>`.
+    DisclosureClosed,
+    DisclosureOpen,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -164,8 +217,7 @@ pub struct Style {
     pub padding: [Dim; 4],
     pub border_width: [f32; 4],
     pub border_color: [Rgba; 4],
-    /// Whether each side's border-style draws anything.
-    pub border_style: [bool; 4],
+    pub border_style: [LineStyle; 4],
     pub border_radius: f32,
     pub width: Dim,
     pub height: Dim,
@@ -187,7 +239,23 @@ pub struct Style {
     pub flex_shrink: f32,
     pub flex_basis: Dim,
     pub vertical_align: VerticalAlign,
+    pub opacity: f32,
+    pub z_index: Option<i32>,
+    pub float: Float,
+    /// `clear`: (left, right).
+    pub clear: (bool, bool),
+    pub outline_width: f32,
+    pub outline_style: LineStyle,
+    pub outline_color: Rgba,
+    pub outline_offset: f32,
+    pub background_image: Option<String>,
+    pub background_size: BackgroundSize,
+    pub background_repeat: Repeat,
+    /// `background-position` as fractions (0 = left/top, 1 = right/bottom)
+    /// or pixel offsets.
+    pub background_position: (Dim, Dim),
     // Inherited:
+    pub text_transform: TextTransform,
     pub border_spacing: f32,
     pub border_collapse: bool,
     pub color: Rgba,
@@ -215,7 +283,7 @@ impl Default for Style {
             padding: [Dim::Px(0.0); 4],
             border_width: [3.0; 4],
             border_color: [Rgba::BLACK; 4],
-            border_style: [false; 4],
+            border_style: [LineStyle::None; 4],
             border_radius: 0.0,
             width: Dim::Auto,
             height: Dim::Auto,
@@ -237,6 +305,19 @@ impl Default for Style {
             flex_shrink: 1.0,
             flex_basis: Dim::Auto,
             vertical_align: VerticalAlign::Baseline,
+            opacity: 1.0,
+            z_index: None,
+            float: Float::None,
+            clear: (false, false),
+            outline_width: 3.0,
+            outline_style: LineStyle::None,
+            outline_color: Rgba::BLACK,
+            outline_offset: 0.0,
+            background_image: None,
+            background_size: BackgroundSize::Auto,
+            background_repeat: Repeat(true, true),
+            background_position: (Dim::Percent(0.0), Dim::Percent(0.0)),
+            text_transform: TextTransform::None,
             border_spacing: 0.0,
             border_collapse: false,
             color: Rgba::BLACK,
@@ -275,6 +356,7 @@ impl Style {
             visible: parent.visible,
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
+            text_transform: parent.text_transform,
             ..Style::default()
         }
     }
@@ -298,7 +380,7 @@ impl Style {
 
     /// Border width of a side, zero if its style draws nothing.
     pub fn border(&self, side: usize) -> f32 {
-        if self.border_style[side] {
+        if self.border_style[side] != LineStyle::None {
             self.border_width[side]
         } else {
             0.0
@@ -356,7 +438,8 @@ impl Style {
                 self.position = match v {
                     "static" => Position::Static,
                     "relative" | "sticky" => Position::Relative,
-                    "absolute" | "fixed" => Position::Absolute,
+                    "absolute" => Position::Absolute,
+                    "fixed" => Position::Fixed,
                     _ => return,
                 }
             }
@@ -436,13 +519,96 @@ impl Style {
             }
             "background-color" => set(&mut self.background, values::color(value, self.color)),
             "background" => {
-                if v == "none" {
-                    self.background = Rgba::TRANSPARENT;
-                }
-                for t in tokens(value) {
-                    if let Some(c) = values::color(t, self.color) {
+                self.background = Rgba::TRANSPARENT;
+                self.background_image = None;
+                let toks = tokens(value);
+                let mut positions = Vec::new();
+                let mut after_slash = false;
+                for t in &toks {
+                    let lt = t.to_ascii_lowercase();
+                    if let Some(u) = url_value(t) {
+                        self.background_image = Some(u);
+                    } else if let Some(r) = repeat(&lt) {
+                        self.background_repeat = r;
+                    } else if *t == "/" {
+                        after_slash = true;
+                    } else if after_slash {
+                        if let Some(sz) = background_size(&lt, fc) {
+                            self.background_size = sz;
+                        }
+                    } else if let Some(c) = values::color(t, self.color) {
                         self.background = c;
+                    } else {
+                        positions.push(lt);
                     }
+                }
+                if !positions.is_empty() {
+                    let p: Vec<&str> = positions.iter().map(String::as_str).collect();
+                    if let Some(pos) = background_position(&p, fc) {
+                        self.background_position = pos;
+                    }
+                }
+            }
+            "background-image" => self.background_image = url_value(value),
+            "background-repeat" => set(&mut self.background_repeat, repeat(v)),
+            "background-size" => set(&mut self.background_size, background_size(v, fc)),
+            "background-position" => {
+                let t = tokens(v);
+                set(&mut self.background_position, background_position(&t, fc));
+            }
+            "opacity" => {
+                if let Some(o) = values::number(v).or_else(|| {
+                    v.strip_suffix('%')
+                        .and_then(values::number)
+                        .map(|p| p / 100.0)
+                }) {
+                    self.opacity = o.clamp(0.0, 1.0);
+                }
+            }
+            "z-index" => self.z_index = v.parse().ok(),
+            "float" => {
+                self.float = match v {
+                    "left" | "inline-start" => Float::Left,
+                    "right" | "inline-end" => Float::Right,
+                    "none" => Float::None,
+                    _ => return,
+                }
+            }
+            "clear" => {
+                self.clear = match v {
+                    "left" => (true, false),
+                    "right" => (false, true),
+                    "both" => (true, true),
+                    "none" => (false, false),
+                    _ => return,
+                }
+            }
+            "outline" => {
+                self.outline_style = LineStyle::None;
+                self.outline_width = 3.0;
+                self.outline_color = self.color;
+                for t in tokens(value) {
+                    let lt = t.to_ascii_lowercase();
+                    if let Some(w) = border_width(&lt, fc) {
+                        self.outline_width = w;
+                    } else if let Some(st) = border_style(&lt) {
+                        self.outline_style = st;
+                    } else if let Some(c) = values::color(t, self.color) {
+                        self.outline_color = c;
+                    }
+                }
+            }
+            "outline-width" => set(&mut self.outline_width, border_width(v, fc)),
+            "outline-style" => set(&mut self.outline_style, border_style(v)),
+            "outline-color" => set(&mut self.outline_color, values::color(value, self.color)),
+            "outline-offset" => set(&mut self.outline_offset, px(v)),
+            "text-transform" => {
+                self.text_transform = match v {
+                    "uppercase" => TextTransform::Uppercase,
+                    "lowercase" => TextTransform::Lowercase,
+                    "capitalize" => TextTransform::Capitalize,
+                    "none" => TextTransform::None,
+                    _ => return,
                 }
             }
             "overflow" | "overflow-y" => {
@@ -539,6 +705,8 @@ impl Style {
                         "circle" => ListStyle::Circle,
                         "square" => ListStyle::Square,
                         "decimal" => ListStyle::Decimal,
+                        "disclosure-closed" => ListStyle::DisclosureClosed,
+                        "disclosure-open" => ListStyle::DisclosureOpen,
                         "none" => ListStyle::None,
                         _ => continue,
                     };
@@ -570,7 +738,7 @@ impl Style {
     fn border_side(&mut self, side: usize, value: &str, fc: FontContext) {
         // `border: none` and friends reset width and style.
         self.border_width[side] = 3.0;
-        self.border_style[side] = false;
+        self.border_style[side] = LineStyle::None;
         self.border_color[side] = self.color;
         for t in tokens(value) {
             let lt = t.to_ascii_lowercase();
@@ -686,6 +854,8 @@ impl Style {
             "max-height" => self.max_height = from.max_height,
             "box-sizing" => self.box_sizing = from.box_sizing,
             "background" | "background-color" => self.background = from.background,
+            "opacity" => self.opacity = from.opacity,
+            "text-transform" => self.text_transform = from.text_transform,
             "overflow" | "overflow-y" => self.overflow = from.overflow,
             "color" => self.color = from.color,
             "font-size" => self.font_size = from.font_size,
@@ -739,6 +909,7 @@ fn is_inherited(name: &str) -> bool {
                 | "visibility"
                 | "border-spacing"
                 | "border-collapse"
+                | "text-transform"
         )
 }
 
@@ -776,14 +947,87 @@ fn border_width(v: &str, fc: FontContext) -> Option<f32> {
     }
 }
 
-fn border_style(v: &str) -> Option<bool> {
-    match v {
-        "none" | "hidden" => Some(false),
-        "solid" | "dashed" | "dotted" | "double" | "groove" | "ridge" | "inset" | "outset" => {
-            Some(true)
+fn border_style(v: &str) -> Option<LineStyle> {
+    Some(match v {
+        "none" | "hidden" => LineStyle::None,
+        "solid" | "groove" | "ridge" | "inset" | "outset" => LineStyle::Solid,
+        "dashed" => LineStyle::Dashed,
+        "dotted" => LineStyle::Dotted,
+        "double" => LineStyle::Double,
+        _ => return None,
+    })
+}
+
+/// The URL in `url(...)`.
+fn url_value(t: &str) -> Option<String> {
+    let inner = t.trim().strip_prefix("url(")?.strip_suffix(')')?.trim();
+    Some(inner.trim_matches(['"', '\'']).to_string())
+}
+
+fn repeat(v: &str) -> Option<Repeat> {
+    Some(match v {
+        "repeat" => Repeat(true, true),
+        "no-repeat" => Repeat(false, false),
+        "repeat-x" => Repeat(true, false),
+        "repeat-y" => Repeat(false, true),
+        _ => return None,
+    })
+}
+
+fn background_size(v: &str, fc: FontContext) -> Option<BackgroundSize> {
+    Some(match v {
+        "cover" => BackgroundSize::Cover,
+        "contain" => BackgroundSize::Contain,
+        "auto" => BackgroundSize::Auto,
+        _ => {
+            let t = tokens(v);
+            let w = values::dim(t.first()?, fc)?;
+            let h = t
+                .get(1)
+                .and_then(|h| values::dim(h, fc))
+                .unwrap_or(Dim::Auto);
+            BackgroundSize::Size(w, h)
         }
-        _ => None,
+    })
+}
+
+fn background_position(t: &[&str], fc: FontContext) -> Option<(Dim, Dim)> {
+    let keyword = |k: &str| -> Option<(Option<Dim>, Option<Dim>)> {
+        Some(match k {
+            "left" => (Some(Dim::Percent(0.0)), None),
+            "right" => (Some(Dim::Percent(100.0)), None),
+            "top" => (None, Some(Dim::Percent(0.0))),
+            "bottom" => (None, Some(Dim::Percent(100.0))),
+            "center" => (None, None),
+            _ => return None,
+        })
+    };
+    let (mut x, mut y) = (Dim::Percent(50.0), Dim::Percent(50.0));
+    match t {
+        [a] => match keyword(a) {
+            Some((kx, ky)) => {
+                x = kx.unwrap_or(x);
+                y = ky.unwrap_or(y);
+            }
+            None => x = values::dim(a, fc)?,
+        },
+        [a, b, ..] => match (keyword(a), keyword(b)) {
+            (Some((ax, ay)), Some((bx, by))) => {
+                x = ax.or(bx).unwrap_or(x);
+                y = ay.or(by).unwrap_or(y);
+            }
+            _ => {
+                x = keyword(a)
+                    .and_then(|k| k.0)
+                    .or_else(|| values::dim(a, fc))?;
+                y = keyword(b)
+                    .and_then(|k| k.1)
+                    .or_else(|| values::dim(b, fc))?;
+            }
+        },
+        [] => return None,
     }
+    Some((x, y))
 }
 
 fn flex_direction(v: &str) -> Option<FlexDirection> {

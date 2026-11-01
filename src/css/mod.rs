@@ -126,6 +126,23 @@ pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<O
         } else {
             continue;
         };
+        let mut style = style;
+        // <details>: only the summary shows until it is opened.
+        if let Some(p) = dom.parent(id).filter(|&p| dom.tag(p) == Some("details")) {
+            let open = dom.attr(p, "open").is_some();
+            let is_summary = dom.tag(id) == Some("summary");
+            if is_summary {
+                style.list_style = if open {
+                    style::ListStyle::DisclosureOpen
+                } else {
+                    style::ListStyle::DisclosureClosed
+                };
+            } else if !open && dom.element(id).is_some() {
+                style.display = style::Display::None;
+            } else if !open && dom.text(id).is_some_and(|t| !t.trim().is_empty()) {
+                continue;
+            }
+        }
         if style.display == style::Display::None {
             continue;
         }

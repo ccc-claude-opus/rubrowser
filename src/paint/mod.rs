@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use crate::css::Style;
 use crate::css::style::{self as cs, Display, ListStyle};
-use crate::css::values::Rgba;
+use crate::css::values::{Dim, Rgba};
 use crate::document::{
     Control, FormState, ImageState, Images, button_label, control, option_label, options,
 };
@@ -83,8 +83,16 @@ impl Painter<'_> {
         };
         c.fill_rect(clip.x, clip.y, clip.w, clip.h, bg.rgb());
         let sy = self.scroll.get(&None).copied().unwrap_or(0.0);
-        for &child in &vp.children {
-            self.paint_box(c, child, origin.0, origin.1 - sy);
+        // The page, then fixed boxes (which do not scroll) by z-index.
+        let mut kids = vp.children.clone();
+        kids.sort_by_key(|&k| (self.tree.boxes[k].fixed, self.tree.boxes[k].z));
+        for child in kids {
+            let dy = if self.tree.boxes[child].fixed {
+                0.0
+            } else {
+                sy
+            };
+            self.paint_box(c, child, origin.0, origin.1 - dy);
         }
         self.scrollbar(
             c,
@@ -122,6 +130,10 @@ impl Painter<'_> {
             return;
         };
         let own = b.node.is_some();
+        let alpha = c.global_alpha();
+        if own && style.opacity < 1.0 {
+            c.set_global_alpha((alpha as f32 * style.opacity).round() as u8);
+        }
         if own && style.visible {
             let propagated = self.canvas_background().1 == b.node;
             if propagated {
@@ -129,9 +141,9 @@ impl Painter<'_> {
                     background: Rgba::TRANSPARENT,
                     ..style.clone()
                 };
-                self.decorations(c, &plain, r);
+                self.decorations(c, b, &plain, r);
             } else {
-                self.decorations(c, style, r);
+                self.decorations(c, b, style, r);
             }
             if style.display == Display::ListItem {
                 self.marker(c, b, style, r);
@@ -158,13 +170,18 @@ impl Painter<'_> {
             let (cx, cy) = b.content_offset();
             self.inline(c, il, r.x + cx, r.y + cy - sy);
         }
-        // In-flow children first, then absolutely positioned ones on top.
-        for pass in [false, true] {
-            for &child in &b.children {
-                if self.tree.boxes[child].absolute == pass {
-                    self.paint_box(c, child, r.x, r.y - sy);
-                }
+        // In-flow children first, then positioned ones on top by z-index.
+        let mut positioned = Vec::new();
+        for &child in &b.children {
+            if self.tree.boxes[child].absolute {
+                positioned.push(child);
+            } else {
+                self.paint_box(c, child, r.x, r.y - sy);
             }
+        }
+        positioned.sort_by_key(|&k| self.tree.boxes[k].z);
+        for child in positioned {
+            self.paint_box(c, child, r.x, r.y - sy);
         }
         if let Some(node) = b.node
             && self.dom.tag(node) != Some("button")
@@ -190,6 +207,195 @@ impl Painter<'_> {
         }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);
+        }
+        c.set_clip(saved);
+        if own && style.visible && style.outline_style != cs::LineStyle::None {
+            self.outline(c, style, r);
+        }
+        c.set_global_alpha(alpha);
+    }
+
+    /// The outline, outside the border box.
+    fn outline(&self, c: &mut Canvas, style: &Style, r: RectF) {
+        let w = style.outline_width;
+        let o = style.outline_offset;
+        let outer = RectF {
+            x: r.x - o - w,
+            y: r.y - o - w,
+            w: r.w + 2.0 * (o + w),
+            h: r.h + 2.0 * (o + w),
+        };
+        let (ls, col) = (style.outline_style, style.outline_color);
+        let bottom = RectF {
+            y: outer.y + outer.h - w,
+            h: w,
+            ..outer
+        };
+        let right = RectF {
+            x: outer.x + outer.w - w,
+            w,
+            ..outer
+        };
+        self.line_side(c, RectF { h: w, ..outer }, true, ls, col);
+        self.line_side(c, bottom, true, ls, col);
+        self.line_side(c, RectF { w, ..outer }, false, ls, col);
+        self.line_side(c, right, false, ls, col);
+    }
+
+    /// One border (or outline) side: a strip drawn solid, dashed, dotted
+    /// or double.
+    fn line_side(
+        &self,
+        c: &mut Canvas,
+        side: RectF,
+        horizontal: bool,
+        ls: cs::LineStyle,
+        col: Rgba,
+    ) {
+        let thick = if horizontal { side.h } else { side.w };
+        let len = if horizontal { side.w } else { side.h };
+        if thick <= 0.0 || len <= 0.0 {
+            return;
+        }
+        let seg = |c: &mut Canvas, from: f32, to: f32| {
+            let part = if horizontal {
+                RectF {
+                    x: side.x + from,
+                    w: to - from,
+                    ..side
+                }
+            } else {
+                RectF {
+                    y: side.y + from,
+                    h: to - from,
+                    ..side
+                }
+            };
+            self.fill(c, part, col);
+        };
+        match ls {
+            cs::LineStyle::None => {}
+            cs::LineStyle::Solid => seg(c, 0.0, len),
+            cs::LineStyle::Dashed | cs::LineStyle::Dotted => {
+                let (on, off) = if ls == cs::LineStyle::Dashed {
+                    ((thick * 3.0).max(4.0), (thick * 2.0).max(3.0))
+                } else {
+                    (thick, thick)
+                };
+                let mut at = 0.0;
+                while at < len {
+                    seg(c, at, (at + on).min(len));
+                    at += on + off;
+                }
+            }
+            cs::LineStyle::Double => {
+                let t = (thick / 3.0).max(1.0);
+                let (a, z) = if horizontal {
+                    (
+                        RectF { h: t, ..side },
+                        RectF {
+                            y: side.y + side.h - t,
+                            h: t,
+                            ..side
+                        },
+                    )
+                } else {
+                    (
+                        RectF { w: t, ..side },
+                        RectF {
+                            x: side.x + side.w - t,
+                            w: t,
+                            ..side
+                        },
+                    )
+                };
+                self.fill(c, a, col);
+                self.fill(c, z, col);
+            }
+        }
+    }
+
+    /// `background-image`, tiled and positioned in the padding box.
+    fn background_image(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
+        let Some(url) = &style.background_image else {
+            return;
+        };
+        let Some(bm) = self.images.urls.get(url).and_then(|s| s.bitmap()) else {
+            return;
+        };
+        let pr = b.padding_rect();
+        let area = RectF {
+            x: r.x + pr.x,
+            y: r.y + pr.y,
+            ..pr
+        };
+        let (iw, ih) = (bm.width as f32, bm.height as f32);
+        if iw <= 0.0 || ih <= 0.0 || area.w <= 0.0 || area.h <= 0.0 {
+            return;
+        }
+        let (tw, th) = match style.background_size {
+            cs::BackgroundSize::Auto => (iw, ih),
+            cs::BackgroundSize::Cover => {
+                let k = (area.w / iw).max(area.h / ih);
+                (iw * k, ih * k)
+            }
+            cs::BackgroundSize::Contain => {
+                let k = (area.w / iw).min(area.h / ih);
+                (iw * k, ih * k)
+            }
+            cs::BackgroundSize::Size(w, h) => {
+                let w = (w != Dim::Auto).then(|| w.px_or_zero(area.w));
+                let h = (h != Dim::Auto).then(|| h.px_or_zero(area.h));
+                match (w, h) {
+                    (Some(w), Some(h)) => (w, h),
+                    (Some(w), None) => (w, w * ih / iw),
+                    (None, Some(h)) => (h * iw / ih, h),
+                    (None, None) => (iw, ih),
+                }
+            }
+        };
+        if tw < 0.5 || th < 0.5 {
+            return;
+        }
+        let place = |d: Dim, room: f32| match d {
+            Dim::Percent(p) => room * p / 100.0,
+            other => other.px_or_zero(room),
+        };
+        let x0 = area.x + place(style.background_position.0, area.w - tw);
+        let y0 = area.y + place(style.background_position.1, area.h - th);
+        let s = self.scale;
+        let (pw, ph) = (
+            (tw * s).round().max(1.0) as u32,
+            (th * s).round().max(1.0) as u32,
+        );
+        let Some(px) = self.images.scaled_url(url, pw, ph) else {
+            return;
+        };
+        let saved = c.clip();
+        c.set_clip(self.phys(r).intersect(&saved));
+        let cs::Repeat(rx, ry) = style.background_repeat;
+        let start = |p0: f32, size: f32, lo: f32, rep: bool| {
+            if rep {
+                p0 - ((p0 - lo) / size).ceil().max(0.0) * size
+            } else {
+                p0
+            }
+        };
+        let mut y = start(y0, th, r.y, ry);
+        while y < r.y + r.h {
+            let mut x = start(x0, tw, r.x, rx);
+            while x < r.x + r.w {
+                let (dx, dy) = ((x * s).round() as i32, (y * s).round() as i32);
+                c.draw_argb(dx, dy, pw as usize, ph as usize, &px);
+                if !rx {
+                    break;
+                }
+                x += tw;
+            }
+            if !ry {
+                break;
+            }
+            y += th;
         }
         c.set_clip(saved);
     }
@@ -493,7 +699,7 @@ impl Painter<'_> {
         }
     }
 
-    fn decorations(&self, c: &mut Canvas, style: &Style, r: RectF) {
+    fn decorations(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
         let s = self.scale;
         let bw = [0, 1, 2, 3].map(|i| style.border(i));
         let radius = style.border_radius;
@@ -501,7 +707,16 @@ impl Painter<'_> {
             && style
                 .border_color
                 .iter()
-                .all(|&col| col == style.border_color[0]);
+                .all(|&col| col == style.border_color[0])
+            && style
+                .border_style
+                .iter()
+                .all(|&ls| matches!(ls, cs::LineStyle::Solid | cs::LineStyle::None));
+        if style.background_image.is_some() && radius <= 0.0 {
+            self.fill(c, r, style.background);
+            self.background_image(c, b, style, r);
+            return self.borders(c, style, r, bw);
+        }
         if radius > 0.0 {
             let outer = (r.x * s, r.y * s, r.w * s, r.h * s, radius * s);
             if style.background.is_visible() {
@@ -525,6 +740,11 @@ impl Painter<'_> {
         } else {
             self.fill(c, r, style.background);
         }
+        self.borders(c, style, r, bw);
+    }
+
+    /// Four border sides (square corners).
+    fn borders(&self, c: &mut Canvas, style: &Style, r: RectF, bw: [f32; 4]) {
         let sides = [
             RectF { h: bw[0], ..r },
             RectF {
@@ -541,7 +761,8 @@ impl Painter<'_> {
         ];
         for (i, side) in sides.into_iter().enumerate() {
             if bw[i] > 0.0 {
-                self.fill(c, side, style.border_color[i]);
+                let ls = style.border_style[i];
+                self.line_side(c, side, i % 2 == 0, ls, style.border_color[i]);
             }
         }
     }
@@ -560,6 +781,15 @@ impl Painter<'_> {
         let color = style.color;
         match style.list_style {
             ListStyle::None => {}
+            ListStyle::DisclosureClosed | ListStyle::DisclosureOpen => {
+                let arrow = if style.list_style == ListStyle::DisclosureOpen {
+                    "\u{25be} "
+                } else {
+                    "\u{25b8} "
+                };
+                let w = self.fonts.measure(style.font(), fs, arrow);
+                self.text(c, style, x - w, baseline, arrow, color);
+            }
             ListStyle::Decimal => {
                 let n = self.list_index(b.node);
                 let text = format!("{n}. ");
@@ -620,7 +850,9 @@ impl Painter<'_> {
                         x: tx,
                         width,
                         text,
+                        shift,
                     } => {
+                        let baseline = baseline + shift;
                         let Some(st) = self.style(*node) else {
                             continue;
                         };

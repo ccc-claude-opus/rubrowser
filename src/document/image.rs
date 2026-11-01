@@ -101,6 +101,9 @@ type Scaled = (u32, u32, Rc<Vec<u32>>);
 #[derive(Default)]
 pub struct Images {
     pub states: HashMap<NodeId, ImageState>,
+    /// CSS `background-image` URLs (as written in the stylesheet).
+    pub urls: HashMap<String, ImageState>,
+    scaled_urls: RefCell<HashMap<String, Scaled>>,
     /// node → (width, height, pixels) at the last painted size.
     scaled: RefCell<HashMap<NodeId, Scaled>>,
 }
@@ -122,6 +125,25 @@ impl Images {
         let px = Rc::new(bitmap.resized(w, h));
         cache.insert(node, (w, h, px.clone()));
         Some(px)
+    }
+
+    /// Pixels of background image `url` resized to `w × h`, cached.
+    pub fn scaled_url(&self, url: &str, w: u32, h: u32) -> Option<Rc<Vec<u32>>> {
+        let bitmap = self.urls.get(url)?.bitmap()?;
+        let mut cache = self.scaled_urls.borrow_mut();
+        if let Some((cw, ch, px)) = cache.get(url)
+            && (*cw, *ch) == (w, h)
+        {
+            return Some(px.clone());
+        }
+        let px = Rc::new(bitmap.resized(w, h));
+        cache.insert(url.to_string(), (w, h, px.clone()));
+        Some(px)
+    }
+
+    pub fn set_url(&mut self, url: &str, state: ImageState) {
+        self.scaled_urls.borrow_mut().remove(url);
+        self.urls.insert(url.to_string(), state);
     }
 
     pub fn set(&mut self, node: NodeId, state: ImageState) {
