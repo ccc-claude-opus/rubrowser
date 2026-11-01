@@ -1100,22 +1100,37 @@ fn zero_px(v: &str) -> String {
 }
 
 /// A `grid-template-columns` / `-rows` track list (line names ignored).
-fn track_list(v: &str) -> Vec<GridTemplateComponent<String>> {
+/// A track list and its line names (`[a b] 1fr [c]`: one list of names per
+/// line, so one more than there are tracks).
+type TrackList = (Vec<GridTemplateComponent<String>>, Vec<Vec<String>>);
+
+fn track_list(v: &str) -> TrackList {
     if v.trim() == "none" {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let v = zero_px(v);
-    top_tokens(&v)
-        .into_iter()
-        .filter(|t| !t.starts_with('['))
-        .filter_map(|t| {
-            if t.starts_with("repeat(") {
-                t.parse::<GridTemplateComponent<String>>().ok()
-            } else {
-                track(t).map(GridTemplateComponent::Single)
-            }
-        })
-        .collect()
+    let mut tracks = Vec::new();
+    let mut names: Vec<Vec<String>> = vec![Vec::new()];
+    for t in top_tokens(&v) {
+        if let Some(list) = t.strip_prefix('[') {
+            let list = list.trim_end_matches(']');
+            names
+                .last_mut()
+                .unwrap()
+                .extend(list.split_whitespace().map(str::to_string));
+            continue;
+        }
+        let component = if t.starts_with("repeat(") {
+            t.parse::<GridTemplateComponent<String>>().ok()
+        } else {
+            track(t).map(GridTemplateComponent::Single)
+        };
+        if let Some(c) = component {
+            tracks.push(c);
+            names.push(Vec::new());
+        }
+    }
+    (tracks, names)
 }
 
 /// `grid-template-areas: "a a" "b c"`.
@@ -1160,10 +1175,10 @@ fn template_areas(v: &str) -> Option<taffy::GridTemplateAreas<String>> {
 /// Grid container properties.
 fn grid_style(g: &crate::css::style::GridProps, ts: &mut Style) {
     if let Some(v) = &g.template_columns {
-        ts.grid_template_columns = track_list(v);
+        (ts.grid_template_columns, ts.grid_template_column_names) = track_list(v);
     }
     if let Some(v) = &g.template_rows {
-        ts.grid_template_rows = track_list(v);
+        (ts.grid_template_rows, ts.grid_template_row_names) = track_list(v);
     }
     if let Some(v) = &g.template_areas {
         ts.grid_template_areas = template_areas(v);
