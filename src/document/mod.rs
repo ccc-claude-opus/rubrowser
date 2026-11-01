@@ -153,20 +153,33 @@ impl Document {
         self.size
     }
 
-    /// `<link rel=stylesheet href>` elements: (node, href).
+    /// `<link>` elements whose sheet to load, `rel=stylesheet` or
+    /// `rel=preload as=style` (which pages turn into stylesheets when it
+    /// loads): (node, href).
     pub fn stylesheet_links(&self) -> Vec<(NodeId, String)> {
         self.dom
             .descendants(Dom::ROOT)
             .into_iter()
-            .filter(|&n| {
-                self.dom.tag(n) == Some("link")
-                    && self.dom.attr(n, "rel").is_some_and(|r| {
-                        r.split_whitespace()
-                            .any(|w| w.eq_ignore_ascii_case("stylesheet"))
-                    })
-            })
+            .filter(|&n| self.loads_sheet(n))
             .filter_map(|n| Some((n, self.dom.attr(n, "href")?.to_string())))
             .collect()
+    }
+
+    /// Whether `n` is a `<link>` whose stylesheet to load.
+    pub fn loads_sheet(&self, n: NodeId) -> bool {
+        self.dom.tag(n) == Some("link")
+            && (self.link_rel(n, "stylesheet")
+                || (self.link_rel(n, "preload")
+                    && self
+                        .dom
+                        .attr(n, "as")
+                        .is_some_and(|a| a.eq_ignore_ascii_case("style"))))
+    }
+
+    fn link_rel(&self, n: NodeId, rel: &str) -> bool {
+        self.dom.attr(n, "rel").is_some_and(|r| {
+            r.split_whitespace().any(|w| w.eq_ignore_ascii_case(rel))
+        })
     }
 
     /// Delivers the text of a `<link rel=stylesheet>` loaded from `url`.
@@ -263,7 +276,12 @@ impl Document {
                     }
                 }
                 Some("link") => match self.linked_css.get(&n) {
-                    Some(sheet) if self.dom.attr(n, "disabled").is_none() => sheet.clone(),
+                    Some(sheet)
+                        if self.dom.attr(n, "disabled").is_none()
+                            && self.link_rel(n, "stylesheet") =>
+                    {
+                        sheet.clone()
+                    }
                     _ => continue,
                 },
                 _ => continue,

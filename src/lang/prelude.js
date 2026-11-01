@@ -12,6 +12,16 @@
 
   const wrappers = new Map();
 
+  // A URL attribute as a property: resolved against the page.
+  function absolute(v) {
+    if (v === null || v === undefined) return '';
+    try {
+      return new URL(v, document.baseURI).href;
+    } catch (_) {
+      return v;
+    }
+  }
+
   function wrap(h) {
     if (h === null || h === undefined || h < 0) return null;
     let n = wrappers.get(h);
@@ -320,6 +330,7 @@
       if (t) return t.toLowerCase();
       return this.localName === 'button' ? 'submit' : this.localName === 'input' ? 'text' : '';
     }
+    set type(v) { this.setAttribute('type', v); }
     get elements() { return this.querySelectorAll('input, select, textarea, button'); }
     submit() { rb.formAction(this.__h, 0); }
     reset() { rb.formAction(this.__h, 1); }
@@ -327,9 +338,9 @@
     set hidden(v) { if (v) this.setAttribute('hidden', ''); else this.removeAttribute('hidden'); }
     get disabled() { return this.hasAttribute('disabled'); }
     set disabled(v) { if (v) this.setAttribute('disabled', ''); else this.removeAttribute('disabled'); }
-    get href() { return this.getAttribute('href') || ''; }
+    get href() { return absolute(this.getAttribute('href')); }
     set href(v) { this.setAttribute('href', v); }
-    get src() { return this.getAttribute('src') || ''; }
+    get src() { return absolute(this.getAttribute('src')); }
     set src(v) { this.setAttribute('src', v); }
     get title() { return this.getAttribute('title') || ''; }
     set title(v) { this.setAttribute('title', v); }
@@ -403,6 +414,15 @@
       t.textContent = v;
     }
     get location() { return location; }
+    get baseURI() {
+      const base = rb.query('base[href]');
+      if (base < 0) return location.href;
+      try {
+        return new URL(rb.getAttr(base, 'href'), location.href).href;
+      } catch (_) {
+        return location.href;
+      }
+    }
     get readyState() { return 'complete'; }
     getElementById(id) {
       const v = String(id).replace(/["\\]/g, '\\$&');
@@ -417,7 +437,7 @@
     createEvent(kind) { return new (/custom/i.test(kind) ? CustomEvent : Event)(''); }
     createComment(text) { return this.createTextNode(''); }
     createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
-    get currentScript() { return null; }
+    get currentScript() { return currentScript; }
     get visibilityState() { return 'visible'; }
     get hidden() { return false; }
     createElement(tag) {
@@ -922,6 +942,28 @@
     static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason; return s; }
     static any() { return new AbortSignal(); }
   }
+  // Workers and channels exist but never deliver messages (no threads
+  // here): enough for feature checks and for pages that use them optionally.
+  class MessagePort extends EventTarget {
+    postMessage() {}
+    start() {}
+    close() {}
+  }
+  class Worker extends EventTarget {
+    constructor(url) { super(); this.url = String(url); }
+    postMessage() {}
+    terminate() {}
+  }
+  class SharedWorker extends EventTarget {
+    constructor(url) { super(); this.port = new MessagePort(); }
+  }
+  class MessageChannel {
+    constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); }
+  }
+  class BroadcastChannel extends MessagePort {
+    constructor(name) { super(); this.name = String(name); }
+  }
+
   class AbortController {
     constructor() { this.signal = new AbortSignal(); }
     abort(reason) {
@@ -1123,6 +1165,63 @@
   });
   for (const name of ['load', 'domcontentloaded', 'keydown', 'click']) handlerProperty(global, name);
 
+  // Properties reflecting attributes: strings, then booleans.
+  for (const [prop, attr] of [['rel'], ['as'], ['media'], ['crossOrigin', 'crossorigin'], ['charset'],
+    ['integrity'], ['alt'], ['target'], ['lang'], ['dir'], ['placeholder'], ['content'],
+    ['httpEquiv', 'http-equiv'], ['htmlFor', 'for'], ['download'], ['referrerPolicy', 'referrerpolicy'],
+    ['loading'], ['srcset'], ['sizes'], ['action'], ['method'], ['nonce'], ['role'], ['autocomplete'],
+    ['decoding'], ['fetchPriority', 'fetchpriority'], ['enctype'], ['accept'], ['pattern'], ['label']]) {
+    Object.defineProperty(Element.prototype, prop, {
+      configurable: true,
+      get() { return this.getAttribute(attr || prop) || ''; },
+      set(v) { if (v === null) this.removeAttribute(attr || prop); else this.setAttribute(attr || prop, v); },
+    });
+  }
+  for (const [prop, attr] of [['async'], ['defer'], ['noModule', 'nomodule'], ['required'], ['readOnly', 'readonly'],
+    ['multiple'], ['autofocus'], ['open'], ['selected'], ['inert'], ['noValidate', 'novalidate']]) {
+    Object.defineProperty(Element.prototype, prop, {
+      configurable: true,
+      get() { return this.hasAttribute(attr || prop); },
+      set(v) { this.toggleAttribute(attr || prop, !!v); },
+    });
+  }
+  for (const [prop, attr, initial] of [['width', 'width', 0], ['height', 'height', 0], ['tabIndex', 'tabindex', -1],
+    ['colSpan', 'colspan', 1], ['rowSpan', 'rowspan', 1], ['maxLength', 'maxlength', -1]]) {
+    if (Object.getOwnPropertyDescriptor(Element.prototype, prop)) continue;
+    Object.defineProperty(Element.prototype, prop, {
+      configurable: true,
+      get() { const v = parseInt(this.getAttribute(attr), 10); return isNaN(v) ? initial : v; },
+      set(v) { this.setAttribute(attr, String(v)); },
+    });
+  }
+
+  // `element.onclick = …` and friends.
+  for (const name of ['load', 'error', 'click', 'dblclick', 'contextmenu', 'input', 'change', 'submit',
+    'reset', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'mousedown', 'mouseup', 'mousemove',
+    'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'wheel', 'scroll', 'pointerdown', 'pointerup',
+    'animationend', 'transitionend']) {
+    Object.defineProperty(Element.prototype, 'on' + name, {
+      configurable: true,
+      enumerable: true,
+      get() { return (this.__on && this.__on[name] && this.__on[name].fn) || null; },
+      set(fn) {
+        const on = this.__on || (this.__on = {});
+        if (on[name]) this.removeEventListener(name, on[name].listener);
+        on[name] = null;
+        if (typeof fn !== 'function') return;
+        const listener = function (event) {
+          if (fn.call(this, event) === false) event.preventDefault();
+        };
+        this.addEventListener(name, listener);
+        on[name] = { fn, listener };
+      },
+    });
+  }
+
+  // document.currentScript, set by the browser around each script.
+  let currentScript = null;
+  global.__rb_current = function (h) { currentScript = h < 0 ? null : wrap(h); };
+
   for (const [name, which] of [['innerWidth', 2], ['innerHeight', 3], ['outerWidth', 2], ['outerHeight', 3]]) {
     Object.defineProperty(global, name, { configurable: true, get: () => rb.rect(0, which) });
   }
@@ -1151,6 +1250,11 @@
     structuredClone,
     AbortController,
     AbortSignal,
+    Worker,
+    SharedWorker,
+    MessageChannel,
+    MessagePort,
+    BroadcastChannel,
     Headers,
     Request,
     Response,

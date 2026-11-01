@@ -32,7 +32,7 @@ use crate::sdk::{ffi, read_string};
 const PRELUDE: &str = include_str!("prelude.js");
 
 thread_local! {
-    static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+    static CONTEXT: RefCell<Option<Box<Context>>> = const { RefCell::new(None) };
     /// Buffers handed out by `rb_alloc`, freed after `rb_eval`.
     static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
@@ -405,14 +405,19 @@ fn report(err: JsError, ctx: &mut Context) {
 }
 
 fn with_context(f: impl FnOnce(&mut Context)) {
-    // Take the context out so nested calls cannot double-borrow it.
-    let ctx = CONTEXT.with(|c| c.borrow_mut().take());
-    if let Some(mut ctx) = ctx {
-        f(&mut ctx);
+    // No borrow is held while scripts run: when the browser stops a script
+    // that runs too long, the call never returns, and the next call must
+    // still find the context.
+    let ctx = CONTEXT.with(|c| c.borrow_mut().as_deref_mut().map(|c| c as *mut Context));
+    if let Some(ctx) = ctx {
+        // SAFETY: the context is boxed (a stable address) and only reached
+        // from the runtime's exports, which the browser never calls while
+        // another is running.
+        let ctx = unsafe { &mut *ctx };
+        f(ctx);
         if let Err(e) = ctx.run_jobs() {
-            report(e, &mut ctx);
+            report(e, ctx);
         }
-        CONTEXT.with(|c| *c.borrow_mut() = Some(ctx));
     }
 }
 
@@ -538,7 +543,7 @@ pub fn init() {
     if let Err(e) = ctx.eval(Source::from_bytes(PRELUDE)) {
         log(&format!("prelude failed: {e}"));
     }
-    CONTEXT.with(|c| *c.borrow_mut() = Some(ctx));
+    CONTEXT.with(|c| *c.borrow_mut() = Some(Box::new(ctx)));
 }
 
 /// `rb_alloc`: a buffer for the browser to write source code into.

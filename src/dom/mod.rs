@@ -83,6 +83,8 @@ pub struct Dom {
     pub quirks: bool,
     /// Bumped by every change (see [`Dom::version`]).
     version: u64,
+    /// `<script>`s created by `innerHTML`, which never run.
+    pub inert_scripts: std::collections::HashSet<NodeId>,
 }
 
 impl Default for Dom {
@@ -104,6 +106,7 @@ impl Dom {
             }],
             quirks: false,
             version: 0,
+            inert_scripts: Default::default(),
         }
     }
 
@@ -401,6 +404,11 @@ impl Dom {
         for t in top {
             let n = self.import(&frag, t);
             self.append(id, n);
+            for d in self.descendants(n) {
+                if self.tag(d) == Some("script") {
+                    self.inert_scripts.insert(d);
+                }
+            }
         }
     }
 

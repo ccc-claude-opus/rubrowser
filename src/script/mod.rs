@@ -344,12 +344,13 @@ fn placeholder() -> Document {
     Document::new(Dom::new(), "")
 }
 
+/// The error of a script stopped for running too long.
+pub const TOO_LONG: &str = "the script ran too long without returning (possible infinite loop)";
+
 /// Turns a wasmi error into a message for the console.
 fn describe(e: Error) -> String {
     match e.as_trap_code() {
-        Some(TrapCode::OutOfFuel) => {
-            "the script ran too long without returning (possible infinite loop)".into()
-        }
+        Some(TrapCode::OutOfFuel) => TOO_LONG.into(),
         Some(TrapCode::UnreachableCodeReached) => "the script panicked".into(),
         Some(code) => format!("the script crashed: {code}"),
         None => e.to_string(),

@@ -62,6 +62,13 @@
 
 其他修正：`translate` / `transform: translate()`、`aspect-ratio`、`@property`、具名 grid 線、`[hidden]`、`clip` / `clip-path` 的隱藏寫法、SVG 的 CSS `fill` / `stroke` 與屬性中的 `var()`、絕對定位元素以最近的定位祖先為包含區塊、CSS 已定尺寸的圖片載入時不重新排版、hover 的增量樣式計算。
 
+### 第三輪：腳本插入的資源
+
+- 腳本插入的 `<script>` 與 `<link rel=stylesheet>` 會載入、執行並觸發 `load` / `error`（許多網站用載入器這樣載入 JS 與 CSS）；`document.currentScript`、元素的 `on…` 屬性、反映屬性的 property。
+- 一個腳本超過時間上限時只停止它，不再讓整頁的 JS 停擺。
+- Wikipedia（英、中）與 GitHub 仍與 Chrome 相近，且 Wikipedia 的 ResourceLoader 模組現在會執行。
+- craigslist：已能跑到自己的載入流程，但主程式（1.2 MB）在 boa 上太慢而逾時；效能留到最後處理。
+
 ### 第二批調查
 
 | 網站 | 狀況 |

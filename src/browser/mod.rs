@@ -166,6 +166,14 @@ struct PendingScript {
     /// For a module: its import graph, fetched before it runs (`body` is
     /// set once every module has arrived).
     graph: Option<ModuleGraph>,
+    /// Its `<script>` element (`document.currentScript`).
+    node: Option<NodeId>,
+    /// Whether it has `src` or was inserted by a script: it then gets
+    /// `load` / `error`.
+    events: bool,
+    /// Inserted by a script: async, so not limited by the page's loading
+    /// budget (only by the per-call one).
+    inserted: bool,
 }
 
 /// The modules of one `<script type=module>`.
@@ -395,6 +403,8 @@ const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js.wasm");
 /// Extra fields of a dispatched event.
 #[derive(Clone, Copy, Debug, Default)]
 struct EventInit {
+    /// Only at the target (`load` of a script or stylesheet).
+    local: bool,
     key: i32,
     mods: i32,
     x: f32,
@@ -457,6 +467,14 @@ struct Tab {
     dom_version: u64,
     /// Method and body for the next page load (a form POST).
     post: Option<crate::input::HttpRequest>,
+    /// `<script>` and stylesheet `<link>` elements already handled; others
+    /// were inserted by scripts.
+    known: std::collections::HashSet<NodeId>,
+    /// Stylesheet `load` / `error` events waiting for `DOMContentLoaded`
+    /// (so inline handlers are registered by then).
+    link_events: Vec<(NodeId, &'static str)>,
+    /// Scripts inserted by scripts are queued: run them on the next update.
+    kick: bool,
 }
 
 impl Tab {
@@ -579,6 +597,9 @@ impl Browser {
             runtimes: HashMap::new(),
             script_count: 0,
             loaded: false,
+            known: Default::default(),
+            link_events: Vec::new(),
+            kick: false,
         });
         self.active = self.tabs.len() - 1;
     }
@@ -735,12 +756,21 @@ impl Browser {
         if let Some(code) = inline_handlers(&tab.doc).filter(|_| self.javascript || !web) {
             let at = scripts
                 .iter()
-                .take_while(|(l, _, _)| matches!(l, Lang::Runtime(_)))
+                .take_while(|(l, ..)| matches!(l, Lang::Runtime(_)))
                 .count();
-            scripts.insert(at, (Lang::Source(JS_MIME.to_string()), None, code));
+            scripts.insert(at, (Lang::Source(JS_MIME.to_string()), None, code, None));
         }
         tab.script_count = scripts.len();
         tab.loaded = false;
+        tab.link_events.clear();
+        tab.known = tab
+            .doc
+            .dom
+            .descendants(crate::dom::Dom::ROOT)
+            .into_iter()
+            .filter(|&n| tab.doc.dom.tag(n) == Some("script"))
+            .chain(links.iter().map(|&(n, _)| n))
+            .collect();
         for (link, href) in links {
             let target = url::resolve(url, &href);
             let req = Request::Stylesheet {
@@ -753,7 +783,7 @@ impl Browser {
         }
         self.tabs[i].import_map = import_map(&self.tabs[i].doc, url);
         // Scripts are fetched in parallel but run in document order.
-        for (slot, (lang, src, inline)) in scripts.into_iter().enumerate() {
+        for (slot, (lang, src, inline, node)) in scripts.into_iter().enumerate() {
             let tab = &mut self.tabs[i];
             let module = lang == Lang::Module;
             match src {
@@ -764,6 +794,9 @@ impl Browser {
                         name: target.clone(),
                         body: None,
                         graph: module.then(|| ModuleGraph::new(&target)),
+                        node,
+                        events: true,
+                        inserted: false,
                     });
                     let req = Request::Script {
                         tab: id,
@@ -779,6 +812,9 @@ impl Browser {
                         name: format!("{url} (inline module)"),
                         body: None,
                         graph: Some(ModuleGraph::new(&root)),
+                        node,
+                        events: false,
+                        inserted: false,
                     });
                     self.module_loaded(i, slot, &root, Ok(inline.into_bytes()), host);
                 }
@@ -787,6 +823,9 @@ impl Browser {
                     name: format!("{url} (inline script)"),
                     body: Some(Ok(inline.into_bytes())),
                     graph: None,
+                    node,
+                    events: false,
+                    inserted: false,
                 }),
             }
         }
@@ -840,20 +879,40 @@ impl Browser {
                 Ok(b) => b,
                 Err(e) => {
                     host.log(&format!("{}: {e}", p.name));
+                    if let Some(node) = p.node.filter(|_| p.events) {
+                        self.element_event(i, node, "error", host);
+                    }
                     continue;
                 }
             };
+            // Inserted scripts run outside the loading budget.
+            let saved = p.inserted.then(|| self.js_budget(i, None)).flatten();
             match p.lang {
                 Lang::Module => self.run_module(i, p.graph.unwrap_or_default(), host),
                 Lang::Wasm => self.start_wasm(i, &body, &p.name, host),
                 Lang::Runtime(mime) => self.start_runtime(i, &mime, &body, &p.name, host),
                 Lang::Source(mime) => {
                     let source = String::from_utf8_lossy(&body).into_owned();
+                    let current = p.node.filter(|_| mime == JS_MIME);
+                    if let Some(n) = current {
+                        self.run_source(i, JS_MIME, &format!("__rb_current({n})"), "rb", host);
+                    }
                     self.run_source(i, &mime, &source, &p.name, host);
+                    if current.is_some() && i < self.tabs.len() {
+                        self.run_source(i, JS_MIME, "__rb_current(-1)", "rb", host);
+                    }
                 }
             }
             if i >= self.tabs.len() {
                 return;
+            }
+            if let Some(budget) = saved
+                && !self.tabs[i].loaded
+            {
+                self.js_budget(i, Some(budget));
+            }
+            if let Some(node) = p.node.filter(|_| p.events) {
+                self.element_event(i, node, "load", host);
             }
         }
     }
@@ -928,10 +987,124 @@ impl Browser {
         self.run_source(i, JS_MIME, "", &format!("rb-module:{}", graph.root), host);
     }
 
+    /// Sets the loading budget of tab `i`'s JavaScript runtime; returns the
+    /// previous one.
+    fn js_budget(&mut self, i: usize, budget: Option<u64>) -> Option<u64> {
+        let tab = &mut self.tabs[i];
+        let rt = tab.runtimes.get(JS_MIME).and_then(|&si| tab.scripts.get_mut(si))?;
+        let rt = rt.as_mut()?;
+        let old = rt.budget();
+        rt.set_budget(budget);
+        old
+    }
+
+    /// Fires `load` / `error` at a script or stylesheet element of tab `i`
+    /// (not bubbling).
+    fn element_event(&mut self, i: usize, node: NodeId, kind: &str, host: &mut dyn Host) {
+        if i == self.active && !self.tabs[i].scripts.is_empty() {
+            let init = EventInit {
+                local: true,
+                ..Default::default()
+            };
+            self.dispatch(node, kind, init, host);
+        }
+    }
+
+    /// Starts the `<script>` and stylesheet `<link>` elements that scripts
+    /// inserted into tab `i`. Scripts are queued after the page's own and
+    /// get `load` / `error` once run; `innerHTML` scripts never run.
+    fn adopt_inserted(&mut self, i: usize, host: &mut dyn Host) {
+        let tab = &mut self.tabs[i];
+        let (id, serial) = (tab.id, tab.serial);
+        let base = tab.doc.base_url();
+        let dom = &tab.doc.dom;
+        let mut links = Vec::new();
+        let mut scripts = Vec::new();
+        for n in dom.descendants(crate::dom::Dom::ROOT) {
+            if tab.known.contains(&n) || dom.inert_scripts.contains(&n) {
+                continue;
+            }
+            if let Some(entry) = script_entry(dom, n) {
+                // A script without `src` or text yet waits for them.
+                tab.known.insert(n);
+                scripts.push((n, entry));
+            } else if tab.doc.loads_sheet(n)
+                && let Some(href) = dom.attr(n, "href")
+            {
+                tab.known.insert(n);
+                links.push((n, url::resolve(&base, href)));
+            }
+        }
+        for (link, target) in links {
+            let req = Request::Stylesheet {
+                tab: id,
+                serial,
+                link: Some(link),
+                url: target.clone(),
+            };
+            self.fetch(req, &target, host);
+        }
+        for (node, (lang, src, inline)) in scripts {
+            if !matches!(lang, Lang::Module | Lang::Source(_)) {
+                continue;
+            }
+            let tab = &mut self.tabs[i];
+            let slot = tab.script_count;
+            tab.script_count += 1;
+            let module = lang == Lang::Module;
+            tab.kick = true;
+            match src {
+                Some(src) => {
+                    let target = url::resolve(&base, &src);
+                    tab.pending.push_back(PendingScript {
+                        lang,
+                        name: target.clone(),
+                        body: None,
+                        graph: module.then(|| ModuleGraph::new(&target)),
+                        node: Some(node),
+                        events: true,
+                        inserted: true,
+                    });
+                    let req = Request::Script {
+                        tab: id,
+                        serial,
+                        slot,
+                    };
+                    self.fetch(req, &target, host);
+                }
+                None if module => {
+                    let root = format!("{base}#inserted-module-{slot}");
+                    tab.pending.push_back(PendingScript {
+                        lang,
+                        name: format!("{base} (inserted module)"),
+                        body: None,
+                        graph: Some(ModuleGraph::new(&root)),
+                        node: Some(node),
+                        events: false,
+                        inserted: true,
+                    });
+                    self.module_loaded(i, slot, &root, Ok(inline.into_bytes()), host);
+                }
+                None => tab.pending.push_back(PendingScript {
+                    lang,
+                    name: format!("{base} (inserted script)"),
+                    body: Some(Ok(inline.into_bytes())),
+                    graph: None,
+                    node: Some(node),
+                    events: false,
+                    inserted: true,
+                }),
+            }
+        }
+    }
+
     /// `DOMContentLoaded` at the document, then `load` at the body.
     fn fire_load(&mut self, i: usize, host: &mut dyn Host) {
         if i != self.active || self.tabs[i].scripts.is_empty() {
             return;
+        }
+        for (node, kind) in std::mem::take(&mut self.tabs[i].link_events) {
+            self.element_event(i, node, kind, host);
         }
         self.dispatch(
             crate::dom::Dom::ROOT,
@@ -1108,6 +1281,7 @@ impl Browser {
                 else {
                     return;
                 };
+                let kind = if result.is_ok() { "load" } else { "error" };
                 if let Ok(bytes) = result {
                     let css = String::from_utf8_lossy(&bytes).into_owned();
                     match link {
@@ -1115,6 +1289,13 @@ impl Browser {
                         None => self.tabs[i].doc.add_import(&url, css),
                     }
                     self.dirty = true;
+                }
+                if let Some(link) = link {
+                    if self.tabs[i].loaded {
+                        self.element_event(i, link, kind, host);
+                    } else {
+                        self.tabs[i].link_events.push((link, kind));
+                    }
                 }
             }
             Request::Image {
@@ -1247,7 +1428,8 @@ impl Browser {
             });
         }
         let version = tab.doc.dom.version();
-        if version != tab.dom_version {
+        let changed = version != tab.dom_version;
+        if changed {
             tab.dom_version = version;
             tab.doc.dom_changed();
         }
@@ -1284,6 +1466,9 @@ impl Browser {
             };
             host.fetch_with(fid, &target, &request);
         }
+        if changed {
+            self.adopt_inserted(i, host);
+        }
         if let Some(target) = out.navigate
             && i == self.active
         {
@@ -1316,6 +1501,13 @@ impl Browser {
     /// Reports a script failure and stops that script.
     fn script_failed(&mut self, i: usize, si: usize, err: &str, host: &mut dyn Host) {
         host.log(&format!("script error in {}: {err}", self.tabs[i].doc.url));
+        // A language runtime survives one of its scripts being stopped for
+        // time; it fails for good if that left it broken.
+        if err == crate::script::TOO_LONG
+            && self.tabs[i].scripts[si].as_ref().is_some_and(Script::is_runtime)
+        {
+            return;
+        }
         self.tabs[i].scripts[si] = None;
         self.tabs[i].timers.retain(|t| t.script != si);
     }
@@ -1371,7 +1563,7 @@ impl Browser {
                     return prevented; // the script navigated away
                 }
             }
-            if stopped {
+            if stopped || init.local {
                 break;
             }
             n = self.tabs[i].doc.dom.parent(id);
@@ -2203,6 +2395,11 @@ impl Browser {
             }
         }
         self.run_timers(host);
+        for i in 0..self.tabs.len() {
+            if std::mem::take(&mut self.tabs[i].kick) {
+                self.run_scripts(i, host);
+            }
+        }
         if self.dirty {
             self.sync_chrome(host);
         }
@@ -2330,7 +2527,7 @@ impl Browser {
 /// Every script the browser can run, in document order: language
 /// runtimes declared with `<link rel="rubrowser-runtime" type href>` first,
 /// then `<script>`s. Each entry is (language, `src`, inline text).
-fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
+fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String, Option<NodeId>)> {
     let dom = &doc.dom;
     let all = dom.descendants(crate::dom::Dom::ROOT);
     let runtimes = all.iter().filter_map(|&n| {
@@ -2343,36 +2540,44 @@ fn page_scripts(doc: &Document) -> Vec<(Lang, Option<String>, String)> {
             Lang::Runtime(mime),
             Some(dom.attr(n, "href")?.to_string()),
             String::new(),
+            None,
         ))
     });
     let scripts = all.iter().filter_map(|&n| {
-        if dom.tag(n) != Some("script") {
-            return None;
-        }
-        let src = dom.attr(n, "src").map(str::to_string);
-        let ty = dom
-            .attr(n, "type")
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
-        // `nomodule` scripts are fallbacks for browsers without modules.
-        if dom.attr(n, "nomodule").is_some() || ty == "importmap" {
-            return None;
-        }
-        let wasm_src = src.as_deref().is_some_and(|s| s.ends_with(".wasm"));
-        let lang = match script_mime(&ty) {
-            _ if ty == "module" => Lang::Module,
-            Some(m) if m == JS_MIME && wasm_src => Lang::Wasm,
-            Some(m) => Lang::Source(m),
-            None => Lang::Wasm,
-        };
-        let inline = dom.text_content(n);
-        if src.is_none() && (lang == Lang::Wasm || inline.trim().is_empty()) {
-            return None;
-        }
-        Some((lang, src, inline))
+        let (lang, src, inline) = script_entry(dom, n)?;
+        Some((lang, src, inline, Some(n)))
     });
     runtimes.chain(scripts).collect()
+}
+
+/// What `<script>` element `n` runs: its language, `src` and inline text
+/// (`None` for no script, e.g. JSON data or a `nomodule` fallback).
+fn script_entry(dom: &crate::dom::Dom, n: NodeId) -> Option<(Lang, Option<String>, String)> {
+    if dom.tag(n) != Some("script") {
+        return None;
+    }
+    let src = dom.attr(n, "src").map(str::to_string);
+    let ty = dom
+        .attr(n, "type")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    // `nomodule` scripts are fallbacks for browsers without modules.
+    if dom.attr(n, "nomodule").is_some() || ty == "importmap" {
+        return None;
+    }
+    let wasm_src = src.as_deref().is_some_and(|s| s.ends_with(".wasm"));
+    let lang = match script_mime(&ty) {
+        _ if ty == "module" => Lang::Module,
+        Some(m) if m == JS_MIME && wasm_src => Lang::Wasm,
+        Some(m) => Lang::Source(m),
+        None => Lang::Wasm,
+    };
+    let inline = dom.text_content(n);
+    if src.is_none() && (lang == Lang::Wasm || inline.trim().is_empty()) {
+        return None;
+    }
+    Some((lang, src, inline))
 }
 
 /// JavaScript registering every `on…="code"` attribute, if there are any.
@@ -2985,6 +3190,62 @@ mod tests {
 
         b.render(100.0, &mut h);
         assert!(h.logs.contains(&"timer true".to_string()), "{:?}", h.logs);
+    }
+
+    #[test]
+    fn scripts_and_stylesheets_inserted_by_scripts_load() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<p id=p>x</p><script>
+              console.log('current ' + document.currentScript.tagName);
+              const l = document.createElement('link');
+              l.rel = 'stylesheet';
+              l.href = 's.css';
+              l.onload = () => console.log('css load');
+              document.head.appendChild(l);
+              const s = document.createElement('script');
+              s.src = 'd.js';
+              s.addEventListener('load', () => console.log('js load'));
+              document.head.appendChild(s);
+              document.body.insertAdjacentHTML('beforeend', '<script>console.log("innerHTML ran")<\/script>');
+              const t = document.createElement('script');
+              t.textContent = 'console.log("inline ran")';
+              document.body.appendChild(t);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let find = |h: &LogHost, url: &str| h.inner.fetched.iter().find(|f| f.1 == url).unwrap().0;
+        let (css, js) = (find(&h, "https://js.test/s.css"), find(&h, "https://js.test/d.js"));
+        b.fetch_done(js, Ok(b"console.log('d ran')".to_vec()), &mut h);
+        b.fetch_done(css, Ok(b"#p { color: red }".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in ["current SCRIPT", "inline ran", "d ran", "js load", "css load"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+        assert!(!h.logs.iter().any(|l| l == "innerHTML ran"), "{:?}", h.logs);
+        let doc = &b.tabs[b.active].doc;
+        let p = doc.dom.element_by_id("p").unwrap();
+        assert_eq!(doc.style(p).unwrap().color.rgb(), 0xff0000);
+    }
+
+    #[test]
+    fn runtime_survives_a_script_that_runs_too_long() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              setTimeout(() => { let n = 0; for (;;) n++; }, 1);
+              setTimeout(() => console.log('still running', [1, 2].map(x => x * 2).join()), 5);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(10.0, &mut h);
+        assert!(h.logs.iter().any(|l| l.contains("ran too long")), "{:?}", h.logs);
+        assert!(h.logs.contains(&"still running 2,4".to_string()), "{:?}", h.logs);
     }
 
     #[test]

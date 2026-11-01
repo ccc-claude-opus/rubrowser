@@ -44,17 +44,18 @@ flowchart LR
 | 語言 | boa 支援的 ECMAScript：`let/const`、箭頭函式、class、解構、展開、樣板字串、`Map/Set`、`Promise`、`async/await`、`Proxy`、正規表示式、`JSON`、`Math`、`Date` … |
 | `document` | `getElementById`、`querySelector(All)`、`getElementsByTagName/ClassName`、`createElement`、`createTextNode`、`body`、`head`、`documentElement`、`title`、`addEventListener` |
 | 節點 | `parentNode`、`parentElement`、`childNodes`、`children`、`firstChild`、`nextSibling`、`firstElementChild` …、`textContent`、`appendChild`、`append`、`prepend`、`insertBefore`、`removeChild`、`replaceChild`、`remove`、`before`、`after`、`replaceWith`、`contains`、`cloneNode` |
-| 元素 | `id`、`className`、`classList`、`style`（含 `setProperty`）、`dataset`、`innerHTML`、`outerHTML`、`innerText`、`value`、`hidden`、`disabled`、`getAttribute` 等、`matches`、`closest`、`insertAdjacentHTML`、`click()` |
-| 事件 | `addEventListener`（含 `once`）、`removeEventListener`；事件物件的 `type`、`target`、`currentTarget`、`key`、`keyCode`、`shiftKey/ctrlKey/altKey/metaKey`、`clientX/clientY`、`button`、`preventDefault()`、`stopPropagation()`；`window.onload` 等屬性 |
+| 元素 | `id`、`className`、`classList`、`style`（含 `setProperty`）、`dataset`、`innerHTML`、`outerHTML`、`innerText`、`value`、`hidden`、`disabled`、`href` / `src`（絕對網址）、`rel`、`type`、`async`、`crossOrigin` 等反映屬性的 property、`getAttribute` 等、`matches`、`closest`、`insertAdjacentHTML`、`click()` |
+| 事件 | `addEventListener`（含 `once`）、`removeEventListener`；事件物件的 `type`、`target`、`currentTarget`、`key`、`keyCode`、`shiftKey/ctrlKey/altKey/metaKey`、`clientX/clientY`、`button`、`preventDefault()`、`stopPropagation()`；`window.onload`、`element.onclick` / `onload` / `onerror` 等屬性 |
+| 動態載入 | 腳本插入的 `<script>`（外部、內嵌、模組）與 `<link rel=stylesheet>` 會載入並執行／套用，完成後觸發 `load` / `error`；`innerHTML` 插入的腳本不執行（同瀏覽器）；`document.currentScript`；`<link rel=preload as=style>` 會先下載，改成 `rel=stylesheet` 時套用 |
 | 計時 | `setTimeout`、`setInterval`、`clearTimeout`、`clearInterval`、`requestAnimationFrame`、`queueMicrotask`、`performance.now()`、`Date.now()` |
 | 其他 | `console.log/info/warn/error`、`alert`（寫到主控台）、`location.href`（讀取與換頁）、`history.back/forward/go`（`pushState` / `replaceState` 只保存 state） |
 | 模組 | `<script type=module>`（外部與內嵌）、`import` / `export`、`import * as`、`export … from`、import map、`import.meta.url`；`nomodule` 腳本不執行 |
 | 幾何 | `getBoundingClientRect`、`offsetWidth/Height/Top/Left`、`clientWidth/Height`、`innerWidth/innerHeight`（上次排版的結果） |
-| Web API | `URL`、`URLSearchParams`、`customElements`（含升級已存在的元素、`connectedCallback`、`attributeChangedCallback`）、`DocumentFragment`、`localStorage` / `sessionStorage`（只存在於這一頁）、`document.cookie`（同上）、`navigator`、`matchMedia`（一律不符合）、`TextEncoder/Decoder`、`atob/btoa`、`crypto.getRandomValues/randomUUID`、`structuredClone`、`AbortController`、`CustomEvent`、`dispatchEvent`、`DOMParser`、簡化的 `Intl`、`requestIdleCallback`；`MutationObserver`、`ResizeObserver`、`IntersectionObserver`（所有元素都算可見） |
+| Web API | `URL`、`URLSearchParams`、`customElements`（含升級已存在的元素、`connectedCallback`、`attributeChangedCallback`）、`DocumentFragment`、`localStorage` / `sessionStorage`（只存在於這一頁）、`document.cookie`（同上）、`navigator`、`matchMedia`（一律不符合）、`TextEncoder/Decoder`、`atob/btoa`、`crypto.getRandomValues/randomUUID`、`structuredClone`、`AbortController`、`CustomEvent`、`dispatchEvent`、`DOMParser`、簡化的 `Intl`、`requestIdleCallback`、`Worker` / `SharedWorker` / `MessageChannel` / `BroadcastChannel`（存在但不傳遞訊息）；`MutationObserver`、`ResizeObserver`、`IntersectionObserver`（所有元素都算可見） |
 
 | 網路 | `fetch`（含 `Request`、`Headers`、`URLSearchParams` / `FormData` 本文）、`XMLHttpRequest`；只允許與頁面同源的網址（還沒有 CORS 檢查），GET 與 POST |
 
-尚未支援：跨來源請求、canvas、Web Worker、WebSocket、shadow DOM 的繪製。
+尚未支援：跨來源請求、canvas、真正執行的 Web Worker、WebSocket、shadow DOM 的繪製。
 
 ### 模組協定
 
@@ -70,11 +71,11 @@ flowchart LR
 
 ### 執行時間
 
-載入頁面時，所有腳本合計最多約 80 億 fuel（約 3 秒）；用完後其餘的腳本會略過，讓頁面先顯示。載入完成後，每次呼叫（事件、計時器）最多 100 億 fuel。
+載入頁面時，HTML 裡的腳本合計最多約 80 億 fuel（約 3 秒）；用完後其餘的腳本會略過，讓頁面先顯示。腳本插入的腳本是非同步的，不算在這個預算內。載入完成後（以及每個插入的腳本），每次呼叫最多 100 億 fuel。
 
 ## 3. 錯誤
 
-未捕捉的例外會以 `Uncaught …` 寫到主控台（原生版在終端機的 stderr，網頁版在瀏覽器的 console），同一頁的其他腳本與事件處理照常執行。超過 fuel 上限（例如無窮迴圈）時，該頁的 JS runtime 會被停止。
+未捕捉的例外會以 `Uncaught …` 寫到主控台（原生版在終端機的 stderr，網頁版在瀏覽器的 console），同一頁的其他腳本與事件處理照常執行。超過 fuel 上限（例如無窮迴圈）時，只停止那一次呼叫；runtime 的 `Context` 不在呼叫期間被借出，所以之後的腳本、事件與計時器照常執行。若 runtime 因此損壞（之後的呼叫當掉），該頁的 JS 才會被停止。
 
 ## 4. 建置 runtime
 
