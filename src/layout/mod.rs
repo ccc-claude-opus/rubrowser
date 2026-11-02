@@ -150,10 +150,18 @@ struct Builder<'a> {
     caps: HashMap<NodeId, f32>,
     /// Inline-blocks found wider than their container in this pass.
     overflow: HashMap<NodeId, f32>,
+    /// Containing block sizes (the percentage bases of mixed `calc()`
+    /// values) found by a previous pass; others assume the viewport.
+    bases: HashMap<NodeId, (f32, f32)>,
+    /// Elements with mixed `calc()` values, with the bases assumed.
+    calc_nodes: Vec<(NodeId, (f32, f32))>,
     /// Positioned elements being built (innermost last), each with the
     /// absolutely positioned descendants hoisted to it as its children.
     abs_stack: Vec<(NodeId, Vec<taffy::NodeId>)>,
 }
+
+/// Containing block sizes (width, height) by element.
+type Bases = HashMap<NodeId, (f32, f32)>;
 
 /// Natural sizes of replaced elements (`<img>`), by node.
 pub type Replaced = std::collections::HashMap<NodeId, (f32, f32)>;
@@ -168,12 +176,15 @@ pub fn layout(
     height: f32,
     replaced: &Replaced,
 ) -> LayoutTree {
-    CALC_BASE.with(|b| b.set(width));
+    CALC_BASE.with(|b| b.set((width, height)));
+    VIEWPORT.with(|v| v.set((width, height)));
     let mut caps = HashMap::new();
-    // Shrink-to-fit needs the container width, which is only known after
-    // layout: re-run with caps for the inline-blocks that overflowed.
+    let mut bases = HashMap::new();
+    // Shrink-to-fit needs the container width, and mixed `calc()` values
+    // their containing block's size, which are only known after layout:
+    // re-run with what the previous pass found.
     for _ in 0..3 {
-        let (tree, overflow) = layout_pass(
+        let (tree, overflow, wrong) = layout_pass(
             dom,
             styles,
             generated,
@@ -182,13 +193,15 @@ pub fn layout(
             height,
             replaced,
             caps.clone(),
+            bases.clone(),
         );
-        if overflow.is_empty() {
+        if overflow.is_empty() && wrong.is_empty() {
             return tree;
         }
         caps.extend(overflow);
+        bases.extend(wrong);
     }
-    layout_pass(dom, styles, generated, fonts, width, height, replaced, caps).0
+    layout_pass(dom, styles, generated, fonts, width, height, replaced, caps, bases).0
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -201,7 +214,8 @@ fn layout_pass(
     height: f32,
     replaced: &Replaced,
     caps: HashMap<NodeId, f32>,
-) -> (LayoutTree, HashMap<NodeId, f32>) {
+    bases: Bases,
+) -> (LayoutTree, HashMap<NodeId, f32>, Bases) {
     let mut gen_of: HashMap<NodeId, [Option<usize>; 2]> = HashMap::new();
     for (i, g) in generated.iter().enumerate() {
         gen_of.entry(g.owner).or_default()[g.after as usize] = Some(i);
@@ -211,6 +225,8 @@ fn layout_pass(
         gen_of,
         caps,
         overflow: HashMap::new(),
+        bases,
+        calc_nodes: Vec::new(),
         abs_stack: Vec::new(),
         in_block: true,
         fixed: Vec::new(),
@@ -271,17 +287,48 @@ fn layout_pass(
         vp.children.extend(fixed);
         vp.content_h = content_h;
     }
-    (LayoutTree { boxes: b.boxes }, b.overflow)
+    let wrong = b.wrong_bases();
+    (LayoutTree { boxes: b.boxes }, b.overflow, wrong)
 }
 
 impl Builder<'_> {
+    /// Elements whose mixed `calc()` values assumed a containing block
+    /// size other than the one they got, with the real one.
+    fn wrong_bases(&self) -> HashMap<NodeId, (f32, f32)> {
+        let mut at: HashMap<NodeId, usize> = HashMap::new();
+        for (i, b) in self.boxes.iter().enumerate() {
+            if let Some(n) = b.node {
+                at.entry(n).or_insert(i);
+            }
+        }
+        let mut out = HashMap::new();
+        for &(id, assumed) in &self.calc_nodes {
+            let mut p = self.dom.parent(id);
+            while let Some(n) = p {
+                if let Some(&i) = at.get(&n) {
+                    let b = &self.boxes[i];
+                    let size = (
+                        b.rect.w - b.padding[cs::LEFT] - b.padding[cs::RIGHT]
+                            - b.border[cs::LEFT]
+                            - b.border[cs::RIGHT],
+                        b.rect.h - b.padding[cs::TOP] - b.padding[cs::BOTTOM]
+                            - b.border[cs::TOP]
+                            - b.border[cs::BOTTOM],
+                    );
+                    if (size.0 - assumed.0).abs() > 0.5 || (size.1 - assumed.1).abs() > 0.5 {
+                        out.insert(id, size);
+                    }
+                    break;
+                }
+                p = self.dom.parent(n);
+            }
+        }
+        out
+    }
+
     /// Whether element `id` has a percentage (or calc with %) width.
     fn percent_width(&self, id: NodeId) -> bool {
-        self.style(id).is_some_and(|s| match s.width {
-            Dim::Percent(_) => true,
-            Dim::Calc(_, p) => p != 0.0,
-            _ => false,
-        })
+        self.style(id).is_some_and(|s| s.width.has_percent())
     }
 
     /// Children of `id` including generated `::before` / `::after` boxes.
@@ -411,7 +458,7 @@ impl Builder<'_> {
             return false;
         };
         let set = |d: Dim| d != Dim::Auto;
-        let pct = |d: Dim| matches!(d, Dim::Percent(_) | Dim::Calc(_, _));
+        let pct = |d: Dim| d.has_percent();
         let horizontal = set(s.inset[cs::LEFT]) || set(s.inset[cs::RIGHT]);
         let vertical = set(s.inset[cs::TOP]) || set(s.inset[cs::BOTTOM]);
         (horizontal && vertical) || (pct(s.width) && pct(s.height))
@@ -423,6 +470,11 @@ impl Builder<'_> {
         let css = self.style(id).cloned().unwrap_or_default();
         let is_flex = matches!(css.display, CDisplay::Flex | CDisplay::InlineFlex);
         let is_grid = matches!(css.display, CDisplay::Grid | CDisplay::InlineGrid);
+        let base = self.bases.get(&id).copied().unwrap_or(self.viewport);
+        CALC_BASE.with(|b| b.set(base));
+        if has_calc(&css) {
+            self.calc_nodes.push((id, base));
+        }
         let mut tstyle = convert(&css);
         // `<center>` / `align=center`: block children with no horizontal
         // margins are centered.
@@ -1097,8 +1149,8 @@ fn track(tok: &str) -> Option<TrackSizingFunction> {
     let fc = crate::css::values::FontContext {
         em: 16.0,
         rem: 16.0,
-        vw: CALC_BASE.with(|b| b.get()),
-        vh: 800.0,
+        vw: VIEWPORT.with(|v| v.get().0),
+        vh: VIEWPORT.with(|v| v.get().1),
     };
     let lp = lp(crate::css::values::dim(tok, fc)?);
     Some(minmax(lp.into(), lp.into()))
@@ -1123,7 +1175,7 @@ fn avoid_floats(o: Point<TOverflow>) -> Point<TOverflow> {
 /// Rewrites lengths for taffy's parser, which only knows `px`, `%` and
 /// `fr`: unitless zeros become `0px`, `rem`/`em`/`vw`/`vh`/`pt` become px.
 fn zero_px(v: &str) -> String {
-    let base = CALC_BASE.with(|b| b.get());
+    let base = VIEWPORT.with(|v| v.get().0);
     let mut out = String::with_capacity(v.len() + 8);
     let mut rest = v;
     while !rest.is_empty() {
@@ -1282,33 +1334,57 @@ fn push_inline(parts: &mut Vec<Part>, item: Item) {
 }
 
 thread_local! {
-    /// Viewport width while converting styles: mixed `calc(% + px)` values
-    /// cannot be expressed in taffy, so their pixel part is approximated
-    /// as a share of the viewport.
-    static CALC_BASE: std::cell::Cell<f32> = const { std::cell::Cell::new(1280.0) };
+    /// The containing block size (width, height) of the element whose
+    /// style is being converted: taffy has no `calc()`, so mixed values
+    /// become pixels against it (see [`Builder::wrong_bases`]).
+    static CALC_BASE: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1280.0, 800.0)) };
+    /// The viewport size, for `vw` / `vh` in grid templates.
+    static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1280.0, 800.0)) };
 }
 
-fn calc_percent(px: f32, pct: f32) -> f32 {
-    let base = CALC_BASE.with(|b| b.get()).max(1.0);
-    (pct + px * 100.0 / base) / 100.0
+/// Pixels of a mixed `calc()` value: percentages of the containing
+/// block's height for `vertical` properties, else of its width.
+fn calc_px(d: Dim, vertical: bool) -> f32 {
+    let (w, h) = CALC_BASE.with(|b| b.get());
+    d.px_or_zero(if vertical { h } else { w })
 }
 
-fn dim(d: Dim) -> Dimension {
+/// Whether a style has mixed `calc()` values (see [`calc_px`]).
+fn has_calc(s: &Css) -> bool {
+    let mixed = |d: &Dim| matches!(d, Dim::Calc(..) | Dim::Expr(_));
+    [s.width, s.height, s.min_width, s.min_height, s.max_width, s.max_height]
+        .iter()
+        .chain(&s.margin)
+        .chain(&s.padding)
+        .chain(&s.inset)
+        .chain([&s.row_gap, &s.column_gap, &s.flex_basis])
+        .any(mixed)
+}
+
+fn dim_on(d: Dim, vertical: bool) -> Dimension {
     match d {
         Dim::Auto => Dimension::auto(),
         Dim::Px(v) => Dimension::length(v),
         Dim::Percent(p) => Dimension::percent(p / 100.0),
-        Dim::Calc(px, p) => Dimension::percent(calc_percent(px, p)),
+        Dim::Calc(..) | Dim::Expr(_) => Dimension::length(calc_px(d, vertical)),
     }
 }
 
-fn lpa(d: Dim) -> LengthPercentageAuto {
+fn dim(d: Dim) -> Dimension {
+    dim_on(d, false)
+}
+
+fn lpa_on(d: Dim, vertical: bool) -> LengthPercentageAuto {
     match d {
         Dim::Auto => LengthPercentageAuto::auto(),
         Dim::Px(v) => LengthPercentageAuto::length(v),
         Dim::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
-        Dim::Calc(px, p) => LengthPercentageAuto::percent(calc_percent(px, p)),
+        Dim::Calc(..) | Dim::Expr(_) => LengthPercentageAuto::length(calc_px(d, vertical)),
     }
+}
+
+fn lpa(d: Dim) -> LengthPercentageAuto {
+    lpa_on(d, false)
 }
 
 fn lp(d: Dim) -> LengthPercentage {
@@ -1316,7 +1392,7 @@ fn lp(d: Dim) -> LengthPercentage {
         Dim::Auto => LengthPercentage::length(0.0),
         Dim::Px(v) => LengthPercentage::length(v),
         Dim::Percent(p) => LengthPercentage::percent(p / 100.0),
-        Dim::Calc(px, p) => LengthPercentage::percent(calc_percent(px, p)),
+        Dim::Calc(..) | Dim::Expr(_) => LengthPercentage::length(calc_px(d, false)),
     }
 }
 
@@ -1389,7 +1465,8 @@ fn convert(s: &Css) -> Style {
         inset: if s.position == cs::Position::Sticky {
             rect4([Dim::Auto; 4].map(lpa))
         } else {
-            rect4(s.inset.map(lpa))
+            let [t, r, b, l] = s.inset;
+            rect4([lpa_on(t, true), lpa(r), lpa_on(b, true), lpa(l)])
         },
         overflow: Point {
             x: overflow,
@@ -1398,15 +1475,15 @@ fn convert(s: &Css) -> Style {
         scrollbar_width: 0.0,
         size: Size {
             width: dim(s.width),
-            height: dim(s.height),
+            height: dim_on(s.height, true),
         },
         min_size: Size {
             width: lpa(s.min_width),
-            height: lpa(s.min_height),
+            height: lpa_on(s.min_height, true),
         },
         max_size: Size {
             width: lpa(s.max_width),
-            height: lpa(s.max_height),
+            height: lpa_on(s.max_height, true),
         },
         margin: rect4(s.margin.map(lpa)),
         padding: rect4(s.padding.map(lp)),
@@ -1528,6 +1605,22 @@ mod tests {
         assert_eq!(a.w, 300.0);
         assert_eq!(a.y, 10.0);
         assert_eq!(b.y, 40.0, "adjacent vertical margins collapse");
+    }
+
+    #[test]
+    fn calc_and_min_use_the_containing_block() {
+        let l = lay(
+            r#"<style>body{margin:0} #box{width:400px;height:200px}
+               #a{width:calc(100% - 100px);height:calc(50% - 10px)} #b{width:min(100%, 600px)}
+               #c{width:clamp(10px, 50%, 150px)} #d{width:max(10%, 50px);margin-left:calc(25% - 20px)}</style>
+               <div id=box><div id=a></div><div id=b></div><div id=c></div><div id=d></div></div>"#,
+            1000.0,
+            600.0,
+        );
+        assert_eq!((l.rect("a").w, l.rect("a").h), (300.0, 90.0));
+        assert_eq!(l.rect("b").w, 400.0);
+        assert_eq!(l.rect("c").w, 150.0);
+        assert_eq!((l.rect("d").w, l.rect("d").x), (50.0, 80.0));
     }
 
     #[test]

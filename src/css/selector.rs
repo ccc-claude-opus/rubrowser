@@ -75,6 +75,10 @@ enum Pseudo {
     Required,
     Optional,
     PlaceholderShown,
+    /// `:lang(…)`: language ranges, lowercase.
+    Lang(Vec<String>),
+    /// `:dir(rtl)` (true) or `:dir(ltr)`.
+    Dir(bool),
     /// Valid syntax this engine does not support: never matches.
     Never,
 }
@@ -335,6 +339,17 @@ impl<'a> Parser<'a> {
                 }
                 "where" => Pseudo::Where(parse_list_forgiving(arg)),
                 "has" => Pseudo::Has(parse_relative(arg)?),
+                "lang" => Pseudo::Lang(
+                    arg.split(',')
+                        .map(|l| l.trim().trim_matches(['"', '\'']).to_ascii_lowercase())
+                        .filter(|l| !l.is_empty())
+                        .collect(),
+                ),
+                "dir" => match arg.trim().to_ascii_lowercase().as_str() {
+                    "rtl" => Pseudo::Dir(true),
+                    "ltr" => Pseudo::Dir(false),
+                    _ => Pseudo::Never,
+                },
                 "nth-child" | "nth-last-child" | "nth-of-type" | "nth-last-of-type" => {
                     let (expr, of) = match arg.find(" of ") {
                         Some(k) if name.ends_with("child") => {
@@ -759,8 +774,57 @@ fn pseudo_matches<C: Context>(cx: &C, p: &Pseudo, n: NodeId) -> bool {
         Pseudo::PlaceholderShown => {
             dom.attr(n, "placeholder").is_some() && dom.attr(n, "value").is_none_or(str::is_empty)
         }
+        Pseudo::Lang(ranges) => {
+            let lang = language(dom, n);
+            ranges.iter().any(|r| {
+                // `*` and `*-CH` match any primary language.
+                let r = r.strip_prefix('*').unwrap_or(r);
+                if r.is_empty() {
+                    return !lang.is_empty();
+                }
+                if r.starts_with('-') {
+                    return lang.contains(r);
+                }
+                lang == *r || lang.starts_with(&format!("{r}-"))
+            })
+        }
+        Pseudo::Dir(rtl) => is_rtl(dom, n) == *rtl,
         Pseudo::Never => false,
     }
+}
+
+/// The language of element `n` (from the nearest `lang` / `xml:lang`),
+/// lowercase; empty if unknown.
+fn language(dom: &Dom, n: NodeId) -> String {
+    let mut at = Some(n);
+    while let Some(id) = at {
+        if let Some(l) = dom.attr(id, "xml:lang").or_else(|| dom.attr(id, "lang")) {
+            return l.trim().to_ascii_lowercase();
+        }
+        at = dom.parent(id);
+    }
+    String::new()
+}
+
+/// The directionality of element `n` (HTML): from the nearest `dir`
+/// attribute, `auto` by the first strong character; left-to-right by default.
+fn is_rtl(dom: &Dom, n: NodeId) -> bool {
+    let mut at = Some(n);
+    while let Some(id) = at {
+        match dom.attr(id, "dir").map(|d| d.trim().to_ascii_lowercase()).as_deref() {
+            Some("rtl") => return true,
+            Some("ltr") => return false,
+            Some("auto") => {
+                return dom
+                    .text_content(id)
+                    .chars()
+                    .find(|c| c.is_alphabetic())
+                    .is_some_and(crate::text::is_rtl);
+            }
+            _ => at = dom.parent(id),
+        }
+    }
+    false
 }
 
 /// `:has(comb sel)` relative to `n`.
@@ -1000,6 +1064,17 @@ mod tests {
         assert!(!check(DOC, "#l2 ~ li", "l1"));
         assert!(check(DOC, "ul ~ p", "p1"));
         assert!(check(DOC, ".a.b li.item", "l3"));
+    }
+
+    #[test]
+    fn language_and_direction() {
+        let doc = r#"<div lang=fr-CA dir=rtl><p id=a>x</p></div><p id=b dir=auto>abc</p><p id=c lang=en>y</p>"#;
+        assert!(check(doc, ":lang(fr)", "a"));
+        assert!(check(doc, ":lang(de, fr)", "a"));
+        assert!(!check(doc, ":lang(fr)", "c"));
+        assert!(check(doc, ":lang(\"*-CA\")", "a"));
+        assert!(check(doc, ":dir(rtl)", "a"));
+        assert!(check(doc, ":dir(ltr)", "b"));
     }
 
     #[test]

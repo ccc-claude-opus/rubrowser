@@ -59,6 +59,73 @@ pub struct Matcher<'a> {
     pub dom: &'a Dom,
     pub state: ElementState,
     pub checked: &'a dyn Fn(NodeId) -> bool,
+    /// Size containers found by the last layout (for `@container`).
+    pub containers: &'a Containers,
+}
+
+/// A size container (`container-type: size | inline-size`) after layout.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Container {
+    pub names: Vec<String>,
+    /// Content box size.
+    pub width: f32,
+    pub height: f32,
+}
+
+pub type Containers = BTreeMap<NodeId, Container>;
+
+/// No containers (before the first layout, and outside documents).
+pub static NO_CONTAINERS: Containers = BTreeMap::new();
+
+/// The prelude of an `@container` rule: an optional container name and a
+/// size condition (media-query syntax over the container's size).
+#[derive(Debug, PartialEq)]
+pub struct ContainerQuery {
+    name: Option<String>,
+    condition: MediaList,
+}
+
+impl ContainerQuery {
+    pub fn parse(prelude: &str) -> Option<ContainerQuery> {
+        let p = prelude.trim();
+        let first = p.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+        let named = !first.is_empty() && !matches!(first.to_ascii_lowercase().as_str(), "not");
+        let (name, rest) = if named {
+            (Some(first.to_string()), p[first.len()..].trim())
+        } else {
+            (None, p)
+        };
+        // Logical sizes are the physical ones in horizontal writing.
+        let rest = rest
+            .to_ascii_lowercase()
+            .replace("inline-size", "width")
+            .replace("block-size", "height");
+        Some(ContainerQuery {
+            name,
+            condition: MediaList::parse(&rest),
+        })
+    }
+
+    /// Whether the nearest matching ancestor container of `n` satisfies
+    /// the condition (false without one).
+    fn matches(&self, cx: &Matcher, n: NodeId) -> bool {
+        let mut at = cx.dom.parent(n);
+        while let Some(a) = at {
+            if let Some(c) = cx.containers.get(&a)
+                && self.name.as_ref().is_none_or(|name| c.names.contains(name))
+            {
+                let env = MediaEnv {
+                    width: c.width,
+                    height: c.height,
+                    scale: 1.0,
+                    dark: false,
+                };
+                return self.condition.matches(&env);
+            }
+            at = cx.dom.parent(a);
+        }
+        false
+    }
 }
 
 impl Context for Matcher<'_> {
@@ -90,6 +157,7 @@ pub fn matches(dom: &Dom, id: NodeId, selector: &str, state: &ElementState) -> b
         dom,
         state: *state,
         checked: &no,
+        containers: &NO_CONTAINERS,
     };
     dom.element(id).is_some()
         && selector::parse_list(selector).is_some_and(|list| {
@@ -107,6 +175,8 @@ struct Indexed {
     /// Cascade layer rank ([`UNLAYERED`] for rules outside layers).
     layer: u16,
     order: u32,
+    /// The `@container` queries around the rule, all of which must hold.
+    containers: Rc<[Rc<ContainerQuery>]>,
 }
 
 /// Layer rank of rules outside any `@layer` (they beat layered ones).
@@ -123,6 +193,10 @@ pub struct Cascade {
     /// The state-dependent compounds of all rules (see
     /// [`Selector::dynamic_parts`]).
     pub dynamic: Vec<selector::DynPart>,
+    /// The `@container` queries enclosing the rules being added.
+    within: Vec<Rc<ContainerQuery>>,
+    /// Whether any rule depends on a container query.
+    pub has_container_rules: bool,
 }
 
 impl Cascade {
@@ -140,6 +214,8 @@ impl Cascade {
             initial_vars: BTreeMap::new(),
             buckets: HashMap::new(),
             dynamic: Vec::new(),
+            within: Vec::new(),
+            has_container_rules: false,
         };
         let ua = ua_sheet();
         c.add(&ua.rules, 0, env, "");
@@ -188,6 +264,7 @@ impl Cascade {
                             origin,
                             layer: rank,
                             order,
+                            containers: self.within.clone().into(),
                         });
                     }
                 }
@@ -204,6 +281,12 @@ impl Cascade {
                 }
                 Rule::Property(name, value) => {
                     self.initial_vars.insert(name.clone(), value.clone());
+                }
+                Rule::Container(query, inner) => {
+                    self.has_container_rules = true;
+                    self.within.push(query.clone());
+                    self.add(inner, origin, env, layer);
+                    self.within.pop();
                 }
                 Rule::Import(..) | Rule::FontFace(_) => {}
             }
@@ -768,7 +851,10 @@ fn cascade_element(
     let mut decls: Vec<Matched> = Vec::new();
     for &i in candidates {
         let r = &cascade.rules[i as usize];
-        if r.selector.pseudo_element != pe || !selector::matches(cx, &r.selector, id) {
+        if r.selector.pseudo_element != pe
+            || !selector::matches(cx, &r.selector, id)
+            || !r.containers.iter().all(|q| q.matches(cx, id))
+        {
             continue;
         }
         for d in r.decls.iter() {
@@ -920,6 +1006,7 @@ pub fn compute_styles(dom: &Dom, sheets: &[&str], state: &ElementState) -> Vec<O
         dom,
         state: *state,
         checked: &no,
+        containers: &NO_CONTAINERS,
     };
     compute(dom, &cascade, &cx, &env).nodes
 }
@@ -1223,6 +1310,7 @@ mod tests {
             dom: &dom,
             state: ElementState::default(),
             checked: &no,
+            containers: &NO_CONTAINERS,
         };
         let st = compute(&dom, &cascade, &cx, &env);
         let texts: Vec<(bool, &str)> = st
@@ -1269,6 +1357,7 @@ mod tests {
             dom: &dom,
             state: ElementState::default(),
             checked: &no,
+            containers: &NO_CONTAINERS,
         };
         let st = compute(&dom, &cascade, &cx, &env);
         let get = |id: &str| st.nodes[dom.element_by_id(id).unwrap()].as_ref().unwrap();

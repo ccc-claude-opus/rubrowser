@@ -317,7 +317,7 @@ fn dim(d: Dim, base: f32) -> String {
         Dim::Px(v) => px(v),
         Dim::Percent(p) if base > 0.0 => px(base * p / 100.0),
         Dim::Percent(p) => format!("{}%", number(p)),
-        Dim::Calc(..) => px(d.px_or_zero(base)),
+        Dim::Calc(..) | Dim::Expr(_) => px(d.px_or_zero(base)),
     }
 }
 

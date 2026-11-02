@@ -318,6 +318,10 @@ pub struct Style {
     pub translate: (Dim, Dim),
     pub rotate: f32,
     pub scale: (f32, f32),
+    /// `container-type: size | inline-size` (a query container) and its
+    /// `container-name`s.
+    pub container: bool,
+    pub container_names: Rc<[String]>,
     pub object_fit: ObjectFit,
     pub object_position: (Dim, Dim),
     /// `text-overflow: ellipsis` (lines cut at the end of a clipping box
@@ -426,6 +430,8 @@ impl Default for Style {
             rotate: 0.0,
             scale: (1.0, 1.0),
             ellipsis: false,
+            container: false,
+            container_names: Rc::new([]),
             object_fit: ObjectFit::Fill,
             object_position: (Dim::Percent(50.0), Dim::Percent(50.0)),
             transform: Rc::new([]),
@@ -887,6 +893,29 @@ impl Style {
                 _ => {}
             },
             "scale" => set(&mut self.scale, super::transform::parse_scale(v)),
+            "container-type" => match v {
+                "size" | "inline-size" => self.container = true,
+                "normal" => self.container = false,
+                _ => {}
+            },
+            "container-name" => {
+                self.container_names = if v == "none" {
+                    Rc::new([])
+                } else {
+                    value.split_whitespace().map(str::to_string).collect()
+                };
+            }
+            // `container: <name> [/ <type>]`
+            "container" => {
+                let (names, kind) = value.split_once('/').unwrap_or((value, "normal"));
+                let names = names.trim();
+                self.container_names = if names.eq_ignore_ascii_case("none") {
+                    Rc::new([])
+                } else {
+                    names.split_whitespace().map(str::to_string).collect()
+                };
+                self.container = matches!(kind.trim(), "size" | "inline-size");
+            }
             "object-fit" => {
                 set(
                     &mut self.object_fit,

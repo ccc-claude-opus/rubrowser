@@ -98,6 +98,8 @@ pub struct Document {
     pub forms: FormState,
     /// Nested documents of `<iframe>` elements.
     pub frames: HashMap<NodeId, Frame>,
+    /// Size containers from the last layout (for `@container` rules).
+    containers: crate::css::Containers,
 }
 
 impl Document {
@@ -131,6 +133,7 @@ impl Document {
             images: Images::default(),
             forms: FormState::default(),
             frames: HashMap::new(),
+            containers: Default::default(),
         }
     }
 
@@ -410,6 +413,41 @@ impl Document {
 
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
+        self.update_once(fonts);
+        // `@container` rules depend on sizes only layout gives: if the
+        // containers changed, style and lay out again (once, so sizes that
+        // flip-flop settle).
+        if self.cascade.as_ref().is_some_and(|c| c.2.has_container_rules) {
+            let found = self.find_containers();
+            if found != self.containers {
+                self.containers = found;
+                self.needs_style = true;
+                self.update_once(fonts);
+            }
+        }
+    }
+
+    /// Size containers in the current layout.
+    fn find_containers(&self) -> crate::css::Containers {
+        let mut out = crate::css::Containers::new();
+        for (n, s) in self.styles.iter().enumerate() {
+            if let Some(s) = s.as_ref().filter(|s| s.container)
+                && let Some((_, c)) = self.box_rects(n)
+            {
+                out.insert(
+                    n,
+                    crate::css::Container {
+                        names: s.container_names.to_vec(),
+                        width: c.w,
+                        height: c.h,
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    fn update_once(&mut self, fonts: &Fonts) {
         let t0 = profiling().then(std::time::Instant::now);
         self.update_style();
         if self.needs_layout {
@@ -506,6 +544,7 @@ impl Document {
             dom,
             state: self.state,
             checked: &checked,
+            containers: &self.containers,
         };
         Some(crate::css::unrendered_style(cascade, &cx, &venv, &parent, &chain))
     }
@@ -548,6 +587,7 @@ impl Document {
                 dom,
                 state: self.state,
                 checked: &checked,
+                containers: &self.containers,
             };
             let roots = std::mem::take(&mut self.restyle_roots);
             let mut done = !self.needs_style;
@@ -1249,6 +1289,7 @@ impl Document {
             dom,
             state,
             checked: &checked,
+            containers: &self.containers,
         };
         let mut roots = Vec::new();
         for &(n, bit) in &changed {
@@ -1812,6 +1853,22 @@ mod tests {
         for px in [&clip, &cut] {
             assert!((0..40).all(|y| px[y * 100 + 70] == 0xffffff));
         }
+    }
+
+    #[test]
+    fn container_queries_use_the_container_size() {
+        let (d, _) = doc(
+            r#"<style>body{margin:0} .w{container-type:inline-size} .x{color:#000}
+               @container (min-width: 400px) { .x{color:#f00} }
+               @container nope (min-width: 1px) { .x{color:#00f} }</style>
+               <div class=w style="width:300px"><p class=x id=a>a</p></div>
+               <div class=w style="width:500px"><p class=x id=b>b</p></div>
+               <p class=x id=c>no container</p>"#,
+            800.0,
+            400.0,
+        );
+        let color = |id| d.style(d.dom.element_by_id(id).unwrap()).unwrap().color.rgb();
+        assert_eq!((color("a"), color("b"), color("c")), (0x000000, 0xff0000, 0x000000));
     }
 
     #[test]

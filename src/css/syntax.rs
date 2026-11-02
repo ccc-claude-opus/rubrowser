@@ -36,6 +36,8 @@ pub enum Rule {
     Property(String, String),
     /// `@font-face { … }` descriptors.
     FontFace(Rc<[Decl]>),
+    /// `@container [name] <condition> { … }`.
+    Container(Rc<super::ContainerQuery>, Vec<Rule>),
 }
 
 /// A parsed stylesheet.
@@ -236,6 +238,11 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                         out.push(Rule::Property(prelude.to_string(), d.value.to_string()));
                     }
                 }
+                "container" if has_block => {
+                    if let Some(q) = super::ContainerQuery::parse(prelude) {
+                        out.push(Rule::Container(Rc::new(q), parse_rules(body, base)));
+                    }
+                }
                 "scope" | "-moz-document" if has_block => {
                     out.extend(parse_rules(body, base));
                 }
@@ -410,7 +417,9 @@ mod tests {
                     Rule::Style { selectors, decls } => {
                         out.push((format!("{} selector(s)", selectors.len()), decls.to_vec()))
                     }
-                    Rule::Media(_, inner) | Rule::Layer(_, inner) => walk(inner, out),
+                    Rule::Media(_, inner) | Rule::Layer(_, inner) | Rule::Container(_, inner) => {
+                        walk(inner, out)
+                    }
                     Rule::Import(..)
                     | Rule::LayerOrder(_)
                     | Rule::Property(..)
