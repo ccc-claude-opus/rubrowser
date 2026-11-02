@@ -179,6 +179,8 @@ impl Painter<'_> {
                     ..style.clone()
                 };
                 self.decorations(c, b, &plain, r);
+            } else if let Some(legend) = self.legend_rect(b, r) {
+                self.fieldset(c, b, style, r, legend);
             } else {
                 self.decorations(c, b, style, r);
             }
@@ -265,7 +267,17 @@ impl Painter<'_> {
                     let label = button_label(self.dom, node, kind);
                     self.centered_label(c, b, style, r, &label);
                 }
+                Control::Range => self.range(c, b, node, r),
+                Control::Color => self.color_swatch(c, b, node, r),
+                Control::File => self.file_input(c, b, style, r),
                 Control::Hidden => {}
+            }
+        }
+        if let Some(node) = b.node.filter(|_| style.visible) {
+            match self.dom.tag(node) {
+                Some("progress") => self.bar(c, b, node, r, true),
+                Some("meter") => self.bar(c, b, node, r, false),
+                _ => {}
             }
         }
         if let Some(node) = b
@@ -667,6 +679,170 @@ impl Painter<'_> {
             label,
             style.color,
         );
+    }
+
+    /// Where the legend of `<fieldset>` box `b` (at `r`) is, if it has one.
+    fn legend_rect(&self, b: &LBox, r: RectF) -> Option<RectF> {
+        if b.node.and_then(|n| self.dom.tag(n)) != Some("fieldset") {
+            return None;
+        }
+        let k = b.children.iter().find(|&&k| {
+            let kb = &self.tree.boxes[k];
+            kb.node.and_then(|n| self.dom.tag(n)) == Some("legend") && !kb.absolute
+        })?;
+        let kb = &self.tree.boxes[*k];
+        Some(RectF {
+            x: r.x + kb.rect.x,
+            y: r.y + kb.rect.y,
+            ..kb.rect
+        })
+    }
+
+    /// A fieldset's background and border start at the middle of its
+    /// legend, and the top border leaves a gap for it (HTML rendering).
+    fn fieldset(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF, legend: RectF) {
+        let top = (legend.y + legend.h / 2.0 - style.border(cs::TOP) / 2.0).max(r.y);
+        let shown = RectF {
+            y: top,
+            h: (r.y + r.h - top).max(0.0),
+            ..r
+        };
+        let saved = c.clip();
+        let band = self.phys(RectF {
+            x: r.x,
+            y: top,
+            w: r.w,
+            h: style.border(cs::TOP),
+        });
+        let gap = self.phys(RectF {
+            x: legend.x - 2.0,
+            w: legend.w + 4.0,
+            ..legend
+        });
+        // Everywhere but the part of the top border behind the legend.
+        let parts = [
+            Rect::new(saved.x, band.bottom(), saved.w, saved.bottom() - band.bottom()),
+            Rect::new(saved.x, band.y, gap.x - saved.x, band.h),
+            Rect::new(gap.right(), band.y, saved.right() - gap.right(), band.h),
+        ];
+        for part in parts {
+            c.set_clip(part.intersect(&saved));
+            self.decorations(c, b, style, shown);
+        }
+        c.set_clip(saved);
+    }
+
+    /// The value of an input as typed or set, else its `value` attribute.
+    fn raw_value(&self, node: NodeId) -> String {
+        self.inputs.get(&node).map_or_else(
+            || self.dom.attr(node, "value").unwrap_or("").to_string(),
+            |f| f.text(),
+        )
+    }
+
+    /// A range slider: a track filled up to the value, and a round thumb.
+    fn range(&self, c: &mut Canvas, b: &LBox, node: NodeId, r: RectF) {
+        let area = Self::content_area(b, r);
+        let s = self.scale;
+        let (lo, hi) = crate::document::range_bounds(self.dom, node);
+        let v = crate::document::range_value(self.dom, node, &self.raw_value(node));
+        let f = if hi > lo { ((v - lo) / (hi - lo)) as f32 } else { 0.0 };
+        let thumb = area.h.min(16.0);
+        let track_h = 4.0;
+        let ty = area.y + (area.h - track_h) / 2.0;
+        let (x0, x1) = (area.x + thumb / 2.0, area.x + area.w - thumb / 2.0);
+        let at = x0 + (x1 - x0) * f;
+        let disabled = self.dom.attr(node, "disabled").is_some();
+        let accent = if disabled { 0x9aa0a6 } else { 0x0075ff };
+        let track = (area.x * s, ty * s, area.w * s, track_h * s, track_h / 2.0 * s);
+        c.fill_rounded(track, None, 0xefefef, 255);
+        let edge = (track.0 + 0.5 * s, track.1 + 0.5 * s, track.2 - s, track.3 - s, track.4);
+        c.fill_rounded(track, Some(edge), 0xb2b2b2, 255);
+        let filled = (area.x * s, ty * s, (at - area.x) * s, track_h * s, track_h / 2.0 * s);
+        c.fill_rounded(filled, None, accent, 255);
+        let knob = ((at - thumb / 2.0) * s, (area.y + (area.h - thumb) / 2.0) * s, thumb * s, thumb * s, thumb / 2.0 * s);
+        c.fill_rounded(knob, None, accent, 255);
+    }
+
+    /// A color input: its color in a swatch.
+    fn color_swatch(&self, c: &mut Canvas, b: &LBox, node: NodeId, r: RectF) {
+        let area = Self::content_area(b, r);
+        let raw = self.raw_value(node);
+        let color = crate::css::values::color(&raw, Rgba::BLACK)
+            .filter(|_| raw.len() == 7 && raw.starts_with('#'))
+            .unwrap_or(Rgba::BLACK);
+        let inner = RectF {
+            x: area.x + 2.0,
+            y: area.y + 2.0,
+            w: (area.w - 4.0).max(0.0),
+            h: (area.h - 4.0).max(0.0),
+        };
+        self.fill(c, inner, Rgba::new(118, 118, 118, 255));
+        let swatch = RectF {
+            x: inner.x + 1.0,
+            y: inner.y + 1.0,
+            w: (inner.w - 2.0).max(0.0),
+            h: (inner.h - 2.0).max(0.0),
+        };
+        self.fill(c, swatch, Rgba { a: 255, ..color });
+    }
+
+    /// A file input: a "Choose File" button and the (empty) file name.
+    fn file_input(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
+        use crate::document::{FILE_BUTTON, NO_FILE};
+        let area = Self::content_area(b, r);
+        let s = self.scale;
+        let w = self.fonts.measure(style.font(), style.font_size, FILE_BUTTON) + 12.0;
+        let button = (area.x * s, area.y * s, w * s, area.h * s, 2.0 * s);
+        c.fill_rounded(button, None, 0xefefef, 255);
+        let edge = (button.0 + s, button.1 + s, button.2 - 2.0 * s, button.3 - 2.0 * s, s);
+        c.fill_rounded(button, Some(edge), 0x767676, 255);
+        let baseline = self.centered_baseline(style, area);
+        self.text(c, style, area.x + 6.0, baseline, FILE_BUTTON, style.color);
+        self.text(c, style, area.x + w + 6.0, baseline, NO_FILE, style.color);
+    }
+
+    /// `<progress>` (`progress`) or `<meter>`: a rounded track, filled to
+    /// the value; a meter's fill is green, yellow or red by how close the
+    /// value is to its optimum region.
+    fn bar(&self, c: &mut Canvas, b: &LBox, node: NodeId, r: RectF, progress: bool) {
+        let area = Self::content_area(b, r);
+        let s = self.scale;
+        let num = |a: &str| {
+            self.dom
+                .attr(node, a)
+                .and_then(|v| v.trim().parse::<f32>().ok())
+        };
+        let (min, max) = if progress {
+            (0.0, num("max").filter(|m| *m > 0.0).unwrap_or(1.0))
+        } else {
+            let min = num("min").unwrap_or(0.0);
+            (min, num("max").unwrap_or(1.0).max(min))
+        };
+        let value = num("value").map(|v| v.clamp(min, max));
+        let radius = (area.h / 2.0).min(4.0);
+        let track = (area.x * s, area.y * s, area.w * s, area.h * s, radius * s);
+        c.fill_rounded(track, None, 0xefefef, 255);
+        let edge = (track.0 + 0.5 * s, track.1 + 0.5 * s, track.2 - s, track.3 - s, track.4);
+        c.fill_rounded(track, Some(edge), 0xb2b2b2, 255);
+        // An indeterminate progress bar (no value) stays empty.
+        let Some(v) = value.or((!progress).then_some(min)) else { return };
+        let f = if max > min { (v - min) / (max - min) } else { 0.0 };
+        let color = if progress {
+            0x0075ff
+        } else {
+            let low = num("low").unwrap_or(min).clamp(min, max);
+            let high = num("high").unwrap_or(max).clamp(low, max);
+            let optimum = num("optimum").unwrap_or((min + max) / 2.0);
+            let region = |x: f32| -> i32 { if x < low { 0 } else if x > high { 2 } else { 1 } };
+            match (region(optimum) - region(v)).abs() {
+                0 => 0x107c10,
+                1 => 0xffb900,
+                _ => 0xd13438,
+            }
+        };
+        let fill = (area.x * s, area.y * s, area.w * f * s, area.h * s, radius * s);
+        c.fill_rounded(fill, None, color, 255);
     }
 
     /// A checkbox or radio button.

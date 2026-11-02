@@ -62,6 +62,8 @@ struct Press {
     element: Option<NodeId>,
     /// Text input being drag-selected.
     input: Option<NodeId>,
+    /// Range input whose thumb is being dragged.
+    range: Option<NodeId>,
 }
 
 /// What an outstanding fetch is for.
@@ -1847,6 +1849,10 @@ impl Browser {
 
     fn mouse_move(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         self.pointer = (x, y);
+        if let Some(Press { range: Some(r), .. }) = self.press {
+            let vp = self.viewport_rect();
+            return self.slide(r, x - vp.x, host);
+        }
         if let Some(Press {
             target,
             input: Some(n),
@@ -2017,12 +2023,42 @@ impl Browser {
                 input = Some(f);
             }
         }
+        // A range input jumps to the pointer and follows it while pressed.
+        let range = hit
+            .element
+            .filter(|&e| {
+                use crate::document::{Control, control};
+                t == Target::Page && control(&self.doc(t).dom, e) == Some(Control::Range)
+            })
+            .filter(|&e| self.doc(t).dom.attr(e, "disabled").is_none());
+        if let Some(e) = range {
+            self.slide(e, lx, host);
+        }
         self.press = Some(Press {
             target: t,
             element: hit.element,
             input,
+            range,
         });
         self.dirty = true;
+    }
+
+    /// Sets range input `node` to the value under page x `lx`; fires
+    /// `input` if it changed.
+    fn slide(&mut self, node: NodeId, lx: f32, host: &mut dyn Host) {
+        let doc = &mut self.tabs[self.active].doc;
+        let Some(area) = doc.content_box(node) else { return };
+        let (lo, hi) = crate::document::range_bounds(&doc.dom, node);
+        let thumb = area.h.min(16.0);
+        let span = (area.w - thumb).max(1.0);
+        let f = ((lx - area.x - thumb / 2.0) / span).clamp(0.0, 1.0) as f64;
+        let before = doc.input_value(node);
+        doc.set_input_value(node, &(lo + (hi - lo) * f).to_string());
+        if doc.input_value(node) != before {
+            doc.dom_changed();
+            self.dirty = true;
+            self.dispatch(node, "input", EventInit::default(), host);
+        }
     }
 
     fn mouse_up(&mut self, x: f32, y: f32, host: &mut dyn Host) {
@@ -2032,6 +2068,10 @@ impl Browser {
         };
         self.set_state(press.target, |s| s.active = None);
         let (t, lx, ly) = self.target_at(x, y);
+        if let Some(r) = press.range {
+            self.slide(r, lx, host);
+            self.dispatch(r, "change", EventInit::default(), host);
+        }
         let hit = self.doc(t).hit_test(lx, ly);
         if t == Target::Page
             && let Some(e) = hit.element
@@ -3444,6 +3484,35 @@ mod tests {
             "template 4 2",
             "meta x",
         ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+    }
+
+    #[test]
+    fn range_inputs_follow_the_pointer() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0"><input id=r type=range min=0 max=10 style="margin:0">
+            <input id=c type=color><script>
+              const r = document.getElementById('r');
+              console.log('start ' + r.value + ' ' + document.getElementById('c').value);
+              r.addEventListener('input', () => console.log('input ' + r.value));
+              r.addEventListener('change', () => console.log('change ' + r.value));
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let n = page_el(&b, "r");
+        let area = b.tabs[b.active].doc.content_box(n).unwrap();
+        let vp = b.viewport_rect();
+        let y = (vp.y + area.y + area.h / 2.0) as i32;
+        let at = |f: f32| (vp.x + area.x + 8.0 + (area.w - 16.0) * f) as i32;
+        b.event(Event::MouseDown { x: at(0.2), y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseMove { x: at(0.9), y }, 0.0, &mut h);
+        b.event(Event::MouseUp { x: at(0.9), y, button: 0 }, 0.0, &mut h);
+        for want in ["start 5 #000000", "input 2", "input 9", "change 9"] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
     }

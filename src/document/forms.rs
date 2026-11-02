@@ -19,6 +19,12 @@ pub enum Control {
     /// A button that does nothing by itself (`type=button`).
     Button,
     Hidden,
+    /// `type=range`: a slider.
+    Range,
+    /// `type=color`: a color swatch.
+    Color,
+    /// `type=file` (no file can be chosen here).
+    File,
 }
 
 impl Control {
@@ -49,6 +55,9 @@ pub fn control(dom: &Dom, node: NodeId) -> Option<Control> {
             "button" => Control::Button,
             "hidden" => Control::Hidden,
             "password" => Control::Password,
+            "range" => Control::Range,
+            "color" => Control::Color,
+            "file" => Control::File,
             _ => Control::Text,
         },
         "textarea" => Control::TextArea,

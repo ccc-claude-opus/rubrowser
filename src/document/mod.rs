@@ -29,6 +29,38 @@ pub use forms::{
 };
 pub use image::{Bitmap, ImageState, Images};
 
+/// The labels of a file input.
+pub const FILE_BUTTON: &str = "Choose File";
+pub const NO_FILE: &str = "No file chosen";
+
+/// A range input's minimum and maximum.
+pub fn range_bounds(dom: &Dom, n: NodeId) -> (f64, f64) {
+    let num = |a: &str| dom.attr(n, a).and_then(|v| v.trim().parse::<f64>().ok());
+    let min = num("min").unwrap_or(0.0);
+    (min, num("max").unwrap_or(100.0).max(min))
+}
+
+/// A range input's numeric value (HTML's value sanitization): `raw`
+/// clamped to `min`..`max` (default 0..100) and snapped to `step`
+/// (default 1); the midpoint when `raw` is not a number.
+pub fn range_value(dom: &Dom, n: NodeId, raw: &str) -> f64 {
+    let (min, max) = range_bounds(dom, n);
+    let step = match dom.attr(n, "step").map(str::trim) {
+        Some("any") => None,
+        Some(s) => s.parse::<f64>().ok().filter(|s| *s > 0.0).or(Some(1.0)),
+        None => Some(1.0),
+    };
+    let v = raw.trim().parse::<f64>().unwrap_or(min + (max - min) / 2.0);
+    let v = v.clamp(min, max);
+    match step {
+        Some(s) => {
+            let snapped = min + ((v - min) / s).round() * s;
+            if snapped > max { snapped - s } else { snapped }
+        }
+        None => v,
+    }
+}
+
 /// Result of a hit test.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Hit {
@@ -785,10 +817,22 @@ impl Document {
                 out.insert(n, size);
                 continue;
             }
-            // The default object size of the HTML spec.
-            if self.dom.tag(n) == Some("iframe") {
-                out.insert(n, (300.0, 150.0));
-                continue;
+            // The default object size of the HTML spec; Chrome's for the bars.
+            let em = self.style(n).map_or(16.0, |s| s.font_size);
+            match self.dom.tag(n) {
+                Some("iframe") => {
+                    out.insert(n, (300.0, 150.0));
+                    continue;
+                }
+                Some("progress") => {
+                    out.insert(n, (10.0 * em, em));
+                    continue;
+                }
+                Some("meter") => {
+                    out.insert(n, (5.0 * em, em));
+                    continue;
+                }
+                _ => {}
             }
             if !matches!(self.dom.tag(n), Some("img" | "svg")) {
                 continue;
@@ -837,6 +881,15 @@ impl Document {
                 num("rows", 2.0) * lh,
             ),
             Control::Checkbox | Control::Radio => (13.0, 13.0),
+            // Chrome's defaults.
+            Control::Range => (129.0, 16.0),
+            Control::Color => (44.0, 19.0),
+            Control::File => (
+                fonts.measure(st.font(), st.font_size, FILE_BUTTON)
+                    + 18.0
+                    + fonts.measure(st.font(), st.font_size, NO_FILE),
+                lh + 4.0,
+            ),
             Control::Select => {
                 let widest = options(&self.dom, n)
                     .into_iter()
@@ -1044,6 +1097,23 @@ impl Document {
             Some(Control::Checkbox | Control::Radio) => {
                 self.dom.attr(node, "value").unwrap_or("on").to_string()
             }
+            Some(Control::Range) => {
+                let raw = self.inputs.get(&node).map_or_else(
+                    || self.dom.attr(node, "value").unwrap_or("").to_string(),
+                    TextField::text,
+                );
+                let v = range_value(&self.dom, node, &raw);
+                if v == v.trunc() { format!("{}", v as i64) } else { v.to_string() }
+            }
+            Some(Control::Color) => {
+                let v = self.dom.attr(node, "value").unwrap_or("");
+                let v = self.inputs.get(&node).map_or(v.to_string(), TextField::text);
+                let valid = v.len() == 7
+                    && v.starts_with('#')
+                    && v[1..].chars().all(|c| c.is_ascii_hexdigit());
+                if valid { v.to_ascii_lowercase() } else { "#000000".into() }
+            }
+            Some(Control::File) => String::new(),
             _ => self.inputs.get(&node).map_or_else(
                 || self.dom.attr(node, "value").unwrap_or("").to_string(),
                 TextField::text,
@@ -1061,7 +1131,9 @@ impl Document {
                     self.forms.set_selected(node, i);
                 }
             }
-            Some(k) if k.is_text() => self.input(node).set_text(value),
+            Some(k) if k.is_text() || matches!(k, Control::Range | Control::Color) => {
+                self.input(node).set_text(value)
+            }
             _ => {
                 if let Some(e) = self.dom_mut().element_mut(node) {
                     e.set_attr("value", value);

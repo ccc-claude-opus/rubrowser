@@ -84,6 +84,7 @@
 | 7 | CSS 動畫與轉場：`@keyframes`、`animation-*` / `transition-*` 與簡寫、`cubic-bezier` / `steps` 等時間函式、`fill-mode` / `direction` / 次數 / 暫停；動畫值（opacity、transform、顏色、visibility）放在樣式覆蓋層，只影響繪製不重排；截圖會等執行中的動畫最多 2 秒。另外：`border-radius` 百分比、各邊寬度與顏色不同的圓角邊框（轉圈圖示） |
 | 8 | `document.write` / `writeln`：解析器找到的腳本寫入的內容在該腳本結束時插在它後面（分次寫入的標記會合併），寫入的 `<script>` 會執行；非同步插入的腳本與載入後的寫入照 Chrome 忽略並警告 |
 | 9 | JS 相容：腳本讀取尺寸 / 位置 / 計算樣式時先排版（同瀏覽器的強制排版）；無效選擇器（含不認得的偽類）讓 `querySelector` / `matches` 丟出 `SyntaxError`，選擇器只解析一次；`document.implementation.createHTMLDocument`、`importNode` / `adoptNode`；`<template>.content`；複製 fragment；模組錯誤附堆疊。jQuery 3.7 完整可用，Wikipedia 的「外觀」面板出現 |
+| 10 | 表單控制項：`range`（滑桿，可點擊與拖曳，觸發 `input` / `change`，值依 min / max / step 清理）、`color`（色塊）、`file`（「Choose File / No file chosen」）、`<progress>`、`<meter>`（依 low / high / optimum 顯示綠、黃、紅）；fieldset 的 legend 跨在上框線上並留缺口 |
 
 ### 第二批調查
 

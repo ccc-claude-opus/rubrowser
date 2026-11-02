@@ -503,7 +503,10 @@ impl Builder<'_> {
             return self.build_table(tree, id, &css, tstyle);
         }
 
-        if matches!(self.dom.tag(id), Some("input" | "textarea" | "select" | "iframe")) {
+        if matches!(
+            self.dom.tag(id),
+            Some("input" | "textarea" | "select" | "iframe" | "progress" | "meter")
+        ) {
             // Form controls (drawn by the browser) and frames (their own
             // document) are replaced elements.
             let size = self
