@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 mod animate;
+pub mod canvas;
 mod forms;
 mod image;
 
@@ -137,6 +138,8 @@ pub struct Document {
     anim: animate::Animator,
     /// Fonts for laying out on demand (scripts asking for sizes).
     fonts: Option<Rc<Fonts>>,
+    /// Bitmaps of `<canvas>` elements drawn on by scripts.
+    pub canvases: canvas::Canvases,
 }
 
 impl Document {
@@ -173,6 +176,7 @@ impl Document {
             containers: Default::default(),
             anim: Default::default(),
             fonts: None,
+            canvases: Default::default(),
         }
     }
 
@@ -733,6 +737,7 @@ impl Document {
             flat: Default::default(),
             frames: &self.frames,
             overlay: &self.anim.overlay,
+            canvases: &self.canvases,
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -838,6 +843,11 @@ impl Document {
             match self.dom.tag(n) {
                 Some("iframe") => {
                     out.insert(n, (300.0, 150.0));
+                    continue;
+                }
+                Some("canvas") => {
+                    let (w, h) = canvas::canvas_size(&self.dom, n);
+                    out.insert(n, (w as f32, h as f32));
                     continue;
                 }
                 Some("progress") => {

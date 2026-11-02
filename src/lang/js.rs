@@ -258,6 +258,12 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
                 ffi::get_attr(h, name.as_ptr(), name.len(), p, n)
             })))
         }),
+        ("canvas", 2, |_, a, c| {
+            let (h, cmd) = (int(a, 0, c)?, text(a, 1, c)?);
+            Ok(opt_string(read_string(|p, n| unsafe {
+                ffi::canvas(h, cmd.as_ptr(), cmd.len(), p, n)
+            })))
+        }),
         ("mediaMatches", 1, |_, a, c| {
             let q = text(a, 0, c)?;
             Ok((unsafe { ffi::media_matches(q.as_ptr(), q.len()) } != 0).into())

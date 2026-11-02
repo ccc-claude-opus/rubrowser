@@ -3606,6 +3606,35 @@ mod tests {
     }
 
     #[test]
+    fn canvas_2d_draws_into_the_page() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0"><canvas id=c width=100 height=50></canvas><script>
+              const x = document.getElementById('c').getContext('2d');
+              x.fillStyle = '#ff0000'; x.fillRect(0, 0, 50, 50);
+              x.translate(50, 0); x.fillStyle = 'rgb(0, 0, 255)'; x.fillRect(0, 0, 50, 50);
+              console.log('px ' + [...x.getImageData(75, 25, 1, 1).data].join(','));
+              x.beginPath(); x.arc(25, 25, 10, 0, Math.PI * 2);
+              console.log('in ' + x.isPointInPath(75, 25) + ' ' + x.isPointInPath(5, 5));
+              console.log('size ' + x.canvas.width + 'x' + x.canvas.height);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        let vp = b.viewport_rect();
+        let canvas = b.render(0.0, &mut h);
+        let at = |x: f32, y: f32| {
+            canvas.pixels()[((vp.y + y) as usize) * canvas.width() + (vp.x + x) as usize]
+        };
+        assert_eq!(at(10.0, 10.0), 0xff0000);
+        assert_eq!(at(90.0, 10.0), 0x0000ff);
+        for want in ["px 0,0,255,255", "in true false", "size 100x50"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+    }
+
+    #[test]
     fn document_write_inserts_after_the_script() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);

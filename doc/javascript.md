@@ -53,9 +53,10 @@ flowchart LR
 | 幾何 | `getBoundingClientRect`、`offsetWidth/Height/Top/Left`、`clientWidth/Height`、`innerWidth/innerHeight`（DOM 有變動時先重新排版，同瀏覽器） |
 | Web API | `URL`、`URLSearchParams`、`customElements`（含升級已存在的元素、`connectedCallback`、`attributeChangedCallback`）、`DocumentFragment`、`localStorage` / `sessionStorage`（只存在於這一頁）、`document.cookie`（同上）、`navigator`、`matchMedia`（依目前的 viewport 判斷，尚不送出 change 事件）、`getComputedStyle`（瀏覽器 cascade 算出的值：顏色為 `rgb()`、長度為 px，`width` / `height` 為上次排版的大小；`display: none` 的元素也有值）、`TextEncoder/Decoder`、`atob/btoa`、`crypto.getRandomValues/randomUUID`、`structuredClone`、`AbortController`、`CustomEvent`、`dispatchEvent`、`DOMParser`、`document.implementation.createHTMLDocument`、`importNode`、`<template>.content`、簡化的 `Intl`、`requestIdleCallback`、`Worker` / `SharedWorker` / `MessageChannel` / `BroadcastChannel`（存在但不傳遞訊息）；`MutationObserver`、`ResizeObserver`、`IntersectionObserver`（所有元素都算可見） |
 
+| Canvas | `getContext('2d')` 的 `CanvasRenderingContext2D`（路徑、漸層、圖樣、變形、裁切、文字、圖片、像素讀寫、`toDataURL` / `toBlob`）、`Path2D`、`ImageData`；每個呼叫以 `canvas` import 交給瀏覽器以 tiny-skia 繪製 |
 | 網路 | `fetch`（含 `Request`、`Headers`、`URLSearchParams` / `FormData` 本文）、`XMLHttpRequest`；只允許與頁面同源的網址（還沒有 CORS 檢查），GET 與 POST |
 
-尚未支援：跨來源請求、canvas、真正執行的 Web Worker、WebSocket、shadow DOM 的繪製。
+尚未支援：跨來源請求、canvas 的陰影與 WebGL、真正執行的 Web Worker、WebSocket、shadow DOM 的繪製。
 
 ### 模組協定
 

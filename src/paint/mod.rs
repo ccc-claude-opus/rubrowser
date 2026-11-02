@@ -46,6 +46,8 @@ pub struct Painter<'a> {
     pub frames: &'a HashMap<NodeId, crate::document::Frame>,
     /// Animated styles, in place of `styles`.
     pub overlay: &'a HashMap<NodeId, Style>,
+    /// Bitmaps of `<canvas>` elements.
+    pub canvases: &'a crate::document::canvas::Canvases,
 }
 
 /// What an image layer paints.
@@ -297,6 +299,17 @@ impl Painter<'_> {
         }
         if let Some(node) = b.node.filter(|_| style.visible) {
             match self.dom.tag(node) {
+                Some("canvas") => {
+                    if let Some(cv) = self.canvases.get(&node) {
+                        let area = Self::content_area(b, r);
+                        let (w, h) = cv.size();
+                        let d = self.phys(object_rect(style, area, (w as f32, h as f32)));
+                        if d.w > 0 && d.h > 0 {
+                            let px = cv.argb(d.w as u32, d.h as u32);
+                            c.draw_argb(d.x, d.y, d.w as usize, d.h as usize, &px);
+                        }
+                    }
+                }
                 Some("progress") => self.bar(c, b, node, r, true),
                 Some("meter") => self.bar(c, b, node, r, false),
                 _ => {}

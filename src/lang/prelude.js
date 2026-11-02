@@ -1101,6 +1101,247 @@
     text() { return Promise.resolve(this._t); }
   }
 
+  // ----- <canvas> ------------------------------------------------------------
+  // The 2D context sends each call to the browser, which draws (see the
+  // `canvas` import in doc/abi.md).
+
+  const SEP = '\u0001';
+  function canvasCmd(canvas, ...args) {
+    return rb.canvas(canvas.__h, args.map(String).join(SEP));
+  }
+
+  class CanvasGradient {
+    constructor(canvas, id) { this._c = canvas; this._id = id; }
+    addColorStop(offset, color) {
+      if (!(offset >= 0 && offset <= 1)) throw new RangeError('IndexSizeError');
+      canvasCmd(this._c, 'addColorStop', this._id, offset, color);
+    }
+  }
+  class CanvasPattern {
+    constructor(id) { this._id = id; }
+    setTransform() {}
+  }
+
+  // Path2D records its commands; fill / stroke / clip replay them.
+  class Path2D {
+    constructor(init) {
+      this._cmds = init instanceof Path2D ? init._cmds : '';
+      if (typeof init === 'string') this._svg = init;
+    }
+    _add(name, ...n) { this._cmds += name + ',' + n.map(Number).join(',') + ';'; }
+    addPath(p) { if (p instanceof Path2D) this._cmds += p._cmds; }
+    moveTo(x, y) { this._add('moveTo', x, y); }
+    lineTo(x, y) { this._add('lineTo', x, y); }
+    closePath() { this._add('closePath'); }
+    quadraticCurveTo(a, b, c, d) { this._add('quadraticCurveTo', a, b, c, d); }
+    bezierCurveTo(a, b, c, d, e, f) { this._add('bezierCurveTo', a, b, c, d, e, f); }
+    arc(x, y, r, a0, a1, ccw) { this._add('arc', x, y, r, a0, a1, ccw ? 1 : 0); }
+    arcTo(a, b, c, d, r) { this._add('arcTo', a, b, c, d, r); }
+    ellipse(x, y, rx, ry, rot, a0, a1, ccw) { this._add('ellipse', x, y, rx, ry, rot, a0, a1, ccw ? 1 : 0); }
+    rect(x, y, w, h) { this._add('rect', x, y, w, h); }
+    roundRect(x, y, w, h, r) { this._add('roundRect', x, y, w, h, Array.isArray(r) ? r[0] || 0 : r || 0); }
+  }
+
+  class CanvasRenderingContext2D {
+    constructor(canvas) {
+      this.canvas = canvas;
+      this._s = {
+        fillStyle: '#000000', strokeStyle: '#000000', lineWidth: 1, lineCap: 'butt', lineJoin: 'miter',
+        miterLimit: 10, lineDashOffset: 0, globalAlpha: 1, globalCompositeOperation: 'source-over',
+        font: '10px sans-serif', textAlign: 'start', textBaseline: 'alphabetic', direction: 'inherit',
+        shadowBlur: 0, shadowColor: 'rgba(0, 0, 0, 0)', shadowOffsetX: 0, shadowOffsetY: 0,
+        imageSmoothingEnabled: true, imageSmoothingQuality: 'low', filter: 'none',
+        letterSpacing: '0px', wordSpacing: '0px', fontKerning: 'auto',
+      };
+      this._dash = [];
+      this._t = [1, 0, 0, 1, 0, 0];
+      this._stack = [];
+    }
+    _cmd(...args) { return canvasCmd(this.canvas, ...args); }
+    getContextAttributes() { return { alpha: true, colorSpace: 'srgb', desynchronized: false, willReadFrequently: false }; }
+
+    save() { this._stack.push([{ ...this._s }, this._dash.slice(), this._t.slice()]); this._cmd('save'); }
+    restore() {
+      const top = this._stack.pop();
+      if (top) [this._s, this._dash, this._t] = top;
+      this._cmd('restore');
+    }
+    reset() { this._stack = []; this._t = [1, 0, 0, 1, 0, 0]; this._dash = []; this._cmd('reset'); }
+
+    // Transforms (kept here too for getTransform).
+    setTransform(a, b, c, d, e, f) {
+      if (typeof a === 'object' && a) ({ a, b, c, d, e, f } = { a: 1, b: 0, c: 0, d: 1, e: 0, f: 0, ...a });
+      this._t = [a, b, c, d, e, f].map(Number);
+      this._cmd('setTransform', ...this._t);
+    }
+    resetTransform() { this.setTransform(1, 0, 0, 1, 0, 0); }
+    transform(a, b, c, d, e, f) {
+      const [A, B, C, D, E, F] = this._t;
+      this._t = [A * a + C * b, B * a + D * b, A * c + C * d, B * c + D * d, A * e + C * f + E, B * e + D * f + F];
+      this._cmd('transform', a, b, c, d, e, f);
+    }
+    translate(x, y) { this.transform(1, 0, 0, 1, x, y); }
+    scale(x, y) { this.transform(x, 0, 0, y, 0, 0); }
+    rotate(t) { const c = Math.cos(t), s = Math.sin(t); this.transform(c, s, -s, c, 0, 0); }
+    getTransform() {
+      const [a, b, c, d, e, f] = this._t;
+      return { a, b, c, d, e, f, m11: a, m12: b, m21: c, m22: d, m41: e, m42: f, is2D: true, isIdentity: a === 1 && b === 0 && c === 0 && d === 1 && e === 0 && f === 0 };
+    }
+
+    setLineDash(segments) {
+      if (!Array.isArray(segments) || segments.some((v) => !(v >= 0) || !isFinite(v))) return;
+      this._dash = segments.slice();
+      this._cmd('setLineDash', ...segments);
+    }
+    getLineDash() { return this._dash.length % 2 ? this._dash.concat(this._dash) : this._dash.slice(); }
+
+    createLinearGradient(x0, y0, x1, y1) { return new CanvasGradient(this.canvas, this._cmd('linearGradient', x0, y0, x1, y1)); }
+    createRadialGradient(x0, y0, r0, x1, y1, r1) {
+      if (r0 < 0 || r1 < 0) throw new RangeError('IndexSizeError');
+      return new CanvasGradient(this.canvas, this._cmd('radialGradient', x0, y0, r0, x1, y1, r1));
+    }
+    createConicGradient(angle, x, y) { return new CanvasGradient(this.canvas, this._cmd('conicGradient', angle, x, y)); }
+    createPattern(image, repetition) {
+      if (!image || image.__h === undefined) return null;
+      const id = this._cmd('createPattern', image.__h, repetition || 'repeat');
+      return id === null ? null : new CanvasPattern(id);
+    }
+
+    fillRect(x, y, w, h) { this._cmd('fillRect', x, y, w, h); }
+    strokeRect(x, y, w, h) { this._cmd('strokeRect', x, y, w, h); }
+    clearRect(x, y, w, h) { this._cmd('clearRect', x, y, w, h); }
+
+    beginPath() { this._cmd('beginPath'); }
+    closePath() { this._cmd('closePath'); }
+    moveTo(x, y) { this._cmd('moveTo', x, y); }
+    lineTo(x, y) { this._cmd('lineTo', x, y); }
+    quadraticCurveTo(a, b, c, d) { this._cmd('quadraticCurveTo', a, b, c, d); }
+    bezierCurveTo(a, b, c, d, e, f) { this._cmd('bezierCurveTo', a, b, c, d, e, f); }
+    arc(x, y, r, a0, a1, ccw) {
+      if (r < 0) throw new RangeError('IndexSizeError');
+      this._cmd('arc', x, y, r, a0, a1, ccw ? 1 : 0);
+    }
+    arcTo(a, b, c, d, r) { this._cmd('arcTo', a, b, c, d, r); }
+    ellipse(x, y, rx, ry, rot, a0, a1, ccw) { this._cmd('ellipse', x, y, rx, ry, rot, a0, a1, ccw ? 1 : 0); }
+    rect(x, y, w, h) { this._cmd('rect', x, y, w, h); }
+    roundRect(x, y, w, h, r) { this._cmd('roundRect', x, y, w, h, Array.isArray(r) ? r[0] || 0 : r || 0); }
+
+    // fill([path], [rule]), stroke([path]), clip([path], [rule])
+    _pathArgs(args) {
+      const out = [];
+      if (args[0] instanceof Path2D) out.push('path:' + args.shift()._cmds);
+      if (typeof args[0] === 'string') out.push(args[0]);
+      return out;
+    }
+    fill(...args) { this._cmd('fill', ...this._pathArgs(args)); }
+    stroke(...args) { this._cmd('stroke', ...this._pathArgs(args)); }
+    clip(...args) { this._cmd('clip', ...this._pathArgs(args)); }
+    isPointInPath(...args) {
+      const nums = args.filter((a) => typeof a === 'number');
+      const rest = this._pathArgs(args.filter((a) => typeof a !== 'number'));
+      return this._cmd('isPointInPath', ...rest, ...nums) === '1';
+    }
+    isPointInStroke() { return false; }
+
+    fillText(text, x, y, maxWidth) { this._cmd('fillText', text, x, y, maxWidth === undefined ? '' : maxWidth); }
+    strokeText(text, x, y, maxWidth) { this._cmd('strokeText', text, x, y, maxWidth === undefined ? '' : maxWidth); }
+    measureText(text) {
+      const [width, ascent, descent] = String(this._cmd('measureText', text) || '0,0,0').split(',').map(Number);
+      return {
+        width,
+        actualBoundingBoxLeft: 0,
+        actualBoundingBoxRight: width,
+        actualBoundingBoxAscent: ascent,
+        actualBoundingBoxDescent: descent,
+        fontBoundingBoxAscent: ascent,
+        fontBoundingBoxDescent: descent,
+        emHeightAscent: ascent,
+        emHeightDescent: descent,
+        alphabeticBaseline: 0,
+        hangingBaseline: ascent * 0.8,
+        ideographicBaseline: -descent,
+      };
+    }
+
+    drawImage(image, ...n) {
+      if (!image) throw new TypeError('drawImage: no image');
+      if (image.__h === undefined) return;
+      this._cmd('drawImage', image.__h, ...n);
+    }
+
+    createImageData(w, h) {
+      if (typeof w === 'object') ({ width: w, height: h } = w);
+      return new ImageData(w, h);
+    }
+    getImageData(x, y, w, h) {
+      if (!w || !h) throw new RangeError('IndexSizeError');
+      const data = atob(this._cmd('getImageData', x, y, w, h) || '');
+      const img = new ImageData(Math.abs(w), Math.abs(h));
+      for (let i = 0; i < data.length; i++) img.data[i] = data.charCodeAt(i);
+      return img;
+    }
+    putImageData(img, x, y) {
+      let s = '';
+      for (let i = 0; i < img.data.length; i++) s += String.fromCharCode(img.data[i]);
+      this._cmd('putImageData', x, y, img.width, btoa(s));
+    }
+  }
+  // State properties: kept here, sent to the browser when set.
+  for (const name of ['fillStyle', 'strokeStyle', 'lineWidth', 'lineCap', 'lineJoin', 'miterLimit',
+    'lineDashOffset', 'globalAlpha', 'globalCompositeOperation', 'font', 'textAlign', 'textBaseline',
+    'direction', 'shadowBlur', 'shadowColor', 'shadowOffsetX', 'shadowOffsetY', 'imageSmoothingEnabled',
+    'imageSmoothingQuality', 'filter', 'letterSpacing', 'wordSpacing', 'fontKerning']) {
+    Object.defineProperty(CanvasRenderingContext2D.prototype, name, {
+      configurable: true,
+      get() { return this._s[name]; },
+      set(v) {
+        let sent = v;
+        if (v instanceof CanvasGradient) sent = 'g:' + v._id;
+        else if (v instanceof CanvasPattern) sent = 'p:' + v._id;
+        this._s[name] = v;
+        this._cmd(name, sent);
+      },
+    });
+  }
+
+  class ImageData {
+    constructor(a, b, c) {
+      if (a instanceof Uint8ClampedArray) {
+        this.data = a;
+        this.width = b;
+        this.height = c || a.length / 4 / b;
+      } else {
+        this.width = a;
+        this.height = b;
+        this.data = new Uint8ClampedArray(a * b * 4);
+      }
+      this.colorSpace = 'srgb';
+    }
+  }
+
+  // <canvas> element: getContext('2d'); toDataURL; toBlob.
+  const contexts = new WeakMap();
+  Object.assign(Element.prototype, {
+    getContext(kind) {
+      if (this.localName !== 'canvas' || String(kind).toLowerCase() !== '2d') return null;
+      let ctx = contexts.get(this);
+      if (!ctx) contexts.set(this, (ctx = new CanvasRenderingContext2D(this)));
+      return ctx;
+    },
+    toDataURL() {
+      if (this.localName !== 'canvas') return undefined;
+      return rb.canvas(this.__h, 'toDataURL') || 'data:,';
+    },
+    toBlob(cb) {
+      const url = this.toDataURL();
+      const bin = atob(url.split(',')[1] || '');
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      addTimer(() => cb(new Blob([bytes], { type: 'image/png' })), 0, [], false);
+    },
+    transferControlToOffscreen() { throw new Error('NotSupportedError'); },
+  });
+
   // A document that is not shown (DOMParser, createHTMLDocument): its
   // elements live detached in the page's DOM; scripts in it never run.
   function detachedDocument(markup) {
@@ -1306,7 +1547,16 @@
     if (Object.getOwnPropertyDescriptor(Element.prototype, prop)) continue;
     Object.defineProperty(Element.prototype, prop, {
       configurable: true,
-      get() { const v = parseInt(this.getAttribute(attr), 10); return isNaN(v) ? initial : v; },
+      get() {
+        const v = parseInt(this.getAttribute(attr), 10);
+        if (!isNaN(v)) return v;
+        // A canvas is 300 × 150 by default; an image reports its shown size.
+        if (this.localName === 'canvas' && (prop === 'width' || prop === 'height')) return prop === 'width' ? 300 : 150;
+        if (this.localName === 'img' && (prop === 'width' || prop === 'height')) {
+          return Math.round(rb.rect(this.__h, prop === 'width' ? 2 : 3));
+        }
+        return initial;
+      },
       set(v) { this.setAttribute(attr, String(v)); },
     });
   }
@@ -1423,6 +1673,12 @@
     HTMLButtonElement: Element,
     HTMLFormElement: Element,
     HTMLImageElement: Element,
+    HTMLCanvasElement: Element,
+    CanvasRenderingContext2D,
+    CanvasGradient,
+    CanvasPattern,
+    Path2D,
+    ImageData,
     HTMLDivElement: Element,
     HTMLTemplateElement: Element,
     HTMLScriptElement: Element,

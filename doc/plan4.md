@@ -89,6 +89,7 @@
 | 12 | 多欄排版：`column-count` / `column-width` / `columns`、`column-gap`（`normal` 為 1em）、`column-rule`；先以單欄寬排版，再求平衡欄高（不小於最高的不可分段），最後把行與子方塊移到各欄（排版多跑兩次） |
 | 13 | 直排 `writing-mode: vertical-rl / vertical-lr`（只含行內內容的元素）：行變成欄（右到左或左到右），欄長為元素高度；中日韓字直立，其他文字轉 90°（`text-orientation: mixed`）。還不支援直排中的區塊排版與標點的直排位置 |
 | 14 | 第三批調查的修正：繪製順序照 CSS 2.1 附錄 E（負 z-index、一般流、定位元素依樹順序與 z-index；相對定位也算定位元素）；行內模組腳本原本不會執行（排隊時用錯索引）已修正，模組與 `defer` / `async` 腳本延到一般腳本之後；boa 開啟 Annex B（`substr`、`escape` 等瀏覽器都有的功能）；`createElement` 依 DOM 標準檢查名稱；`window.frames` / `top` / `parent` / `length`、`window.postMessage` |
+| 15 | `<canvas>` 2D：tiny-skia 繪圖（矩形、路徑、弧、橢圓、圓角矩形、Bézier、`Path2D`、填色與描邊、虛線、線條端點與接合、線性 / 放射 / 錐形漸層、圖樣、變形與 save / restore、裁切、`globalAlpha`、合成模式、文字與 `measureText`、`drawImage`、`getImageData` / `putImageData`、`toDataURL`、`isPointInPath`）；預設 300×150，依 CSS 大小縮放繪製。陰影與 `filter` 尚未支援 |
 
 ### 第二批調查
 

@@ -637,6 +637,22 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
     )?;
     l.func_wrap(
         "rb",
+        "canvas",
+        |mut c: C, h: i32, p: i32, n: i32, out: i32, cap: i32| -> Result<i32, Error> {
+            // One 2D-context command (see doc/abi.md); queries write a result.
+            let cmd = read_str(&c, p, n)?;
+            let doc = &mut c.data_mut().doc;
+            let result = element(doc, h)
+                .filter(|&e| doc.dom.tag(e) == Some("canvas"))
+                .and_then(|e| doc.canvas_command(e, &cmd));
+            match result {
+                Some(v) => write_str(&mut c, out, cap, &v),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
         "media_matches",
         |c: C, p: i32, n: i32| -> Result<i32, Error> {
             let query = read_str(&c, p, n)?;

@@ -65,6 +65,7 @@ imports! {
     fn set_text(h: i32, p: *const u8, n: usize);
     fn get_attr(h: i32, np: *const u8, nl: usize, p: *mut u8, cap: usize) -> i32;
     fn media_matches(p: *const u8, n: usize) -> i32;
+    fn canvas(h: i32, p: *const u8, n: usize, out: *mut u8, cap: usize) -> i32;
     fn computed_style(h: i32, np: *const u8, nl: usize, p: *mut u8, cap: usize) -> i32;
     fn set_attr(h: i32, np: *const u8, nl: usize, vp: *const u8, vl: usize);
     fn remove_attr(h: i32, np: *const u8, nl: usize);

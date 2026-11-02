@@ -24,7 +24,7 @@ head, style, script, title, meta, link, base, template, noscript {
 
 li { display: list-item; }
 
-img { display: inline-block; }
+img, canvas { display: inline-block; }
 iframe { display: inline-block; border: 2px solid; border-color: #767676 #c3c3c3 #c3c3c3 #767676; }
 svg { display: inline-block; overflow: hidden; }
 
