@@ -148,11 +148,15 @@ impl Document {
         std::mem::take(&mut self.media_events)
     }
 
-    /// Whether some media is playing (frames keep coming).
+    /// Whether some media is playing (frames keep coming) or still
+    /// loading its first data: either way it needs updates.
     pub fn media_playing(&self) -> bool {
-        self.media
-            .values()
-            .any(|m| m.player.as_ref().is_some_and(|p| !p.info().paused))
+        self.media.values().any(|m| {
+            m.player.as_ref().is_some_and(|p| {
+                let i = p.info();
+                !i.paused || (i.ready < 2 && i.error.is_none())
+            })
+        })
     }
 
     /// Starts or pauses media element `n` (its controls were clicked).

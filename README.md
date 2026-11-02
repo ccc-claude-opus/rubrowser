@@ -21,6 +21,12 @@ cargo install rubrowser
 rubrowser
 ```
 
+To play audio and video, build with the `media` feature, which uses FFmpeg (install FFmpeg 8 first, e.g. `brew install ffmpeg`):
+
+```bash
+cargo install rubrowser --features media
+```
+
 Open a file or URL directly:
 
 ```bash
@@ -119,6 +125,7 @@ Then open <http://localhost:8000>. Append `#URL` to open a page, e.g. `http://lo
 | Feature | Use |
 |---|---|
 | `native` (default) | Native window version (`winit` + `softbuffer`) |
+| `media` | Audio and video playback with FFmpeg (`ffmpeg-next`) and `cpal` |
 | `web` | Canvas version, built for `wasm32-unknown-unknown` |
 | `sdk` | API for writing page scripts; no dependencies |
 | `core` | The engine without a platform layer |
@@ -127,9 +134,9 @@ Then open <http://localhost:8000>. Append `#URL` to open a page, e.g. `http://lo
 
 A practical subset: block, inline, inline-block, flex, grid and table layout; floats, absolute, fixed and sticky positioning, z-index; margins, padding, borders (solid, dashed, dotted, double), rounded corners, outlines, opacity; background colors and images; fonts, line height, text alignment, white-space, decorations, `text-transform`, sub/superscript, lists, `::before`/`::after` content with counters; `overflow` scrolling; `:hover`, `:active`, `:focus`; links; images (PNG, JPEG, GIF, WebP, BMP, SVG, `data:` URLs), inline SVG, `mask-image`; `#fragment` links; forms (text, password, textarea, checkbox, radio, select, buttons, labels, GET submission); `<details>`. See [doc/plan.md](doc/plan.md), [doc/plan2.md](doc/plan2.md), [doc/plan3.md](doc/plan3.md) and [doc/architecture.md](doc/architecture.md).
 
-Also: gradients and box shadows, web fonts (WOFF/WOFF2), right-to-left text with Arabic shaping, CJK line breaking, ES modules, same-origin `fetch`/`XMLHttpRequest`, custom elements, form POST.
+Also: gradients and box shadows, 2D transforms, CSS animations and transitions, multi-column layout, container queries, vertical writing, `text-overflow`, `object-fit`, web fonts (WOFF/WOFF2), color emoji, right-to-left text with Arabic shaping, CJK line breaking, `<iframe>`, `<canvas>` 2D, `<video>`/`<audio>` (feature `media`), range/color/file inputs, `<progress>`/`<meter>`, ES modules, same-origin `fetch`/`XMLHttpRequest`, custom elements, form POST. See [doc/plan4.md](doc/plan4.md).
 
-Not supported yet: IME, cross-origin requests from scripts, CSS rotation/scaling transforms and animations, video, canvas and WebGL.
+Not supported yet: IME, cross-origin requests from scripts, scripts inside iframes, WebGL, canvas shadows and filters.
 
 ## License
 

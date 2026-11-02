@@ -91,6 +91,7 @@
 | 14 | 第三批調查的修正：繪製順序照 CSS 2.1 附錄 E（負 z-index、一般流、定位元素依樹順序與 z-index；相對定位也算定位元素）；行內模組腳本原本不會執行（排隊時用錯索引）已修正，模組與 `defer` / `async` 腳本延到一般腳本之後；boa 開啟 Annex B（`substr`、`escape` 等瀏覽器都有的功能）；`createElement` 依 DOM 標準檢查名稱；`window.frames` / `top` / `parent` / `length`、`window.postMessage` |
 | 15 | `<canvas>` 2D：tiny-skia 繪圖（矩形、路徑、弧、橢圓、圓角矩形、Bézier、`Path2D`、填色與描邊、虛線、線條端點與接合、線性 / 放射 / 錐形漸層、圖樣、變形與 save / restore、裁切、`globalAlpha`、合成模式、文字與 `measureText`、`drawImage`、`getImageData` / `putImageData`、`toDataURL`、`isPointInPath`）；預設 300×150，依 CSS 大小縮放繪製。陰影與 `filter` 尚未支援 |
 | 16 | `<video>` / `<audio>` 元素：依 `src` 或第一個可播放的 `<source>` 選擇資源，`poster`（依 `object-fit: contain`）、`controls` 控制列（播放 / 暫停、時間、可點擊的進度條、靜音），預設 300×150（audio 有 controls 時 300×54，沒有則不顯示）；`HTMLMediaElement` API（`play()` 的 Promise、`pause`、`currentTime`、`duration`、`volume`、`muted`、`canPlayType`、事件、`Audio()`）；Chrome 的自動播放規則（有聲音需使用者互動）。實際播放由後端提供（v17：FFmpeg），沒有後端時照標準回報錯誤 |
+| 17 | FFmpeg 播放後端（feature `media`，需安裝 FFmpeg 8）：每個媒體元素一條解碼執行緒（FFmpeg 自己開啟檔案與 http(s) 網址），影格轉成 RGB 送入有上限的佇列，聲音重新取樣後由 `cpal` 輸出（音量、靜音）；主執行緒依時鐘顯示到期的影格，觸發 `loadedmetadata`、`playing`、`timeupdate`、`seeked`、`ended` 等事件；跳轉從關鍵影格解碼並丟棄目標之前的影格與聲音；`loop`；播放或載入中時視窗以約 60 fps 更新，截圖會等待 |
 
 ### 第二批調查
 
