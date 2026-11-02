@@ -20,6 +20,7 @@ use crate::ui::TextField;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+mod animate;
 mod forms;
 mod image;
 
@@ -100,6 +101,8 @@ pub struct Document {
     pub frames: HashMap<NodeId, Frame>,
     /// Size containers from the last layout (for `@container` rules).
     containers: crate::css::Containers,
+    /// Running animations and transitions.
+    anim: animate::Animator,
 }
 
 impl Document {
@@ -134,6 +137,7 @@ impl Document {
             forms: FormState::default(),
             frames: HashMap::new(),
             containers: Default::default(),
+            anim: Default::default(),
         }
     }
 
@@ -159,6 +163,7 @@ impl Document {
         self.needs_style
             || self.needs_layout
             || !self.restyle_roots.is_empty()
+            || self.anim.running
             || self.frames.values().any(|f| f.doc.as_ref().is_some_and(|d| d.needs_update()))
     }
 
@@ -408,12 +413,16 @@ impl Document {
     }
 
     pub fn style(&self, id: NodeId) -> Option<&Style> {
-        self.styles.get(id).and_then(Option::as_ref)
+        self.anim
+            .overlay
+            .get(&id)
+            .or_else(|| self.styles.get(id).and_then(Option::as_ref))
     }
 
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
         self.update_once(fonts);
+        self.animate();
         // `@container` rules depend on sizes only layout gives: if the
         // containers changed, style and lay out again (once, so sizes that
         // flip-flop settle).
@@ -477,9 +486,11 @@ impl Document {
             .keys()
             .filter_map(|&n| Some((n, self.box_rects(n).map(|(_, c)| (c.w, c.h))?)))
             .collect();
+        let now = self.anim_time();
         for (n, (w, h)) in sizes {
             if let Some(doc) = self.frame_mut(n) {
                 doc.set_viewport(w, h);
+                doc.set_time(now);
                 doc.update(fonts);
             }
         }
@@ -564,6 +575,7 @@ impl Document {
     pub fn update_style(&mut self) {
         let t0 = profiling().then(std::time::Instant::now);
         if self.needs_style || !self.restyle_roots.is_empty() {
+            self.before_restyle();
             let sheets = self.author_sheets();
             let env = MediaEnv {
                 width: self.size.0,
@@ -627,6 +639,7 @@ impl Document {
                 }
             }
             self.needs_style = false;
+            self.after_restyle();
             self.sync_inline_svgs();
             if let Some(t) = t0 {
                 eprintln!(
@@ -653,6 +666,7 @@ impl Document {
             view_top: Default::default(),
             flat: Default::default(),
             frames: &self.frames,
+            overlay: &self.anim.overlay,
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -1869,6 +1883,41 @@ mod tests {
         );
         let color = |id| d.style(d.dom.element_by_id(id).unwrap()).unwrap().color.rgb();
         assert_eq!((color("a"), color("b"), color("c")), (0x000000, 0xff0000, 0x000000));
+    }
+
+    #[test]
+    fn animations_and_transitions_run_on_the_clock() {
+        let (mut d, fonts) = doc(
+            r#"<style>@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+               #a { animation: fade 1s linear forwards; opacity: 0 }
+               #b { transition: opacity 100ms linear; opacity: 1 } #b.off { opacity: 0 }</style>
+               <p id=a>a</p><p id=b>b</p>"#,
+            400.0,
+            200.0,
+        );
+        let id = |d: &Document, s| d.dom.element_by_id(s).unwrap();
+        let (a, b) = (id(&d, "a"), id(&d, "b"));
+        let opacity = |d: &Document, n| d.style(n).unwrap().opacity;
+        assert_eq!(opacity(&d, a), 0.0);
+        d.set_time(500.0);
+        d.update(&fonts);
+        assert!((opacity(&d, a) - 0.5).abs() < 0.01);
+        assert!(d.animating());
+        d.set_time(2000.0);
+        d.update(&fonts);
+        assert_eq!(opacity(&d, a), 1.0, "fill-mode forwards keeps the end");
+        assert!(!d.animating());
+
+        d.dom_mut().element_mut(b).unwrap().set_attr("class", "off");
+        d.update(&fonts);
+        assert_eq!(opacity(&d, b), 1.0, "the transition starts from the old value");
+        d.set_time(2050.0);
+        d.update(&fonts);
+        assert!((opacity(&d, b) - 0.5).abs() < 0.01);
+        d.set_time(2200.0);
+        d.update(&fonts);
+        assert_eq!(opacity(&d, b), 0.0);
+        assert!(!d.animating());
     }
 
     #[test]

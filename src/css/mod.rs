@@ -7,6 +7,7 @@
 //! substituted when a declaration is applied.
 
 pub mod computed;
+pub mod animation;
 pub mod gradient;
 pub mod media;
 pub mod selector;
@@ -197,6 +198,8 @@ pub struct Cascade {
     within: Vec<Rc<ContainerQuery>>,
     /// Whether any rule depends on a container query.
     pub has_container_rules: bool,
+    /// `@keyframes` by name (the last definition wins).
+    pub keyframes: HashMap<String, Rc<[animation::Keyframe]>>,
 }
 
 impl Cascade {
@@ -216,6 +219,7 @@ impl Cascade {
             dynamic: Vec::new(),
             within: Vec::new(),
             has_container_rules: false,
+            keyframes: HashMap::new(),
         };
         let ua = ua_sheet();
         c.add(&ua.rules, 0, env, "");
@@ -287,6 +291,9 @@ impl Cascade {
                     self.within.push(query.clone());
                     self.add(inner, origin, env, layer);
                     self.within.pop();
+                }
+                Rule::Keyframes(name, frames) => {
+                    self.keyframes.insert(name.clone(), frames.clone());
                 }
                 Rule::Import(..) | Rule::FontFace(_) => {}
             }

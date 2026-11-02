@@ -2515,6 +2515,7 @@ impl Browser {
         // styles, which name background images.
         let doc = &mut self.tabs[self.active].doc;
         doc.set_viewport(vp.w, vp.h);
+        doc.set_time(self.now);
         doc.update(&self.fonts);
         self.request_images(host);
     }
@@ -2613,6 +2614,11 @@ impl Browser {
             };
             self.fetch(req, &url::resolve(&base, &src), host);
         }
+    }
+
+    /// Whether the active page has animations or transitions running.
+    pub fn animating(&self) -> bool {
+        self.tabs[self.active].doc.animating()
     }
 
     /// Whether a new frame should be drawn at time `now`.

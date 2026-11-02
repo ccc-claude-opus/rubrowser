@@ -88,6 +88,7 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
         "margin" => four(s.margin.map(len)),
         "padding" => four(s.padding.map(len)),
         "border-width" => four([0, 1, 2, 3].map(|i| px(border_width(i)))),
+        "border-radius" if s.border_radius_pct > 0.0 => format!("{}%", number(s.border_radius_pct)),
         "border-radius" => px(s.border_radius),
         "box-sizing" => match s.box_sizing {
             BoxSizing::ContentBox => "content-box",

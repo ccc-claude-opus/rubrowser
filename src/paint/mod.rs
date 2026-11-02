@@ -44,6 +44,8 @@ pub struct Painter<'a> {
     pub flat: std::cell::Cell<Option<usize>>,
     /// Documents of `<iframe>` elements.
     pub frames: &'a HashMap<NodeId, crate::document::Frame>,
+    /// Animated styles, in place of `styles`.
+    pub overlay: &'a HashMap<NodeId, Style>,
 }
 
 /// What an image layer paints.
@@ -60,7 +62,9 @@ const SCROLLBAR: Rgba = Rgba::new(0, 0, 0, 90);
 
 impl Painter<'_> {
     fn style(&self, id: NodeId) -> Option<&Style> {
-        self.styles.get(id).and_then(Option::as_ref)
+        self.overlay
+            .get(&id)
+            .or_else(|| self.styles.get(id).and_then(Option::as_ref))
     }
 
     fn phys(&self, r: RectF) -> Rect {
@@ -201,7 +205,8 @@ impl Painter<'_> {
         };
         // Images inside a rounded clipping box (avatars) are rounded too.
         let saved_round = c.round_clip();
-        if clips && style.border_radius > 0.0 {
+        let radius = style.radius(r.w, r.h);
+        if clips && radius > 0.0 {
             let pr = b.padding_rect();
             let p = RectF {
                 x: r.x + pr.x,
@@ -214,7 +219,7 @@ impl Painter<'_> {
                 p.y * s,
                 p.w * s,
                 p.h * s,
-                style.border_radius * s,
+                radius * s,
             ]));
         }
         if let Some(il) = &b.inline {
@@ -269,14 +274,14 @@ impl Painter<'_> {
             && style.visible
         {
             let outer = c.round_clip();
-            if style.border_radius > 0.0 && outer.is_none() {
+            if radius > 0.0 && outer.is_none() {
                 let s = self.scale;
                 c.set_round_clip(Some([
                     r.x * s,
                     r.y * s,
                     r.w * s,
                     r.h * s,
-                    style.border_radius * s,
+                    radius * s,
                 ]));
             }
             self.image(c, b, node, style, r);
@@ -942,7 +947,7 @@ impl Painter<'_> {
     fn decorations(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
         let s = self.scale;
         let bw = [0, 1, 2, 3].map(|i| style.border(i));
-        let radius = style.border_radius;
+        let radius = style.radius(r.w, r.h);
         let uniform = bw.iter().all(|&w| w == bw[0])
             && style
                 .border_color
@@ -999,6 +1004,23 @@ impl Painter<'_> {
                 c.fill_rounded(outer, Some(inner), col.rgb(), col.a);
             }
             if uniform {
+                return;
+            }
+            let solid = style
+                .border_style
+                .iter()
+                .all(|&ls| matches!(ls, cs::LineStyle::Solid | cs::LineStyle::None));
+            if solid {
+                // Per-side widths and colors around rounded corners.
+                let inner = (
+                    (r.x + bw[cs::LEFT]) * s,
+                    (r.y + bw[cs::TOP]) * s,
+                    (r.w - bw[cs::LEFT] - bw[cs::RIGHT]) * s,
+                    (r.h - bw[cs::TOP] - bw[cs::BOTTOM]) * s,
+                    (radius - bw.iter().copied().fold(0.0, f32::max)).max(0.0) * s,
+                );
+                let colors = style.border_color.map(|c| (c.rgb(), c.a));
+                c.fill_rounded_sides(outer, inner, colors, bw.map(|w| w * s));
                 return;
             }
         } else {

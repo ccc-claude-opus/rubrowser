@@ -292,6 +292,8 @@ pub struct Style {
     pub border_color: [Rgba; 4],
     pub border_style: [LineStyle; 4],
     pub border_radius: f32,
+    /// A percentage `border-radius` (of the box's shorter side here).
+    pub border_radius_pct: f32,
     pub width: Dim,
     pub height: Dim,
     pub min_width: Dim,
@@ -324,6 +326,9 @@ pub struct Style {
     pub container_names: Rc<[String]>,
     pub object_fit: ObjectFit,
     pub object_position: (Dim, Dim),
+    /// `animation-*` and `transition-*` (see [`super::animation`]).
+    pub animations: Rc<super::animation::Animations>,
+    pub transitions: Rc<super::animation::Transitions>,
     /// `text-overflow: ellipsis` (lines cut at the end of a clipping box
     /// end in `…`).
     pub ellipsis: bool,
@@ -405,6 +410,7 @@ impl Default for Style {
             border_color: [Rgba::BLACK; 4],
             border_style: [LineStyle::None; 4],
             border_radius: 0.0,
+            border_radius_pct: 0.0,
             width: Dim::Auto,
             height: Dim::Auto,
             min_width: Dim::Auto,
@@ -434,6 +440,8 @@ impl Default for Style {
             container_names: Rc::new([]),
             object_fit: ObjectFit::Fill,
             object_position: (Dim::Percent(50.0), Dim::Percent(50.0)),
+            animations: Default::default(),
+            transitions: Default::default(),
             transform: Rc::new([]),
             transform_origin: (Dim::Percent(50.0), Dim::Percent(50.0)),
             aspect_ratio: None,
@@ -485,6 +493,11 @@ impl Default for Style {
 }
 
 impl Style {
+    /// The corner radius of a `w × h` border box.
+    pub fn radius(&self, w: f32, h: f32) -> f32 {
+        self.border_radius + self.border_radius_pct * w.min(h) / 100.0
+    }
+
     /// Whether any transform applies (`translate`, `rotate`, `scale` or
     /// `transform`).
     pub fn is_transformed(&self) -> bool {
@@ -704,8 +717,14 @@ impl Style {
                 }
             }
             "border-radius" => {
-                if let Some(r) = tokens(v).first().and_then(|t| px(t)) {
-                    self.border_radius = r;
+                // One radius for all corners: the first one given.
+                let first = tokens(v).first().map(|t| t.split('/').next().unwrap_or(t).trim());
+                match first.and_then(&dim) {
+                    Some(Dim::Percent(p)) => (self.border_radius, self.border_radius_pct) = (0.0, p),
+                    Some(d @ (Dim::Px(_) | Dim::Calc(..))) => {
+                        (self.border_radius, self.border_radius_pct) = (d.px_or_zero(0.0), 0.0)
+                    }
+                    _ => {}
                 }
             }
             "width" => set(&mut self.width, dim(v)),
@@ -893,6 +912,18 @@ impl Style {
                 _ => {}
             },
             "scale" => set(&mut self.scale, super::transform::parse_scale(v)),
+            _ if name.starts_with("animation") => {
+                let mut a = (*self.animations).clone();
+                if a.set(name, value) {
+                    self.animations = Rc::new(a);
+                }
+            }
+            _ if name.starts_with("transition") => {
+                let mut t = (*self.transitions).clone();
+                if t.set(name, value) {
+                    self.transitions = Rc::new(t);
+                }
+            }
             "container-type" => match v {
                 "size" | "inline-size" => self.container = true,
                 "normal" => self.container = false,
@@ -1349,6 +1380,7 @@ impl Style {
                 self.border_style = from.border_style;
                 self.border_color = from.border_color;
                 self.border_radius = from.border_radius;
+                self.border_radius_pct = from.border_radius_pct;
             }
             "width" => self.width = from.width,
             "height" => self.height = from.height,

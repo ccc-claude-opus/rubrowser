@@ -38,6 +38,8 @@ pub enum Rule {
     FontFace(Rc<[Decl]>),
     /// `@container [name] <condition> { … }`.
     Container(Rc<super::ContainerQuery>, Vec<Rule>),
+    /// `@keyframes name { … }`.
+    Keyframes(String, Rc<[super::animation::Keyframe]>),
 }
 
 /// A parsed stylesheet.
@@ -238,6 +240,15 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                         out.push(Rule::Property(prelude.to_string(), d.value.to_string()));
                     }
                 }
+                "keyframes" | "-webkit-keyframes" if has_block => {
+                    let (_, blocks) = parse_block(body, base);
+                    let blocks: Vec<(&str, Vec<Decl>)> = blocks
+                        .into_iter()
+                        .map(|(sel, decls)| (sel, parse_block(decls, base).0))
+                        .collect();
+                    let name = prelude.trim().trim_matches(['"', '\'']).to_string();
+                    out.push(Rule::Keyframes(name, super::animation::parse_keyframes(&blocks)));
+                }
                 "container" if has_block => {
                     if let Some(q) = super::ContainerQuery::parse(prelude) {
                         out.push(Rule::Container(Rc::new(q), parse_rules(body, base)));
@@ -423,7 +434,8 @@ mod tests {
                     Rule::Import(..)
                     | Rule::LayerOrder(_)
                     | Rule::Property(..)
-                    | Rule::FontFace(_) => {}
+                    | Rule::FontFace(_)
+                    | Rule::Keyframes(..) => {}
                 }
             }
         }

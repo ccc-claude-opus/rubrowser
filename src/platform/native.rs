@@ -351,6 +351,13 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         }
     }
     browser.render(now(&start), &mut host);
+    // Let animations that run on load (fade-ins) settle, as a person
+    // looking at the page would.
+    let settle = Instant::now() + std::time::Duration::from_secs(2);
+    while browser.animating() && Instant::now() < settle {
+        std::thread::sleep(std::time::Duration::from_millis(16));
+        browser.render(now(&start), &mut host);
+    }
     if let Ok(sel) = std::env::var("RUBROWSER_DUMP") {
         eprint!("{}", browser.dump_layout(&sel, 12));
     }

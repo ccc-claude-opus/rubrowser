@@ -327,6 +327,46 @@ impl Canvas {
         }
     }
 
+    /// Fills the ring between rounded rectangles `outer` and `inner` with
+    /// one color per side (top, right, bottom, left; `widths` are the side
+    /// widths). Corners split along the diagonals from the outer to the
+    /// inner corners.
+    pub fn fill_rounded_sides(
+        &mut self,
+        outer: (f32, f32, f32, f32, f32),
+        inner: (f32, f32, f32, f32, f32),
+        colors: [(Color, u8); 4],
+        widths: [f32; 4],
+    ) {
+        let (x, y, w, h, _) = outer;
+        let bounds = Rect::new(
+            x.floor() as i32,
+            y.floor() as i32,
+            (x + w).ceil() as i32 - x.floor() as i32,
+            (y + h).ceil() as i32 - y.floor() as i32,
+        )
+        .intersect(&self.clip);
+        for row in bounds.y..bounds.bottom() {
+            let line = row as usize * self.width;
+            for col in bounds.x..bounds.right() {
+                let (px, py) = (col as f32 + 0.5, row as f32 + 0.5);
+                let cov = coverage(outer, px, py) - coverage(inner, px, py);
+                if cov <= 0.0 {
+                    continue;
+                }
+                let depth = [py - y, x + w - px, y + h - py, px - x];
+                let side = (0..4)
+                    .filter(|&i| widths[i] > 0.0)
+                    .min_by(|&a, &b| (depth[a] / widths[a]).total_cmp(&(depth[b] / widths[b])));
+                let Some(side) = side else { continue };
+                let (color, alpha) = colors[side];
+                let a = (cov.min(1.0) * self.effective(alpha) as f32).round() as u8;
+                let p = &mut self.pixels[line + col as usize];
+                *p = blend(*p, color, a);
+            }
+        }
+    }
+
     /// Composites a premultiplied pixel (`color` already scaled by `alpha`)
     /// at `(x, y)`, honoring the clip, rounded clip and global alpha.
     pub fn composite_premul(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
