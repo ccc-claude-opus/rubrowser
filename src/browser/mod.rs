@@ -920,7 +920,8 @@ impl Browser {
                     let source = String::from_utf8_lossy(&body).into_owned();
                     let current = p.node.filter(|_| mime == JS_MIME);
                     if let Some(n) = current {
-                        self.run_source(i, JS_MIME, &format!("__rb_current({n})"), "rb", host);
+                        let call = format!("__rb_current({n}, {})", p.inserted);
+                        self.run_source(i, JS_MIME, &call, "rb", host);
                     }
                     self.run_source(i, &mime, &source, &p.name, host);
                     if current.is_some() && i < self.tabs.len() {
@@ -3398,6 +3399,36 @@ mod tests {
         let doc = &b.tabs[b.active].doc;
         let p = doc.dom.element_by_id("p").unwrap();
         assert_eq!(doc.style(p).unwrap().color.rgb(), 0xff0000);
+    }
+
+    #[test]
+    fn document_write_inserts_after_the_script() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<p id=before>a</p>
+            <script>document.write('<ul id=list><li>one'); document.write('</li><li>two</li></ul>');
+              document.write('<script>console.log("written script ran")<\/script>');</script>
+            <p id=after>b</p>
+            <script>setTimeout(() => document.write('<p id=late>no</p>'), 0);</script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(10.0, &mut h);
+        let doc = &b.tabs[b.active].doc;
+        let list = doc.dom.element_by_id("list").expect("written list");
+        assert_eq!(doc.dom.text_content(list), "onetwo");
+        let body = doc.dom.body().unwrap();
+        let order: Vec<&str> = doc
+            .dom
+            .children(body)
+            .iter()
+            .filter_map(|&c| doc.dom.attr(c, "id"))
+            .collect();
+        assert_eq!(&order[..3], &["before", "list", "after"]);
+        assert!(h.logs.iter().any(|l| l == "written script ran"), "{:?}", h.logs);
+        assert!(doc.dom.element_by_id("late").is_none());
     }
 
     #[test]

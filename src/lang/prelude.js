@@ -461,6 +461,10 @@
     createComment(text) { return this.createTextNode(''); }
     createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
     get currentScript() { return currentScript; }
+    write(...text) { documentWrite(text.join('')); }
+    writeln(...text) { documentWrite(text.join('') + '\n'); }
+    open() { return this; }
+    close() {}
     get visibilityState() { return 'visible'; }
     get hidden() { return false; }
     createElement(tag) {
@@ -1247,7 +1251,36 @@
 
   // document.currentScript, set by the browser around each script.
   let currentScript = null;
-  global.__rb_current = function (h) { currentScript = h < 0 ? null : wrap(h); };
+  let currentInserted = false;
+  // document.write from a script the parser found: the markup goes right
+  // after that <script> when it ends (so markup split over several writes
+  // stays whole). Written scripts run, unlike innerHTML ones.
+  let written = '';
+  global.__rb_current = function (h, inserted) {
+    if (h < 0 && currentScript && written) {
+      const html = written;
+      written = '';
+      const holder = document.createElement('div');
+      holder.innerHTML = html;
+      for (const old of holder.querySelectorAll('script')) {
+        const s = document.createElement('script');
+        for (const name of old.getAttributeNames()) s.setAttribute(name, old.getAttribute(name));
+        s.textContent = old.textContent;
+        old.replaceWith(s);
+      }
+      currentScript.after(...holder.childNodes);
+    }
+    currentScript = h < 0 ? null : wrap(h);
+    currentInserted = !!inserted;
+  };
+  function documentWrite(text) {
+    if (currentScript && !currentInserted) {
+      written += text;
+    } else {
+      console.warn("Failed to execute 'write' on 'Document': It isn't possible to write into a " +
+        'document from an asynchronously-loaded external script unless it is explicitly opened.');
+    }
+  }
 
   for (const [name, which] of [['innerWidth', 2], ['innerHeight', 3], ['outerWidth', 2], ['outerHeight', 3]]) {
     Object.defineProperty(global, name, { configurable: true, get: () => rb.rect(0, which) });

@@ -46,7 +46,7 @@ flowchart LR
 | 節點 | `parentNode`、`parentElement`、`childNodes`、`children`、`firstChild`、`nextSibling`、`firstElementChild` …、`textContent`、`appendChild`、`append`、`prepend`、`insertBefore`、`removeChild`、`replaceChild`、`remove`、`before`、`after`、`replaceWith`、`contains`、`cloneNode` |
 | 元素 | `id`、`className`、`classList`、`style`（含 `setProperty`）、`dataset`、`innerHTML`、`outerHTML`、`innerText`、`value`、`hidden`、`disabled`、`href` / `src`（絕對網址）、`rel`、`type`、`async`、`crossOrigin` 等反映屬性的 property、`getAttribute` 等、`matches`、`closest`、`insertAdjacentHTML`、`click()` |
 | 事件 | `addEventListener`（含 `once`）、`removeEventListener`；事件物件的 `type`、`target`、`currentTarget`、`key`、`keyCode`、`shiftKey/ctrlKey/altKey/metaKey`、`clientX/clientY`、`button`、`preventDefault()`、`stopPropagation()`；`window.onload`、`element.onclick` / `onload` / `onerror` 等屬性 |
-| 動態載入 | 腳本插入的 `<script>`（外部、內嵌、模組）與 `<link rel=stylesheet>` 會載入並執行／套用，完成後觸發 `load` / `error`；`innerHTML` 插入的腳本不執行（同瀏覽器）；`document.currentScript`；`<link rel=preload as=style>` 會先下載，改成 `rel=stylesheet` 時套用 |
+| 動態載入 | 腳本插入的 `<script>`（外部、內嵌、模組）與 `<link rel=stylesheet>` 會載入並執行／套用，完成後觸發 `load` / `error`；`innerHTML` 插入的腳本不執行（同瀏覽器）；`document.currentScript`；`document.write` / `writeln`（解析器找到的腳本：內容在腳本結束後插在它後面，寫入的腳本會執行；非同步腳本與載入後的寫入會被忽略）；`<link rel=preload as=style>` 會先下載，改成 `rel=stylesheet` 時套用 |
 | 計時 | `setTimeout`、`setInterval`、`clearTimeout`、`clearInterval`、`requestAnimationFrame`、`queueMicrotask`、`performance.now()`、`Date.now()` |
 | 其他 | `console.log/info/warn/error`、`alert`（寫到主控台）、`location.href`（讀取與換頁）、`history.back/forward/go`（`pushState` / `replaceState` 只保存 state） |
 | 模組 | `<script type=module>`（外部與內嵌）、`import` / `export`、`import * as`、`export … from`、import map、`import.meta.url`；`nomodule` 腳本不執行 |

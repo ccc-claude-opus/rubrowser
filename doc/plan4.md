@@ -82,6 +82,7 @@
 | 5 | `<iframe>`：`src` / `srcdoc` 載入巢狀文件（自己的 CSS、圖片、字型），預設 300×150、在 iframe 的內容框中繪製；滾輪捲動 frame；frame 內的連結在 frame 內載入（`_top` / `_parent` 換整頁、其他名稱開新分頁）。frame 內不執行 JS，也不支援 frame 中的 frame |
 | 6 | 混合單位的 `calc()` / `min()` / `max()` / `clamp()` 依實際的包含區塊大小計算（以前用 viewport 近似；前一次排版量到的大小不對時再排一次）；`@container` 查詢（`container-type` / `container-name` / `container`，排版後容器大小改變時重算一次樣式）；`:lang()`、`:dir()`；`color-mix()`（預乘 alpha） |
 | 7 | CSS 動畫與轉場：`@keyframes`、`animation-*` / `transition-*` 與簡寫、`cubic-bezier` / `steps` 等時間函式、`fill-mode` / `direction` / 次數 / 暫停；動畫值（opacity、transform、顏色、visibility）放在樣式覆蓋層，只影響繪製不重排；截圖會等執行中的動畫最多 2 秒。另外：`border-radius` 百分比、各邊寬度與顏色不同的圓角邊框（轉圈圖示） |
+| 8 | `document.write` / `writeln`：解析器找到的腳本寫入的內容在該腳本結束時插在它後面（分次寫入的標記會合併），寫入的 `<script>` 會執行；非同步插入的腳本與載入後的寫入照 Chrome 忽略並警告 |
 
 ### 第二批調查
 
