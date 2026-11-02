@@ -229,7 +229,18 @@ impl Painter<'_> {
             let s = self.scale;
             c.set_round_clip(Some([p.x * s, p.y * s, p.w * s, p.h * s, radius * s]));
         }
-        if let Some(il) = &b.inline {
+        if let (Some(il), Some(rl)) = (&b.inline, b.vertical) {
+            let area = Self::content_area(b, r);
+            self.vertical_inline(
+                c,
+                il,
+                RectF {
+                    y: area.y - sy,
+                    ..area
+                },
+                rl,
+            );
+        } else if let Some(il) = &b.inline {
             let (cx, cy) = b.content_offset();
             // `text-overflow: ellipsis` cuts lines at the content box's end.
             let end = (clips && style.ellipsis && !style.rtl).then(|| {
@@ -1509,6 +1520,135 @@ impl Painter<'_> {
                 }
             }
         }
+    }
+
+    /// Paints vertical inline content in content box `area`: each line is
+    /// a column (right to left if `rl`); CJK characters stand upright and
+    /// other runs are turned 90° clockwise (`text-orientation: mixed`).
+    fn vertical_inline(
+        &self,
+        c: &mut Canvas,
+        il: &crate::layout::inline::InlineLayout,
+        area: RectF,
+        rl: bool,
+    ) {
+        for line in &il.lines {
+            let col_x = if rl {
+                area.x + area.w - line.top - line.height
+            } else {
+                area.x + line.top
+            };
+            for item in &line.items {
+                let Placed::Text {
+                    node, x: tx, text, ..
+                } = item
+                else {
+                    continue;
+                };
+                let Some(st) = self.style(*node) else {
+                    continue;
+                };
+                if !st.visible || st.clipped_away {
+                    continue;
+                }
+                let m = self.fonts.line_metrics(st.font(), st.font_size);
+                let mut y = area.y + tx;
+                // Runs of upright and sideways characters.
+                let mut run = String::new();
+                let mut upright_run = None;
+                let mut flush = |run: &mut String, upright: bool, y: &mut f32| {
+                    if run.is_empty() {
+                        return;
+                    }
+                    let w = self.fonts.measure(st.font(), st.font_size, run);
+                    if upright {
+                        for ch in run.chars() {
+                            let s = ch.to_string();
+                            let cw = self.fonts.measure(st.font(), st.font_size, &s);
+                            let x = col_x + (line.height - cw) / 2.0;
+                            self.text(c, st, x, *y + m.ascent, &s, st.color);
+                            *y += cw;
+                        }
+                    } else {
+                        let thick = m.ascent + m.descent;
+                        let x = col_x + (line.height - thick) / 2.0;
+                        self.sideways(c, st, run, x, *y, w, m.ascent, thick);
+                        *y += w;
+                    }
+                    run.clear();
+                };
+                for ch in text.chars() {
+                    let upright = crate::layout::inline::is_cjk(ch);
+                    if upright_run.is_some_and(|u| u != upright) {
+                        flush(&mut run, upright_run.unwrap(), &mut y);
+                    }
+                    upright_run = Some(upright);
+                    run.push(ch);
+                }
+                if let Some(u) = upright_run {
+                    flush(&mut run, u, &mut y);
+                }
+            }
+        }
+    }
+
+    /// Draws `text` turned 90° clockwise with its top-left at `(x, y)`
+    /// (it is `w` long and `thick` across; `ascent` above its baseline).
+    #[allow(clippy::too_many_arguments)]
+    fn sideways(
+        &self,
+        c: &mut Canvas,
+        st: &Style,
+        text: &str,
+        x: f32,
+        y: f32,
+        w: f32,
+        ascent: f32,
+        thick: f32,
+    ) {
+        let s = self.scale;
+        let (pw, ph) = ((w * s).ceil() as usize + 1, (thick * s).ceil() as usize + 1);
+        if pw == 0 || ph == 0 || pw * ph > 4_000_000 {
+            return;
+        }
+        // Over white and over black, which gives color and coverage.
+        let mut white = Canvas::new(pw, ph);
+        white.clear(0xff_ffff);
+        let mut black = Canvas::new(pw, ph);
+        for layer in [&mut white, &mut black] {
+            self.fonts.draw(
+                layer,
+                st.font(),
+                st.font_size * s,
+                0.0,
+                ascent * s,
+                text,
+                st.color.rgb(),
+            );
+        }
+        // Turned clockwise: column i of the run becomes row i, row j
+        // becomes column (ph - 1 - j).
+        let mut argb = vec![0u32; pw * ph];
+        for j in 0..ph {
+            for i in 0..pw {
+                let (wp, bp) = (white.pixels()[j * pw + i], black.pixels()[j * pw + i]);
+                let ch = |p: u32, k: u32| ((p >> k) & 0xff) as i32;
+                let cover = 255 - (0..3).map(|k| ch(wp, k * 8) - ch(bp, k * 8)).sum::<i32>() / 3;
+                if cover <= 0 {
+                    continue;
+                }
+                let un = |k: u32| ((ch(bp, k) * 255 / cover).clamp(0, 255)) as u32;
+                let color = (cover as u32) << 24 | un(16) << 16 | un(8) << 8 | un(0);
+                argb[i * ph + (ph - 1 - j)] = color;
+            }
+        }
+        c.draw_argb(
+            (x * s).round() as i32,
+            (y * s).round() as i32,
+            ph,
+            pw,
+            &argb,
+        );
     }
 
     /// The items of a line cut so `…` (in `block`'s font) fits before

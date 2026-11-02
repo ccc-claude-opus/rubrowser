@@ -87,6 +87,7 @@
 | 10 | 表單控制項：`range`（滑桿，可點擊與拖曳，觸發 `input` / `change`，值依 min / max / step 清理）、`color`（色塊）、`file`（「Choose File / No file chosen」）、`<progress>`、`<meter>`（依 low / high / optimum 顯示綠、黃、紅）；fieldset 的 legend 跨在上框線上並留缺口 |
 | 11 | 彩色 emoji：系統的彩色 emoji 字型（macOS Apple Color Emoji、Linux Noto Color Emoji，以 `memmap2` 映射不整檔讀入），以 rustybuzz 整形（國旗、ZWJ 組合、膚色），畫出字型裡的 PNG 點陣圖；文字依 emoji / 一般字分段 |
 | 12 | 多欄排版：`column-count` / `column-width` / `columns`、`column-gap`（`normal` 為 1em）、`column-rule`；先以單欄寬排版，再求平衡欄高（不小於最高的不可分段），最後把行與子方塊移到各欄（排版多跑兩次） |
+| 13 | 直排 `writing-mode: vertical-rl / vertical-lr`（只含行內內容的元素）：行變成欄（右到左或左到右），欄長為元素高度；中日韓字直立，其他文字轉 90°（`text-orientation: mixed`）。還不支援直排中的區塊排版與標點的直排位置 |
 
 ### 第二批調查
 

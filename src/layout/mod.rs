@@ -66,6 +66,9 @@ pub struct LBox {
     pub sticky_top: Option<f32>,
     /// A multi-column container's column count, width and gap.
     pub columns: Option<(u32, f32, f32)>,
+    /// Vertical inline content (`writing-mode`): its lines are columns,
+    /// right to left (`Some(true)`) or left to right.
+    pub vertical: Option<bool>,
 }
 
 impl LBox {
@@ -134,6 +137,14 @@ struct Ctx {
     intrinsic: Option<(f32, f32)>,
     /// Whether that size has a fixed aspect ratio (images, not controls).
     keeps_ratio: bool,
+}
+
+impl Ctx {
+    /// Whether the inline content runs vertically (see [`LBox::vertical`]).
+    fn vertical(&self, styles: &[Option<Css>]) -> Option<bool> {
+        self.inline.as_ref()?;
+        styles.get(self.style_node)?.as_ref()?.vertical
+    }
 }
 
 struct Builder<'a> {
@@ -292,6 +303,7 @@ fn layout_pass(
         content_shift: 0.0,
         sticky_top: None,
         columns: None,
+        vertical: None,
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
@@ -522,9 +534,20 @@ impl Builder<'_> {
                                 },
                             };
                         }
+                        let vertical = ctx.as_ref().and_then(|c| c.vertical(styles));
                         let Some(content) = ctx.and_then(|c| c.inline.as_ref()) else {
                             return Size::ZERO;
                         };
+                        if vertical.is_some() {
+                            // Lines run down a column as long as the box
+                            // is tall (if set); columns stack sideways.
+                            let length = known.height.unwrap_or(f32::INFINITY);
+                            let l = inline::layout(content, length, styles, fonts);
+                            return Size {
+                                width: known.width.unwrap_or(l.height),
+                                height: known.height.unwrap_or(l.width),
+                            };
+                        }
                         let max_w = known.width.unwrap_or(match avail.width {
                             AvailableSpace::Definite(w) => w,
                             AvailableSpace::MinContent => 0.0,
@@ -923,8 +946,13 @@ impl Builder<'_> {
         let side = |r: taffy::Rect<f32>| [r.top, r.right, r.bottom, r.left];
         let border = side(l.border);
         let padding = side(l.padding);
+        let vertical = ctx.and_then(|c| c.vertical(self.styles));
         let inline = ctx.and_then(|c| c.inline.as_ref()).map(|content| {
-            let w = l.size.width - border[1] - border[3] - padding[1] - padding[3];
+            let w = if vertical.is_some() {
+                l.size.height - border[0] - border[2] - padding[0] - padding[2]
+            } else {
+                l.size.width - border[1] - border[3] - padding[1] - padding[3]
+            };
             for item in &content.items {
                 if let inline::Item::Atomic { index, width, .. } = *item {
                     let node = self.boxes[index].node;
@@ -987,6 +1015,7 @@ impl Builder<'_> {
             content_shift: 0.0,
             sticky_top,
             columns: None,
+            vertical,
         });
         let kids: Vec<usize> = tree
             .children(node)
@@ -1743,6 +1772,19 @@ mod tests {
         assert_eq!(a.w, 300.0);
         assert_eq!(a.y, 10.0);
         assert_eq!(b.y, 40.0, "adjacent vertical margins collapse");
+    }
+
+    #[test]
+    fn vertical_writing_swaps_the_axes() {
+        let text = "字".repeat(12);
+        let html = format!(
+            "<style>body{{margin:0}} #v{{writing-mode:vertical-rl;height:100px;font-size:20px;line-height:30px;display:inline-block}}</style><div id=v>{text}</div>"
+        );
+        let l = lay(&html, 800.0, 600.0);
+        let r = l.rect("v");
+        // 12 characters of 20px in columns 100px long: 3 columns of 30px.
+        assert_eq!(l.lines("v"), 3);
+        assert_eq!((r.w, r.h), (90.0, 100.0));
     }
 
     #[test]

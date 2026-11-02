@@ -322,6 +322,10 @@ pub struct Style {
     pub scale: (f32, f32),
     /// Multi-column layout: `column-count` and `column-width` (px), and
     /// `column-rule` (width, style, color).
+    /// `writing-mode`: `Some(true)` for vertical-rl (columns right to
+    /// left), `Some(false)` for vertical-lr; `None` for horizontal.
+    /// Inherited.
+    pub vertical: Option<bool>,
     pub column_count: Option<u32>,
     pub column_width: Option<f32>,
     pub column_rule: (f32, LineStyle, Rgba),
@@ -441,6 +445,7 @@ impl Default for Style {
             rotate: 0.0,
             scale: (1.0, 1.0),
             ellipsis: false,
+            vertical: None,
             column_count: None,
             column_width: None,
             column_rule: (3.0, LineStyle::None, Rgba::BLACK),
@@ -550,6 +555,7 @@ impl Style {
             cursor: parent.cursor,
             list_style: parent.list_style,
             rtl: parent.rtl,
+            vertical: parent.vertical,
             svg_fill: parent.svg_fill.clone(),
             svg_stroke: parent.svg_stroke.clone(),
             // Clipping to nothing hides everything inside too.
@@ -935,6 +941,14 @@ impl Style {
                 if t.set(name, value) {
                     self.transitions = Rc::new(t);
                 }
+            }
+            "writing-mode" | "-webkit-writing-mode" => {
+                self.vertical = match v {
+                    "horizontal-tb" | "lr" | "lr-tb" | "rl" | "rl-tb" => None,
+                    "vertical-rl" | "sideways-rl" | "tb" | "tb-rl" => Some(true),
+                    "vertical-lr" | "sideways-lr" => Some(false),
+                    _ => return,
+                };
             }
             "column-count" => {
                 self.column_count = v.parse::<u32>().ok().filter(|&n| n > 0);
@@ -1471,6 +1485,7 @@ impl Style {
             "cursor" => self.cursor = from.cursor,
             "list-style" | "list-style-type" => self.list_style = from.list_style,
             "direction" => self.rtl = from.rtl,
+            "writing-mode" => self.vertical = from.vertical,
             "fill" => self.svg_fill = from.svg_fill.clone(),
             "stroke" => self.svg_stroke = from.svg_stroke.clone(),
             "visibility" => self.visible = from.visible,
@@ -1560,6 +1575,7 @@ fn is_inherited(name: &str) -> bool {
                 | "border-spacing"
                 | "border-collapse"
                 | "text-transform"
+                | "writing-mode"
         )
 }
 

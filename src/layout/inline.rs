@@ -478,7 +478,7 @@ pub fn align(layout: &mut InlineLayout, align: TextAlign, width: f32, rtl: bool)
 
 /// Whether `c` is Chinese, Japanese or Korean text (lines may break
 /// between such characters).
-fn is_cjk(c: char) -> bool {
+pub(crate) fn is_cjk(c: char) -> bool {
     matches!(c as u32,
         0x1100..=0x11FF | 0x2E80..=0x2FDF | 0x3000..=0x303F | 0x3040..=0x30FF
         | 0x3100..=0x31FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xA960..=0xA97F
