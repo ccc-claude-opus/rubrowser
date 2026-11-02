@@ -226,6 +226,29 @@
     });
   }
 
+  // getComputedStyle: values from the browser's cascade, read-only.
+  function cssName(prop) {
+    if (prop === 'cssFloat') return 'float';
+    const name = camelToKebab(prop);
+    return /^(webkit|moz|ms)-/.test(name) ? '-' + name : name;
+  }
+  function computedStyle(el) {
+    const get = (name) => (el && el.nodeType === 1 && rb.computedStyle(el.__h, name)) || '';
+    return new Proxy({}, {
+      get(_, prop) {
+        if (prop === 'getPropertyValue') return (p) => get(String(p).trim());
+        if (prop === 'getPropertyPriority') return () => '';
+        if (prop === 'setProperty' || prop === 'removeProperty') return () => {
+          throw new Error('NoModificationAllowedError: computed styles are read-only');
+        };
+        if (prop === 'cssText') return '';
+        if (typeof prop !== 'string' || prop === 'then') return undefined;
+        return get(cssName(prop));
+      },
+      set() { return true; },
+    });
+  }
+
   function readStyle(el, prop) {
     const css = el.getAttribute('style') || '';
     for (const decl of css.split(';')) {
@@ -1121,15 +1144,19 @@
   }
   PerformanceObserver.supportedEntryTypes = [];
 
+  // matchMedia: evaluated by the browser against the current viewport each
+  // time `matches` is read (change events are not sent yet).
   function matchMedia(query) {
+    const media = String(query);
     return {
-      matches: false,
-      media: String(query),
+      get matches() { return rb.mediaMatches(media); },
+      media,
       onchange: null,
       addListener() {},
       removeListener() {},
       addEventListener() {},
       removeEventListener() {},
+      dispatchEvent() { return true; },
     };
   }
 
@@ -1302,7 +1329,7 @@
     scrollTo() {},
     scrollBy() {},
     scroll() {},
-    getComputedStyle: (el) => (el && el.style) || {},
+    getComputedStyle: (el) => computedStyle(el),
     setTimeout: (fn, ms, ...args) => addTimer(fn, ms, args, false),
     setInterval: (fn, ms, ...args) => addTimer(fn, ms, args, true),
     clearTimeout: clearTimer,

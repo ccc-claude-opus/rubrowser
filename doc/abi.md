@@ -62,6 +62,8 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `get_text(h, ptr, cap) -> i32` | 所有子孫文字 |
 | `set_text(h, ptr, len)` | 以一個文字節點取代所有子節點 |
 | `get_attr(h, name_ptr, name_len, ptr, cap) -> i32` | 屬性值，不存在回傳 -1 |
+| `media_matches(ptr, len) -> i32` | 媒體查詢（如 `(max-width: 600px)`）是否符合目前的 viewport（`matchMedia`） |
+| `computed_style(h, name_ptr, name_len, ptr, cap) -> i32` | CSS 屬性的計算值（`getComputedStyle`；不認得的屬性為空字串），`h` 不是元素時回傳 -1 |
 | `set_attr(h, name_ptr, name_len, val_ptr, val_len)` | 設定屬性 |
 | `remove_attr(h, name_ptr, name_len)` | 移除屬性 |
 | `class_op(h, op, ptr, len) -> i32` | `op`：0 查詢、1 加入、2 移除、3 切換；回傳之後是否有此 class |

@@ -236,6 +236,16 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
                 ffi::get_attr(h, name.as_ptr(), name.len(), p, n)
             })))
         }),
+        ("mediaMatches", 1, |_, a, c| {
+            let q = text(a, 0, c)?;
+            Ok((unsafe { ffi::media_matches(q.as_ptr(), q.len()) } != 0).into())
+        }),
+        ("computedStyle", 2, |_, a, c| {
+            let (h, name) = (int(a, 0, c)?, text(a, 1, c)?);
+            Ok(opt_string(read_string(|p, n| unsafe {
+                ffi::computed_style(h, name.as_ptr(), name.len(), p, n)
+            })))
+        }),
         ("setAttr", 3, |_, a, c| {
             let (h, name, v) = (int(a, 0, c)?, text(a, 1, c)?, text(a, 2, c)?);
             unsafe { ffi::set_attr(h, name.as_ptr(), name.len(), v.as_ptr(), v.len()) };

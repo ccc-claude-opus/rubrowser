@@ -317,8 +317,108 @@ impl Document {
 
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
-        let profile = profiling();
-        let t0 = profile.then(std::time::Instant::now);
+        let t0 = profiling().then(std::time::Instant::now);
+        self.update_style();
+        if self.needs_layout {
+            let replaced = self.replaced_sizes(fonts);
+            self.tree = layout(
+                &self.dom,
+                &self.styles,
+                &self.generated,
+                fonts,
+                self.size.0,
+                self.size.1,
+                &replaced,
+            );
+            self.needs_layout = false;
+            self.clamp_scroll();
+            self.apply_fragment();
+            if let Some(t) = t0 {
+                eprintln!(
+                    "[profile] style+layout {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+        }
+    }
+
+    /// The value of CSS property `prop` for element `n`, as
+    /// `getComputedStyle` reports it (styles are brought up to date; sizes
+    /// come from the last layout).
+    pub fn computed_value(&mut self, n: NodeId, prop: &str) -> Option<String> {
+        self.update_style();
+        self.dom.element(n)?;
+        let unrendered;
+        let style = match self.style(n) {
+            Some(s) => s,
+            None => {
+                unrendered = self.unrendered_style(n)?;
+                &unrendered
+            }
+        };
+        let content = self.box_rects(n).map(|(_, c)| (c.w, c.h));
+        let base = self
+            .dom
+            .parent(n)
+            .and_then(|p| self.box_rects(p))
+            .map_or(self.size.0, |(_, c)| c.w);
+        let used = crate::css::computed::Used { content, base };
+        Some(crate::css::computed::value(style, prop, used))
+    }
+
+    /// The style element `n` would have although it is not rendered.
+    fn unrendered_style(&self, n: NodeId) -> Option<Style> {
+        let (_, env, cascade) = self.cascade.as_ref()?;
+        let mut chain = vec![n];
+        let mut at = n;
+        let parent = loop {
+            match self.dom.parent(at) {
+                Some(p) => match self.style(p) {
+                    Some(s) => break s.clone(),
+                    None => {
+                        chain.push(p);
+                        at = p;
+                    }
+                },
+                None => break Style::default(),
+            }
+        };
+        chain.reverse();
+        let root_font = self
+            .dom
+            .html()
+            .and_then(|h| self.style(h))
+            .map_or(16.0, |s| s.font_size);
+        let venv = crate::css::ValueEnv {
+            root_font,
+            vw: env.width,
+            vh: env.height,
+        };
+        let forms = &self.forms;
+        let dom = &self.dom;
+        let checked = |n: NodeId| forms.checked(dom, n);
+        let cx = Matcher {
+            dom,
+            state: self.state,
+            checked: &checked,
+        };
+        Some(crate::css::unrendered_style(cascade, &cx, &venv, &parent, &chain))
+    }
+
+    /// Whether media query list `query` matches the viewport (`matchMedia`).
+    pub fn media_matches(&self, query: &str) -> bool {
+        let env = MediaEnv {
+            width: self.size.0,
+            height: self.size.1,
+            scale: 1.0,
+            dark: false,
+        };
+        MediaList::parse(query).matches(&env)
+    }
+
+    /// Recomputes styles if needed (not layout).
+    pub fn update_style(&mut self) {
+        let t0 = profiling().then(std::time::Instant::now);
         if self.needs_style || !self.restyle_roots.is_empty() {
             let sheets = self.author_sheets();
             let env = MediaEnv {
@@ -386,27 +486,6 @@ impl Document {
             if let Some(t) = t0 {
                 eprintln!(
                     "[profile] style {:.1} ms",
-                    t.elapsed().as_secs_f64() * 1000.0
-                );
-            }
-        }
-        if self.needs_layout {
-            let replaced = self.replaced_sizes(fonts);
-            self.tree = layout(
-                &self.dom,
-                &self.styles,
-                &self.generated,
-                fonts,
-                self.size.0,
-                self.size.1,
-                &replaced,
-            );
-            self.needs_layout = false;
-            self.clamp_scroll();
-            self.apply_fragment();
-            if let Some(t) = t0 {
-                eprintln!(
-                    "[profile] style+layout {:.1} ms",
                     t.elapsed().as_secs_f64() * 1000.0
                 );
             }

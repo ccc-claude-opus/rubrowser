@@ -6,6 +6,7 @@
 //! when the index is built. Custom properties are inherited and `var()` is
 //! substituted when a declaration is applied.
 
+pub mod computed;
 pub mod gradient;
 pub mod media;
 pub mod selector;
@@ -728,6 +729,27 @@ pub fn counter_text(n: i32, style: &str) -> String {
         "decimal-leading-zero" => format!("{n:02}"),
         _ => n.to_string(),
     }
+}
+
+/// The style of an element that is not rendered (inside or under
+/// `display: none`), for `getComputedStyle`: `chain` runs from just below
+/// the nearest styled ancestor (whose style is `parent`) down to it.
+pub fn unrendered_style(
+    cascade: &Cascade,
+    cx: &Matcher,
+    venv: &ValueEnv,
+    parent: &Style,
+    chain: &[NodeId],
+) -> Style {
+    let mut candidates = Vec::new();
+    let mut style = parent.clone();
+    for &id in chain {
+        if cx.dom.element(id).is_some() {
+            cascade.candidates(cx.dom, id, &mut candidates);
+            style = cascade_element(cx.dom, id, cascade, &candidates, cx, &style, venv, None);
+        }
+    }
+    style
 }
 
 /// Cascades element `id` (or its pseudo-element `pe`).

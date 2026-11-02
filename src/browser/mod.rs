@@ -734,9 +734,12 @@ impl Browser {
     }
 
     fn set_page(&mut self, i: usize, html: &str, url: &str, host: &mut dyn Host) {
+        let vp = self.viewport_rect();
         let tab = &mut self.tabs[i];
         tab.loading = false;
         tab.doc = Document::from_html(html, url);
+        // Scripts see the viewport (`matchMedia`, `innerWidth`) from the start.
+        tab.doc.set_viewport(vp.w, vp.h);
         tab.scripts.clear();
         tab.timers.clear();
         tab.pending.clear();
@@ -3229,6 +3232,36 @@ mod tests {
         let doc = &b.tabs[b.active].doc;
         let p = doc.dom.element_by_id("p").unwrap();
         assert_eq!(doc.style(p).unwrap().color.rgb(), 0xff0000);
+    }
+
+    #[test]
+    fn get_computed_style_and_match_media() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<style>
+              .box { display: flex; color: #f00; margin: 4px 8px; --gap: 3px }
+              @media (max-width: 400px) { .box { display: none } }
+              .hidden { display: none }
+            </style>
+            <div class=box id=box style="padding-left: 2px">x</div>
+            <script>
+              const box = document.getElementById('box');
+              const cs = getComputedStyle(box);
+              console.log([cs.display, cs.color, cs.marginLeft, cs.paddingLeft,
+                cs.getPropertyValue('--gap'), cs.fontWeight].join('|'));
+              box.classList.add('hidden');
+              console.log('after ' + getComputedStyle(box).display);
+              console.log('media ' + matchMedia('(min-width: 500px)').matches + ' ' +
+                matchMedia('(max-width: 400px)').matches);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in ["flex|rgb(255, 0, 0)|8px|2px|3px|400", "after none", "media true false"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
     }
 
     #[test]

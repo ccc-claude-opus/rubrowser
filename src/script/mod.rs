@@ -617,6 +617,28 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
     )?;
     l.func_wrap(
         "rb",
+        "media_matches",
+        |c: C, p: i32, n: i32| -> Result<i32, Error> {
+            let query = read_str(&c, p, n)?;
+            Ok(c.data().doc.media_matches(&query) as i32)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "computed_style",
+        |mut c: C, h: i32, np: i32, nl: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            // `getComputedStyle(el).getPropertyValue(name)`.
+            let name = read_str(&c, np, nl)?.trim().to_ascii_lowercase();
+            let doc = &mut c.data_mut().doc;
+            let value = element(doc, h).and_then(|e| doc.computed_value(e, &name));
+            match value {
+                Some(v) => write_str(&mut c, p, cap, &v),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
         "set_attr",
         |mut c: C, h: i32, np: i32, nl: i32, vp: i32, vl: i32| -> Result<(), Error> {
             let name = read_str(&c, np, nl)?.to_ascii_lowercase();
