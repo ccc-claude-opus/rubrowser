@@ -188,7 +188,11 @@ pub fn query_all(selector: &str) -> Vec<Element> {
                 out.as_mut_ptr(),
                 out.len() as i32,
             )
-        } as usize;
+        };
+        // A negative count: the selector is invalid.
+        let Ok(n) = usize::try_from(n) else {
+            return Vec::new();
+        };
         if n <= out.len() {
             out.truncate(n);
             return out.into_iter().map(Element).collect();
@@ -262,7 +266,7 @@ impl Element {
 
     /// Whether the element matches a CSS selector.
     pub fn matches(self, selector: &str) -> bool {
-        unsafe { ffi::matches(self.0, selector.as_ptr(), selector.len()) != 0 }
+        unsafe { ffi::matches(self.0, selector.as_ptr(), selector.len()) > 0 }
     }
 
     /// The nearest inclusive ancestor matching `selector`.

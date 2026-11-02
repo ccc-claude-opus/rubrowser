@@ -366,7 +366,7 @@ impl<'a> Parser<'a> {
                         of,
                     }
                 }
-                _ => Pseudo::Never,
+                _ => unknown(),
             }
         } else {
             let nth = |a, b, last, of_type| Pseudo::Nth {
@@ -405,7 +405,7 @@ impl<'a> Parser<'a> {
                 "optional" => Pseudo::Optional,
                 "placeholder-shown" => Pseudo::PlaceholderShown,
                 "valid" | "defined" | "read-write" | "scope" => return Some(()),
-                _ => Pseudo::Never,
+                _ => unknown(),
             }
         };
         compound.pseudos.push(p);
@@ -579,6 +579,19 @@ fn parse_nth(expr: &str) -> Option<(i32, i32)> {
             Some((a, b))
         }
     }
+}
+
+thread_local! {
+    /// Set while parsing when a pseudo-class is not known at all.
+    static UNKNOWN_PSEUDO: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Like [`parse_list`], but an unknown pseudo-class makes the whole list
+/// invalid, as for `querySelector` and `matches` (which then throw).
+pub fn parse_list_strict(src: &str) -> Option<Vec<Selector>> {
+    UNKNOWN_PSEUDO.with(|u| u.set(false));
+    let list = parse_list(src)?;
+    (!UNKNOWN_PSEUDO.with(|u| u.get())).then_some(list)
 }
 
 /// Parses a selector list; `None` if any selector is invalid.
@@ -825,6 +838,13 @@ fn is_rtl(dom: &Dom, n: NodeId) -> bool {
         }
     }
     false
+}
+
+/// A pseudo-class this engine does not know: never matches (in a
+/// stylesheet); makes a script's selector invalid.
+fn unknown() -> Pseudo {
+    UNKNOWN_PSEUDO.with(|u| u.set(true));
+    Pseudo::Never
 }
 
 /// `:has(comb sel)` relative to `n`.

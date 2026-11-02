@@ -151,6 +151,35 @@ impl Context for Matcher<'_> {
     }
 }
 
+/// Scripts' selectors: `None` if `selector` is invalid (scripts throw a
+/// `SyntaxError`), else which of `nodes` it matches, parsed once.
+pub fn query(
+    dom: &Dom,
+    nodes: impl IntoIterator<Item = NodeId>,
+    selector: &str,
+    state: &ElementState,
+) -> Option<Vec<NodeId>> {
+    let list = selector::parse_list_strict(selector)?;
+    let no = |_: NodeId| false;
+    let cx = Matcher {
+        dom,
+        state: *state,
+        checked: &no,
+        containers: &NO_CONTAINERS,
+    };
+    Some(
+        nodes
+            .into_iter()
+            .filter(|&n| {
+                dom.element(n).is_some()
+                    && list
+                        .iter()
+                        .any(|s| s.pseudo_element.is_none() && selector::matches(&cx, s, n))
+            })
+            .collect(),
+    )
+}
+
 /// Whether `selector` matches element `id`. Used by scripts' `query`.
 pub fn matches(dom: &Dom, id: NodeId, selector: &str, state: &ElementState) -> bool {
     let no = |_: NodeId| false;

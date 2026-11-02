@@ -5,6 +5,7 @@
 //! `data-action` attribute run browser commands, and the tab strip and
 //! address bar are kept in sync by editing the chrome DOM.
 
+use std::rc::Rc;
 use std::collections::HashMap;
 
 use crate::abi::key;
@@ -521,7 +522,8 @@ impl Tab {
 pub struct Browser {
     /// Whether web pages may run scripts (built-in pages always can).
     javascript: bool,
-    fonts: Fonts,
+    /// Shared with page documents, which lay out on demand for scripts.
+    fonts: Rc<Fonts>,
     canvas: Canvas,
     scale: f32,
     chrome: Document,
@@ -557,7 +559,7 @@ impl Browser {
     /// [`Fonts::with_system_fonts`]).
     pub fn with_fonts(width: usize, height: usize, scale: f32, fonts: Fonts) -> Self {
         let mut b = Browser {
-            fonts,
+            fonts: Rc::new(fonts),
             canvas: Canvas::new(width, height),
             scale: sanitize_scale(scale),
             chrome: Document::from_html(CHROME_HTML, "about:chrome"),
@@ -761,6 +763,7 @@ impl Browser {
         tab.doc = Document::from_html(html, url);
         // Scripts see the viewport (`matchMedia`, `innerWidth`) from the start.
         tab.doc.set_viewport(vp.w, vp.h);
+        tab.doc.set_fonts(self.fonts.clone());
         tab.scripts.clear();
         tab.timers.clear();
         tab.pending.clear();
@@ -3399,6 +3402,50 @@ mod tests {
         let doc = &b.tabs[b.active].doc;
         let p = doc.dom.element_by_id("p").unwrap();
         assert_eq!(doc.style(p).unwrap().color.rgb(), 0xff0000);
+    }
+
+    #[test]
+    fn scripts_see_layout_selector_errors_and_html_documents() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<div id=box style="width:120px;height:30px"></div><script>
+              const box = document.getElementById('box');
+              console.log('width ' + box.offsetWidth);
+              box.style.width = '50px';
+              console.log('after ' + box.getBoundingClientRect().width);
+              for (const sel of [':visible', 'div[', '#box:hover']) {
+                try { document.querySelector(sel); console.log('ok ' + sel); }
+                catch (e) { console.log(e.name + ' ' + sel); }
+              }
+              const tpl = document.createElement('template');
+              tpl.innerHTML = '<li>a</li><li>b</li>';
+              const ul = document.createElement('ul');
+              ul.append(tpl.content.cloneNode(true), document.importNode(tpl.content, true));
+              console.log('template ' + ul.children.length + ' ' + tpl.content.childNodes.length);
+              const meta = document.createElement('meta');
+              meta.content = 'x';
+              console.log('meta ' + meta.content);
+              const doc = document.implementation.createHTMLDocument('t');
+              doc.body.innerHTML = '<form></form><form></form>';
+              console.log('forms ' + doc.body.childNodes.length + ' ' + doc.title);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in [
+            "width 120",
+            "after 50",
+            "SyntaxError :visible",
+            "SyntaxError div[",
+            "ok #box:hover",
+            "forms 2 t",
+            "template 4 2",
+            "meta x",
+        ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
     }
 
     #[test]

@@ -103,6 +103,8 @@ pub struct Document {
     containers: crate::css::Containers,
     /// Running animations and transitions.
     anim: animate::Animator,
+    /// Fonts for laying out on demand (scripts asking for sizes).
+    fonts: Option<Rc<Fonts>>,
 }
 
 impl Document {
@@ -138,6 +140,21 @@ impl Document {
             frames: HashMap::new(),
             containers: Default::default(),
             anim: Default::default(),
+            fonts: None,
+        }
+    }
+
+    pub fn set_fonts(&mut self, fonts: Rc<Fonts>) {
+        self.fonts = Some(fonts);
+    }
+
+    /// Brings styles and layout up to date for a script reading sizes or
+    /// positions (as browsers do), if fonts were given.
+    pub fn ensure_layout(&mut self) {
+        if let Some(fonts) = self.fonts.clone()
+            && (self.needs_style || self.needs_layout || !self.restyle_roots.is_empty())
+        {
+            self.update(&fonts);
         }
     }
 
@@ -500,6 +517,7 @@ impl Document {
     /// `getComputedStyle` reports it (styles are brought up to date; sizes
     /// come from the last layout).
     pub fn computed_value(&mut self, n: NodeId, prop: &str) -> Option<String> {
+        self.ensure_layout();
         self.update_style();
         self.dom.element(n)?;
         let unrendered;

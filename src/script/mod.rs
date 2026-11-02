@@ -403,13 +403,9 @@ fn element(doc: &Document, h: i32) -> Option<NodeId> {
 }
 
 /// Elements matching `selector`, in document order.
-fn select(doc: &Document, selector: &str) -> Vec<NodeId> {
-    let state = doc.state();
-    doc.dom
-        .descendants(Dom::ROOT)
-        .into_iter()
-        .filter(|&n| css::matches(&doc.dom, n, selector, &state))
-        .collect()
+/// Elements matching `selector` in document order; `None` if it is invalid.
+fn select(doc: &Document, selector: &str) -> Option<Vec<NodeId>> {
+    css::query(&doc.dom, doc.dom.descendants(Dom::ROOT), selector, &doc.state())
 }
 
 /// Sets (or with an empty value removes) one property in a `style` attribute.
@@ -437,9 +433,10 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
         "query",
         |c: C, p: i32, n: i32| -> Result<i32, Error> {
             let sel = read_str(&c, p, n)?;
-            Ok(select(&c.data().doc, &sel)
-                .first()
-                .map_or(-1, |&n| n as i32))
+            Ok(match select(&c.data().doc, &sel) {
+                Some(found) => found.first().map_or(-1, |&n| n as i32),
+                None => -2,
+            })
         },
     )?;
     l.func_wrap(
@@ -447,7 +444,9 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
         "query_all",
         |mut c: C, p: i32, n: i32, out: i32, max: i32| -> Result<i32, Error> {
             let sel = read_str(&c, p, n)?;
-            let found = select(&c.data().doc, &sel);
+            let Some(found) = select(&c.data().doc, &sel) else {
+                return Ok(-1);
+            };
             let count = found.len().min(max.max(0) as usize);
             let bytes: Vec<u8> = found[..count]
                 .iter()
@@ -467,14 +466,11 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             let sel = read_str(&c, p, n)?;
             let doc = &c.data().doc;
             let state = doc.state();
-            let found: Vec<NodeId> = match node(doc, root) {
-                Some(r) => doc
-                    .dom
-                    .descendants(r)
-                    .into_iter()
-                    .filter(|&d| d != r && css::matches(&doc.dom, d, &sel, &state))
-                    .collect(),
-                None => Vec::new(),
+            let under = node(doc, root).map_or(Vec::new(), |r| {
+                doc.dom.descendants(r).into_iter().skip(1).collect()
+            });
+            let Some(found) = css::query(&doc.dom, under, &sel, &state) else {
+                return Ok(-1);
             };
             let count = found.len().min(max.max(0) as usize);
             let bytes: Vec<u8> = found[..count]
@@ -488,7 +484,8 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             Ok(found.len() as i32)
         },
     )?;
-    l.func_wrap("rb", "rect", |c: C, h: i32, which: i32| -> f64 {
+    l.func_wrap("rb", "rect", |mut c: C, h: i32, which: i32| -> f64 {
+        c.data_mut().doc.ensure_layout();
         // Layout geometry from the last layout (logical px, viewport
         // coordinates): 0 x, 1 y, 2 width, 3 height of the border box;
         // 4 width, 5 height of the padding box. Node 0: the viewport.
@@ -916,7 +913,10 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             let sel = read_str(&c, p, n)?;
             let doc = &c.data().doc;
             let state = doc.state();
-            Ok(element(doc, h).is_some_and(|e| css::matches(&doc.dom, e, &sel, &state)) as i32)
+            let Some(found) = css::query(&doc.dom, element(doc, h), &sel, &state) else {
+                return Ok(-1);
+            };
+            Ok(!found.is_empty() as i32)
         },
     )?;
 

@@ -183,6 +183,11 @@
     }
     cloneNode(deep) {
       if (this.nodeType === 3) return wrap(rb.createText(this.textContent));
+      if (this instanceof DocumentFragment) {
+        const f = document.createDocumentFragment();
+        if (deep) for (const c of this.childNodes) f.appendChild(c.cloneNode(true));
+        return f;
+      }
       const holder = wrap(rb.createElement('div'));
       rb.setHtml(holder.__h, deep ? this.outerHTML : this.outerHTML.replace(/>[\s\S]*<\/[^>]+>$/, '></' + this.localName + '>'));
       return holder.firstChild;
@@ -460,6 +465,7 @@
     createEvent(kind) { return new (/custom/i.test(kind) ? CustomEvent : Event)(''); }
     createComment(text) { return this.createTextNode(''); }
     createElementNS(ns, tag) { return this.createElement(String(tag).replace(/^.*:/, '')); }
+    get implementation() { return implementation; }
     get currentScript() { return currentScript; }
     write(...text) { documentWrite(text.join('')); }
     writeln(...text) { documentWrite(text.join('') + '\n'); }
@@ -473,6 +479,8 @@
       return wrap(h);
     }
     createTextNode(text) { return wrap(rb.createText(String(text))); }
+    importNode(node, deep) { return node.cloneNode(!!deep); }
+    adoptNode(node) { node.remove(); return node; }
     createDocumentFragment() {
       const h = rb.createElement('template');
       const f = new DocumentFragment(h);
@@ -624,7 +632,8 @@
   }
 
   function reportError(err) {
-    const msg = err && err.stack ? err.stack : err instanceof Error ? err.name + ': ' + err.message : String(err);
+    const head = err instanceof Error ? err.name + ': ' + err.message : String(err);
+    const msg = err && err.stack && !String(err.stack).startsWith(head) ? head + '\n' + err.stack : (err && err.stack) || head;
     rb.log('Uncaught ' + msg);
   }
   global.__rb_report = reportError;
@@ -1092,22 +1101,65 @@
     text() { return Promise.resolve(this._t); }
   }
 
+  // A document that is not shown (DOMParser, createHTMLDocument): its
+  // elements live detached in the page's DOM; scripts in it never run.
+  function detachedDocument(markup) {
+    const html = document.createElement('html');
+    html.innerHTML = String(markup);
+    let head = html.querySelector('head');
+    if (!head) html.prepend(head = document.createElement('head'));
+    let body = html.querySelector('body');
+    if (!body) {
+      body = document.createElement('body');
+      for (const n of [...html.childNodes]) if (n !== head) body.append(n);
+      html.append(body);
+    }
+    const doc = {
+      nodeType: 9,
+      nodeName: '#document',
+      documentElement: html,
+      head,
+      body,
+      get title() { const t = html.querySelector('title'); return t ? t.textContent : ''; },
+      createElement: (t) => document.createElement(t),
+      createElementNS: (ns, t) => document.createElementNS(ns, t),
+      createTextNode: (t) => document.createTextNode(t),
+      createComment: (t) => document.createComment(t),
+      createDocumentFragment: () => document.createDocumentFragment(),
+      importNode: (n, deep) => n.cloneNode(deep),
+      adoptNode: (n) => n,
+      querySelector: (s) => html.querySelector(s),
+      querySelectorAll: (s) => html.querySelectorAll(s),
+      getElementById: (id) => html.querySelector('[id="' + id + '"]'),
+      getElementsByTagName: (t) => html.getElementsByTagName(t),
+      getElementsByClassName: (c) => html.getElementsByClassName(c),
+      addEventListener() {},
+      removeEventListener() {},
+    };
+    doc.implementation = implementation;
+    return doc;
+  }
+
   class DOMParser {
     parseFromString(text) {
-      const html = document.createElement('html');
-      html.innerHTML = String(text);
-      const doc = {
-        documentElement: html,
-        body: html.querySelector('body') || html,
-        head: html.querySelector('head'),
-        querySelector: (s) => html.querySelector(s),
-        querySelectorAll: (s) => html.querySelectorAll(s),
-        getElementById: (id) => html.querySelector('[id="' + id + '"]'),
-        getElementsByTagName: (t) => html.getElementsByTagName(t),
-      };
-      return doc;
+      return detachedDocument(text);
     }
   }
+
+  const implementation = {
+    createHTMLDocument(title) {
+      const doc = detachedDocument('');
+      if (title !== undefined) {
+        const t = document.createElement('title');
+        t.textContent = String(title);
+        doc.head.append(t);
+      }
+      return doc;
+    },
+    createDocument() { return detachedDocument(''); },
+    createDocumentType(name) { return { nodeType: 10, name: String(name) }; },
+    hasFeature() { return true; },
+  };
 
   // Intl without locale data: enough for formatting numbers and dates.
   const Intl = {
@@ -1197,8 +1249,27 @@
   for (const name of ['load', 'domcontentloaded', 'keydown', 'click']) handlerProperty(global, name);
 
   // Properties reflecting attributes: strings, then booleans.
+  // <template>.content: a fragment with the parsed contents (moved there
+  // on first use); `content` of other elements is the attribute (<meta>).
+  const templateContents = new WeakMap();
+  Object.defineProperty(Element.prototype, 'content', {
+    configurable: true,
+    get() {
+      if (this.localName !== 'template' || this instanceof DocumentFragment) {
+        return this.getAttribute('content') || '';
+      }
+      let f = templateContents.get(this);
+      if (!f) {
+        f = document.createDocumentFragment();
+        for (const c of [...this.childNodes]) f.appendChild(c);
+        templateContents.set(this, f);
+      }
+      return f;
+    },
+    set(v) { this.setAttribute('content', v); },
+  });
   for (const [prop, attr] of [['rel'], ['as'], ['media'], ['crossOrigin', 'crossorigin'], ['charset'],
-    ['integrity'], ['alt'], ['target'], ['lang'], ['dir'], ['placeholder'], ['content'],
+    ['integrity'], ['alt'], ['target'], ['lang'], ['dir'], ['placeholder'],
     ['httpEquiv', 'http-equiv'], ['htmlFor', 'for'], ['download'], ['referrerPolicy', 'referrerpolicy'],
     ['loading'], ['srcset'], ['sizes'], ['action'], ['method'], ['nonce'], ['role'], ['autocomplete'],
     ['decoding'], ['fetchPriority', 'fetchpriority'], ['enctype'], ['accept'], ['pattern'], ['label']]) {

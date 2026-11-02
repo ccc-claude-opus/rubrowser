@@ -41,8 +41,8 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 
 | 函式 | 說明 |
 |---|---|
-| `query(sel_ptr, sel_len) -> i32` | 第一個符合 CSS 選擇器的元素 |
-| `query_all(sel_ptr, sel_len, out_ptr, max) -> i32` | 把最多 `max` 個 handle（`i32` 陣列）寫到 `out_ptr`，回傳總數 |
+| `query(sel_ptr, sel_len) -> i32` | 第一個符合 CSS 選擇器的元素；沒有回傳 -1，選擇器無效（含不認得的偽類）回傳 -2 |
+| `query_all(sel_ptr, sel_len, out_ptr, max) -> i32` | 把最多 `max` 個 handle（`i32` 陣列）寫到 `out_ptr`，回傳總數；選擇器無效回傳 -1 |
 | `query_within(root, sel_ptr, sel_len, out_ptr, max) -> i32` | 同上，但只找 `root` 底下的節點（`root` 不在文件中也可以） |
 | `rect(h, which) -> f64` | 上次排版的幾何（邏輯像素、相對於視窗）：0 x、1 y、2 寬、3 高（border box），4 寬、5 高（padding box）；`h = 0` 是視窗 |
 | `http(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, type_ptr, type_len) -> i32` | 發出 HTTP 請求（只限同源），回傳請求編號；完成時瀏覽器呼叫匯出的 `rb_http(id, status)`（`status` 0 表示失敗） |
@@ -53,7 +53,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `special(which) -> i32` | 0 document、1 `<html>`、2 `<head>`、3 `<body>` |
 | `node_type(h) -> i32` | 1 元素、3 文字、8 註解、9 文件、-1 無效 |
 | `tag_name(h, ptr, cap) -> i32` | 小寫標籤名 |
-| `matches(h, sel_ptr, sel_len) -> i32` | 是否符合選擇器 |
+| `matches(h, sel_ptr, sel_len) -> i32` | 是否符合選擇器（1 / 0）；選擇器無效回傳 -1 |
 
 ### 內容與屬性
 

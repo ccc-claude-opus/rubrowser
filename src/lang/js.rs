@@ -94,6 +94,13 @@ fn int(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<i32> {
     args.get_or_undefined(i).to_i32(ctx)
 }
 
+/// The `SyntaxError` of `querySelector` & co. for an invalid selector.
+fn invalid_selector(s: &str) -> boa_engine::JsError {
+    boa_engine::JsNativeError::syntax()
+        .with_message(format!("'{s}' is not a valid selector"))
+        .into()
+}
+
 fn num(args: &[JsValue], i: usize, ctx: &mut Context) -> JsResult<f64> {
     args.get_or_undefined(i).to_number(ctx)
 }
@@ -120,7 +127,11 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
     vec![
         ("query", 1, |_, a, c| {
             let s = text(a, 0, c)?;
-            Ok(unsafe { ffi::query(s.as_ptr(), s.len()) }.into())
+            let h = unsafe { ffi::query(s.as_ptr(), s.len()) };
+            if h == -2 {
+                return Err(invalid_selector(&s));
+            }
+            Ok(h.into())
         }),
         ("queryAll", 1, |_, a, c| {
             let s = text(a, 0, c)?;
@@ -128,7 +139,11 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             loop {
                 let n = unsafe {
                     ffi::query_all(s.as_ptr(), s.len(), out.as_mut_ptr(), out.len() as i32)
-                } as usize;
+                };
+                if n < 0 {
+                    return Err(invalid_selector(&s));
+                }
+                let n = n as usize;
                 if n <= out.len() {
                     out.truncate(n);
                     break;
@@ -150,7 +165,11 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
                         out.as_mut_ptr(),
                         out.len() as i32,
                     )
-                } as usize;
+                };
+                if n < 0 {
+                    return Err(invalid_selector(&s));
+                }
+                let n = n as usize;
                 if n <= out.len() {
                     out.truncate(n);
                     break;
@@ -217,7 +236,10 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
         }),
         ("matches", 2, |_, a, c| {
             let (h, s) = (int(a, 0, c)?, text(a, 1, c)?);
-            Ok((unsafe { ffi::matches(h, s.as_ptr(), s.len()) } != 0).into())
+            match unsafe { ffi::matches(h, s.as_ptr(), s.len()) } {
+                r if r < 0 => Err(invalid_selector(&s)),
+                r => Ok((r != 0).into()),
+            }
         }),
         ("getText", 1, |_, a, c| {
             let h = int(a, 0, c)?;
@@ -525,12 +547,13 @@ fn run_module(url: &str, ctx: &mut Context) {
     match result {
         Ok(p) => {
             if let PromiseState::Rejected(e) = p.state() {
-                log(&format!("Uncaught {} ({url})", e.display()));
+                report(JsError::from_opaque(e), ctx);
+                log(&format!("  in module {url}"));
             }
         }
         Err(e) => {
-            let value = e.into_opaque(ctx).unwrap_or_default();
-            log(&format!("Uncaught {} ({url})", value.display()));
+            report(e, ctx);
+            log(&format!("  in module {url}"));
         }
     }
 }
