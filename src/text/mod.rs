@@ -11,6 +11,8 @@ use fontdue::{Font, FontSettings};
 
 use crate::gfx::{Canvas, Color};
 
+mod emoji;
+
 /// Generic font families available to CSS.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Family {
@@ -168,6 +170,9 @@ pub struct Fonts {
     face_bytes: RefCell<HashMap<usize, Rc<[u8]>>>,
     /// Shaped right-to-left runs: (face, text, size in 1/4 px) → glyphs.
     shaped: RefCell<HashMap<(usize, String, u32), Rc<Shaped>>>,
+    /// The system's color emoji font, loaded on first use.
+    emoji: OnceCell<Option<emoji::EmojiFont>>,
+    emoji_glyphs: RefCell<emoji::EmojiCache>,
 }
 
 /// A shaped run: the face that draws it and its glyphs in visual order.
@@ -425,8 +430,35 @@ impl Fonts {
         }
     }
 
+    /// The color emoji font, if `text` needs it and there is one.
+    fn emoji_for(&self, text: &str) -> Option<&emoji::EmojiFont> {
+        if !emoji::has_emoji(text) {
+            return None;
+        }
+        self.emoji.get_or_init(emoji::EmojiFont::load).as_ref()
+    }
+
     /// Advance of each char of `text` at `size`, including kerning.
     pub fn advances(&self, key: FontKey, size: f32, text: &str) -> Vec<f32> {
+        if let Some(font) = self.emoji_for(text) {
+            // An emoji run's whole advance goes to its first character.
+            let mut out = Vec::new();
+            for (is_emoji, r) in emoji::runs(text) {
+                let part = &text[r];
+                if is_emoji {
+                    let w: f32 = font.shape(size, part).iter().map(|g| g.1).sum();
+                    out.push(w);
+                    out.extend(std::iter::repeat_n(0.0, part.chars().count() - 1));
+                } else {
+                    out.extend(self.plain_advances(key, size, part));
+                }
+            }
+            return out;
+        }
+        self.plain_advances(key, size, text)
+    }
+
+    fn plain_advances(&self, key: FontKey, size: f32, text: &str) -> Vec<f32> {
         let mut out = Vec::with_capacity(text.len());
         let mut prev: Option<(char, usize)> = None;
         for c in text.chars() {
@@ -446,6 +478,9 @@ impl Fonts {
 
     /// Width of `text` at `size`.
     pub fn measure(&self, key: FontKey, size: f32, text: &str) -> f32 {
+        if self.emoji_for(text).is_some() {
+            return self.advances(key, size, text).iter().sum();
+        }
         if self.needs_shaping(key, text)
             && let Some(s) = self.shape(key, size, text)
         {
@@ -467,6 +502,24 @@ impl Fonts {
         text: &str,
         color: Color,
     ) -> f32 {
+        if let Some(font) = self.emoji_for(text) {
+            let mut pen = x;
+            for (is_emoji, r) in emoji::runs(text) {
+                let part = &text[r];
+                if !is_emoji {
+                    pen += self.draw(canvas, key, size, pen, baseline, part, color);
+                    continue;
+                }
+                let mut cache = self.emoji_glyphs.borrow_mut();
+                for (gid, adv) in font.shape(size, part) {
+                    if let Some(g) = font.glyph(&mut cache, gid, size) {
+                        g.draw(canvas, pen, baseline);
+                    }
+                    pen += adv;
+                }
+            }
+            return pen - x;
+        }
         let size_q = (size * 4.0).round() as u32;
         if self.needs_shaping(key, text)
             && let Some(shaped) = self.shape(key, size, text)

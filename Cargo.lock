@@ -2348,6 +2348,7 @@ dependencies = [
  "getrandom 0.4.3",
  "html5ever",
  "image",
+ "memmap2",
  "resvg",
  "rustybuzz",
  "softbuffer",
