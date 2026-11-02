@@ -214,7 +214,16 @@ impl Painter<'_> {
         }
         if let Some(il) = &b.inline {
             let (cx, cy) = b.content_offset();
-            self.inline(c, il, r.x + cx, r.y + cy - sy);
+            // `text-overflow: ellipsis` cuts lines at the content box's end.
+            let end = (clips && style.ellipsis && !style.rtl).then(|| {
+                let content_w = b.rect.w
+                    - b.padding[cs::LEFT]
+                    - b.padding[cs::RIGHT]
+                    - b.border[cs::LEFT]
+                    - b.border[cs::RIGHT];
+                (r.x + cx + content_w, style)
+            });
+            self.inline(c, il, r.x + cx, r.y + cy - sy, end);
         }
         // In-flow children first, then positioned ones on top by z-index.
         let mut positioned = Vec::new();
@@ -1122,10 +1131,30 @@ impl Painter<'_> {
         i
     }
 
-    fn inline(&self, c: &mut Canvas, il: &crate::layout::inline::InlineLayout, x: f32, y: f32) {
+    /// Paints inline content at `x, y`. With `ellipsis` (the end edge and
+    /// the block's style), lines reaching past the edge are cut and end in
+    /// `…`.
+    fn inline(
+        &self,
+        c: &mut Canvas,
+        il: &crate::layout::inline::InlineLayout,
+        x: f32,
+        y: f32,
+        ellipsis: Option<(f32, &Style)>,
+    ) {
         for line in &il.lines {
             let baseline = y + line.top + line.baseline;
-            for item in &line.items {
+            let cut;
+            let items = match ellipsis {
+                Some((end, block)) if x + line.width > end + 0.5 => {
+                    cut = self.cut_line(&line.items, x, end, block);
+                    let (items, at) = &cut;
+                    self.text(c, block, *at, baseline, "…", block.color);
+                    items
+                }
+                _ => &line.items,
+            };
+            for item in items {
                 match item {
                     Placed::Text {
                         node,
@@ -1189,6 +1218,62 @@ impl Painter<'_> {
                 }
             }
         }
+    }
+
+    /// The items of a line cut so `…` (in `block`'s font) fits before
+    /// `end`, and where the `…` goes.
+    fn cut_line(&self, items: &[Placed], x: f32, end: f32, block: &Style) -> (Vec<Placed>, f32) {
+        let mark = self.fonts.measure(block.font(), block.font_size, "…");
+        let limit = end - mark;
+        let mut out = Vec::new();
+        let mut at = x;
+        for item in items {
+            match item {
+                Placed::Text { node, x: tx, width, text, shift, .. } => {
+                    if x + tx + width <= limit {
+                        out.push(item.clone());
+                        at = x + tx + width;
+                        continue;
+                    }
+                    let st = self.style(*node).unwrap_or(block);
+                    let mut kept = String::new();
+                    let mut w = 0.0;
+                    for ch in text.chars() {
+                        let mut next = kept.clone();
+                        next.push(ch);
+                        let nw = self.fonts.measure(st.font(), st.font_size, &next);
+                        if x + tx + nw > limit {
+                            break;
+                        }
+                        (kept, w) = (next, nw);
+                    }
+                    // Spaces before the ellipsis are dropped.
+                    let trimmed = kept.trim_end();
+                    if trimmed.len() < kept.len() {
+                        w = self.fonts.measure(st.font(), st.font_size, trimmed);
+                    }
+                    if !trimmed.is_empty() {
+                        out.push(Placed::Text {
+                            node: *node,
+                            x: *tx,
+                            width: w,
+                            text: trimmed.to_string(),
+                            shift: *shift,
+                            space: 0.0,
+                        });
+                    }
+                    return (out, x + tx + w);
+                }
+                Placed::Atomic { x: ax, width, .. } => {
+                    if x + ax + width > limit {
+                        return (out, at);
+                    }
+                    out.push(item.clone());
+                    at = x + ax + width;
+                }
+            }
+        }
+        (out, at)
     }
 
     fn text(&self, c: &mut Canvas, st: &Style, x: f32, baseline: f32, text: &str, color: Rgba) {

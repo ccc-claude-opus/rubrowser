@@ -307,6 +307,9 @@ pub struct Style {
     pub translate: (Dim, Dim),
     pub rotate: f32,
     pub scale: (f32, f32),
+    /// `text-overflow: ellipsis` (lines cut at the end of a clipping box
+    /// end in `…`).
+    pub ellipsis: bool,
     pub transform: Rc<[super::transform::Op]>,
     pub transform_origin: (Dim, Dim),
     /// `aspect-ratio` (width / height).
@@ -409,6 +412,7 @@ impl Default for Style {
             translate: (Dim::Px(0.0), Dim::Px(0.0)),
             rotate: 0.0,
             scale: (1.0, 1.0),
+            ellipsis: false,
             transform: Rc::new([]),
             transform_origin: (Dim::Percent(50.0), Dim::Percent(50.0)),
             aspect_ratio: None,
@@ -861,6 +865,12 @@ impl Style {
                 }
             }
             "rotate" => set(&mut self.rotate, super::transform::parse_rotate(v)),
+            // One value, or `start end`: the end side is what gets cut.
+            "text-overflow" => match tokens(v).last().copied() {
+                Some("ellipsis") => self.ellipsis = true,
+                Some("clip") => self.ellipsis = false,
+                _ => {}
+            },
             "scale" => set(&mut self.scale, super::transform::parse_scale(v)),
             "transform-origin" => {
                 let t = tokens(v);

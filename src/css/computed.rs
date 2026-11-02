@@ -189,6 +189,7 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
             VerticalAlign::Super => "super",
         }
         .into(),
+        "text-overflow" => if s.ellipsis { "ellipsis" } else { "clip" }.into(),
         "direction" => if s.rtl { "rtl" } else { "ltr" }.into(),
         "cursor" => match s.cursor {
             Cursor::Auto => "auto",

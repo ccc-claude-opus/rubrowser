@@ -1685,6 +1685,25 @@ mod tests {
     }
 
     #[test]
+    fn text_overflow_ellipsis_cuts_the_line() {
+        let paint = |extra: &str| {
+            let html = format!(
+                r#"<body style="margin:0;background:#fff"><p style="margin:0;width:60px;white-space:nowrap;overflow:hidden;font-size:20px;{extra}">ab ab ab ab ab ab</p>"#
+            );
+            let (d, fonts) = doc(&html, 100.0, 40.0);
+            let mut c = Canvas::new(100, 40);
+            d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+            c.pixels().to_vec()
+        };
+        let (clip, cut) = (paint(""), paint("text-overflow:ellipsis"));
+        assert_ne!(clip, cut);
+        // Nothing is painted past the box either way.
+        for px in [&clip, &cut] {
+            assert!((0..40).all(|y| px[y * 100 + 70] == 0xffffff));
+        }
+    }
+
+    #[test]
     fn transforms_rotate_scale_and_hide() {
         let (d, fonts) = doc(
             r#"<body style="margin:0;background:#fff">
