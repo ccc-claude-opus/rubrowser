@@ -18,6 +18,8 @@ use std::rc::Rc;
 use boa_engine::builtins::promise::PromiseState;
 use boa_engine::context::time::JsInstant;
 use boa_engine::context::{Clock, HostHooks};
+use boa_engine::error::RuntimeLimitError;
+use boa_engine::job::SimpleJobExecutor;
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::JsArray;
@@ -35,6 +37,11 @@ thread_local! {
     static CONTEXT: RefCell<Option<Box<Context>>> = const { RefCell::new(None) };
     /// Buffers handed out by `rb_alloc`, freed after `rb_eval`.
     static BUFFERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+    /// Set while a call runs: still set at the next call means the browser
+    /// stopped that one (it ran too long).
+    static RUNNING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Cancels the pending jobs (promise reactions) of the job queue.
+    static CANCEL_JOBS: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
 }
 
 /// Time comes from the browser; there is no OS clock in the sandbox.
@@ -42,6 +49,11 @@ struct HostClock;
 
 impl Clock for HostClock {
     fn now(&self) -> JsInstant {
+        // The job queue reads the clock between jobs: a safe point to drop
+        // the jobs of a call the browser interrupted.
+        if unsafe { ffi::interrupted() } != 0 {
+            CANCEL_JOBS.with(|c| c.borrow().as_ref().map(|cancel| cancel()));
+        }
         let ms = unsafe { ffi::now() }.max(0.0);
         let secs = (ms / 1000.0) as u64;
         let nanos = ((ms - secs as f64 * 1000.0) * 1_000_000.0) as u32;
@@ -434,6 +446,14 @@ fn log(msg: &str) {
 /// Reports an uncaught exception through the prelude (for stack traces),
 /// or directly if that fails.
 fn report(err: JsError, ctx: &mut Context) {
+    // Engine limits are not exceptions; their backtrace shows where (a
+    // script the browser interrupted is reported by the browser).
+    if err.as_engine().is_some() {
+        if unsafe { ffi::interrupted() } == 0 {
+            log(&format!("Uncaught {err}"));
+        }
+        return;
+    }
     let value = err.into_opaque(ctx).unwrap_or_default();
     let reporter = ctx.global_object().get(js_string!("__rb_report"), ctx);
     let reported = reporter
@@ -458,10 +478,18 @@ fn with_context(f: impl FnOnce(&mut Context)) {
         // from the runtime's exports, which the browser never calls while
         // another is running.
         let ctx = unsafe { &mut *ctx };
+        if RUNNING.with(|r| r.replace(true)) {
+            // The last call was stopped: drop what it left queued (a chain
+            // of promise reactions that never ends, typically), as when a
+            // browser stops an unresponsive script.
+            CANCEL_JOBS.with(|c| c.borrow().as_ref().map(|cancel| cancel()));
+            let _ = ctx.run_jobs();
+        }
         f(ctx);
         if let Err(e) = ctx.run_jobs() {
             report(e, ctx);
         }
+        RUNNING.with(|r| r.set(false));
     }
 }
 
@@ -572,7 +600,19 @@ fn run_module(url: &str, ctx: &mut Context) {
 
 /// `rb_init`: creates the engine and the browser environment.
 pub fn init() {
+    // A panic ends the runtime (a trap); its message goes to the console.
+    std::panic::set_hook(Box::new(|info| {
+        log(&format!("JavaScript runtime panicked: {info}"))
+    }));
+    let jobs = Rc::new(SimpleJobExecutor::new());
+    let token = jobs.get_cancellation_token();
+    CANCEL_JOBS.with(|c| {
+        *c.borrow_mut() = Some(Box::new(move || {
+            token.store(true, std::sync::atomic::Ordering::Relaxed)
+        }))
+    });
     let mut ctx = Context::builder()
+        .job_executor(jobs)
         .clock(Rc::new(HostClock))
         .host_hooks(Rc::new(Hooks))
         .module_loader(MODULES.with(Rc::clone))
@@ -580,7 +620,15 @@ pub fn init() {
         .expect("create JavaScript context");
     let mut rb = ObjectInitializer::new(&mut ctx);
     for (name, argc, f) in natives() {
-        rb.function(NativeFunction::from_fn_ptr(f), JsString::from(name), argc);
+        // Every call into the browser is a safe point to stop a script the
+        // browser interrupted: an engine error that scripts cannot catch.
+        let checked = NativeFunction::from_copy_closure(move |this, args, ctx| {
+            if unsafe { ffi::interrupted() } != 0 {
+                return Err(RuntimeLimitError::LoopIteration.into());
+            }
+            f(this, args, ctx)
+        });
+        rb.function(checked, JsString::from(name), argc);
     }
     let rb = rb.build();
     ctx.register_global_property(js_string!("__rb"), rb, Attribute::all())
@@ -638,6 +686,12 @@ pub unsafe fn eval(src: *const u8, len: usize, name: *const u8, name_len: usize)
     }
     with_context(|ctx| {
         if let Err(e) = ctx.eval(Source::from_bytes(&source)) {
+            if e.as_engine().is_some() {
+                if unsafe { ffi::interrupted() } == 0 {
+                    log(&format!("Uncaught {e} ({name})"));
+                }
+                return;
+            }
             let value = e.into_opaque(ctx).unwrap_or_default();
             log(&format!("Uncaught {} ({name})", value.display()));
         }

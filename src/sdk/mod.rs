@@ -88,6 +88,9 @@ imports! {
     fn log(p: *const u8, n: usize);
     fn now() -> f64;
     fn wall_time() -> f64;
+    // Whether the browser asked the running call to stop (it ran too
+    // long): runtimes then end it at their next safe point.
+    fn interrupted() -> i32;
     fn node_type(h: i32) -> i32;
     fn tag_name(h: i32, p: *mut u8, cap: usize) -> i32;
     fn relative(h: i32, which: i32) -> i32;

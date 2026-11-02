@@ -9,7 +9,7 @@
 
 use wasmi::{
     Caller, Config, Engine, Error, Linker, Memory, Module, Store, StoreLimits, StoreLimitsBuilder,
-    TrapCode, TypedFunc,
+    TrapCode, TypedFunc, TypedResumableCall, WasmParams, WasmResults,
 };
 
 use crate::css;
@@ -21,6 +21,16 @@ pub const FUEL_PER_CALL: u64 = 30_000_000;
 /// Budget for language runtimes such as `js.wasm`, which interpret the
 /// page's source and so need many more wasm instructions per call.
 pub const RUNTIME_FUEL_PER_CALL: u64 = 10_000_000_000;
+/// Instructions taken to stand for one millisecond: while a call runs,
+/// the clocks scripts read (`performance.now()`, `Date.now()`) advance by
+/// the fuel it used, so time passes inside long calls (deterministically)
+/// and loops that wait for a deadline end.
+const FUEL_PER_MS: f64 = 2_500_000.0;
+/// Most extra fuel a call gets after running out, to stop at a safe point:
+/// a language runtime is told (`interrupted`) and ends the script cleanly,
+/// rather than being cut off somewhere inside its own code (in the middle
+/// of a garbage collection, say), which could leave it broken.
+const GRACE_FUEL: u64 = 500_000_000;
 /// Maximum linear memory of a script.
 pub const MAX_MEMORY: usize = 64 << 20;
 /// Longest string a script may pass to the browser.
@@ -111,6 +121,12 @@ struct State {
     doc: Document,
     listeners: Vec<Listener>,
     now: f64,
+    /// Fuel at the start of the current call.
+    fuel_start: u64,
+    /// The current call ran out of fuel and should stop.
+    interrupted: bool,
+    /// The latest time a script was told (clocks never go back).
+    last_time: f64,
     out: Output,
     limits: StoreLimits,
     event: Option<EventInfo>,
@@ -160,6 +176,9 @@ impl Script {
             doc: placeholder(),
             listeners: Vec::new(),
             now,
+            fuel_start: fuel,
+            interrupted: false,
+            last_time: now,
             out: Output::default(),
             limits: StoreLimitsBuilder::new()
                 .memory_size(limits.memory)
@@ -196,7 +215,7 @@ impl Script {
             s.eval_fn = instance.get_typed_func(&s.store, "rb_eval").ok();
             s.memory = instance.get_memory(&s.store, "memory");
             if let Ok(init) = instance.get_typed_func::<(), ()>(&s.store, "rb_init") {
-                init.call(&mut s.store, ()).map_err(describe)?;
+                call(&mut s.store, init, ())?;
             }
             Ok(())
         })?;
@@ -215,6 +234,8 @@ impl Script {
         s.now = now;
         std::mem::swap(&mut s.doc, doc);
         let fuel = self.budget.map_or(self.fuel, |b| b.min(self.fuel));
+        self.store.data_mut().fuel_start = fuel;
+        self.store.data_mut().interrupted = false;
         let r = match self.store.set_fuel(fuel) {
             Ok(()) => f(self),
             Err(e) => Err(e.to_string()),
@@ -225,6 +246,11 @@ impl Script {
         }
         std::mem::swap(&mut self.store.data_mut().doc, doc);
         r
+    }
+
+    /// Sets the fuel each call may use.
+    pub fn set_call_fuel(&mut self, fuel: u64) {
+        self.fuel = fuel;
     }
 
     /// Limits the total fuel of all following calls to `budget` (`None`:
@@ -259,7 +285,7 @@ impl Script {
             return Ok(());
         };
         self.store.data_mut().event = Some(event.clone());
-        let r = self.with_doc(doc, now, |s| f.call(&mut s.store, id).map_err(describe));
+        let r = self.with_doc(doc, now, |s| call(&mut s.store, f, id));
         self.store.data_mut().event = None;
         r
     }
@@ -283,9 +309,7 @@ impl Script {
         };
         self.with_doc(doc, now, |s| {
             let put = |s: &mut Script, text: &str| -> Result<i32, String> {
-                let ptr = alloc
-                    .call(&mut s.store, text.len() as i32)
-                    .map_err(describe)?;
+                let ptr = call(&mut s.store, alloc, text.len() as i32)?;
                 let memory = s
                     .memory
                     .ok_or_else(|| "runtime does not export memory".to_string())?;
@@ -296,11 +320,11 @@ impl Script {
             };
             let src = put(s, source)?;
             let file = put(s, name)?;
-            eval.call(
+            call(
                 &mut s.store,
+                eval,
                 (src, source.len() as i32, file, name.len() as i32),
             )
-            .map_err(describe)
         })
     }
 
@@ -309,7 +333,7 @@ impl Script {
         let Some(f) = self.timer_fn else {
             return Ok(());
         };
-        self.with_doc(doc, now, |s| f.call(&mut s.store, id).map_err(describe))
+        self.with_doc(doc, now, |s| call(&mut s.store, f, id))
     }
 
     /// Delivers the response to HTTP request `id`: `status` (0 when the
@@ -327,9 +351,7 @@ impl Script {
             return Ok(());
         };
         self.store.data_mut().response = Some((id, body));
-        let r = self.with_doc(doc, now, |s| {
-            f.call(&mut s.store, (id, status)).map_err(describe)
-        });
+        let r = self.with_doc(doc, now, |s| call(&mut s.store, f, (id, status)));
         self.store.data_mut().response = None;
         r
     }
@@ -347,8 +369,52 @@ fn placeholder() -> Document {
 /// The error of a script stopped for running too long.
 pub const TOO_LONG: &str = "the script ran too long without returning (possible infinite loop)";
 
+/// Calls `f`. When it runs out of fuel it gets some more (a quarter of its
+/// fuel, at most [`GRACE_FUEL`]) and is
+/// marked interrupted; running out again stops it. A call that ends after
+/// being interrupted counts as stopped for running too long.
+fn call<P: WasmParams, R: WasmResults>(
+    store: &mut Store<State>,
+    f: TypedFunc<P, R>,
+    params: P,
+) -> Result<R, String> {
+    let mut run = f.call_resumable(&mut *store, params).map_err(describe)?;
+    loop {
+        match run {
+            TypedResumableCall::Finished(r) if !store.data().interrupted => return Ok(r),
+            TypedResumableCall::Finished(_) => return Err(TOO_LONG.into()),
+            TypedResumableCall::HostTrap(t) => return Err(describe_ref(t.host_error())),
+            TypedResumableCall::OutOfFuel(_) if store.data().interrupted => {
+                return Err(TOO_LONG.into());
+            }
+            TypedResumableCall::OutOfFuel(t) => {
+                store.data_mut().interrupted = true;
+                let grace = (store.data().fuel_start / 4).min(GRACE_FUEL);
+                store.set_fuel(grace).map_err(|e| e.to_string())?;
+                run = t.resume(&mut *store).map_err(describe)?;
+            }
+        }
+    }
+}
+
+/// The time (ms) a script sees now: the call's start time plus the fuel
+/// it has used so far, never earlier than a time it saw before.
+fn script_time(c: &mut Caller<'_, State>) -> f64 {
+    let used = c
+        .data()
+        .fuel_start
+        .saturating_sub(c.get_fuel().unwrap_or(0));
+    let t = (c.data().now + used as f64 / FUEL_PER_MS).max(c.data().last_time);
+    c.data_mut().last_time = t;
+    t
+}
+
 /// Turns a wasmi error into a message for the console.
 fn describe(e: Error) -> String {
+    describe_ref(&e)
+}
+
+fn describe_ref(e: &Error) -> String {
     match e.as_trap_code() {
         Some(TrapCode::OutOfFuel) => TOO_LONG.into(),
         Some(TrapCode::UnreachableCodeReached) => "the script panicked".into(),
@@ -885,9 +951,12 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             Ok(())
         },
     )?;
-    l.func_wrap("rb", "now", |c: C| -> f64 { c.data().now })?;
-    l.func_wrap("rb", "wall_time", |c: C| -> f64 {
-        c.data().now + c.data().wall_offset
+    l.func_wrap("rb", "now", |mut c: C| -> f64 { script_time(&mut c) })?;
+    l.func_wrap("rb", "interrupted", |c: C| -> i32 {
+        c.data().interrupted as i32
+    })?;
+    l.func_wrap("rb", "wall_time", |mut c: C| -> f64 {
+        script_time(&mut c) + c.data().wall_offset
     })?;
 
     // ----- ABI v1: tree navigation ---------------------------------------

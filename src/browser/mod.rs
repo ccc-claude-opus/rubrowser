@@ -1590,14 +1590,23 @@ impl Browser {
 
     /// Reports a script failure and stops that script.
     fn script_failed(&mut self, i: usize, si: usize, err: &str, host: &mut dyn Host) {
-        host.log(&format!("script error in {}: {err}", self.tabs[i].doc.url));
         // A language runtime survives one of its scripts being stopped for
-        // time; it fails for good if that left it broken.
-        if err == crate::script::TOO_LONG
+        // time (what it did before stays done, its timers included); it
+        // fails for good if that left it broken.
+        let survives = err == crate::script::TOO_LONG
             && self.tabs[i].scripts[si]
                 .as_ref()
-                .is_some_and(Script::is_runtime)
-        {
+                .is_some_and(Script::is_runtime);
+        if survives {
+            self.after_script(i, si, host);
+        } else if let Some(Some(script)) = self.tabs[i].scripts.get_mut(si) {
+            // What it logged before failing (a panic's message).
+            for msg in script.take_output().logs {
+                host.log(&msg);
+            }
+        }
+        host.log(&format!("script error in {}: {err}", self.tabs[i].doc.url));
+        if survives {
             return;
         }
         self.tabs[i].scripts[si] = None;
@@ -3870,10 +3879,18 @@ mod tests {
         b.navigate("https://js.test/index.html", &mut h);
         let id = h.inner.fetched.last().unwrap().0;
         let page = r#"<script>
-              setTimeout(() => { let n = 0; for (;;) n++; }, 1);
+              // A chain of promise reactions that never ends: stopped, and
+              // dropped so later calls do not resume it.
+              setTimeout(() => { console.log('before'); (async () => { for (;;) await null; })(); }, 1);
+              // A loop that keeps calling into the browser.
+              setTimeout(() => { for (;;) document.body.firstChild; }, 2);
               setTimeout(() => console.log('still running', [1, 2].map(x => x * 2).join()), 5);
             </script>"#;
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        // A smaller per-call limit keeps the test quick.
+        let t = &mut b.tabs[b.active];
+        let si = t.runtimes[JS_MIME];
+        t.scripts[si].as_mut().unwrap().set_call_fuel(300_000_000);
         b.render(10.0, &mut h);
         assert!(
             h.logs.iter().any(|l| l.contains("ran too long")),
@@ -3885,6 +3902,64 @@ mod tests {
             "{:?}",
             h.logs
         );
+        // What it logged before it was stopped is kept.
+        assert!(h.logs.contains(&"before".to_string()), "{:?}", h.logs);
+        assert_eq!(
+            h.logs.iter().filter(|l| l.contains("ran too long")).count(),
+            2,
+            "{:?}",
+            h.logs
+        );
+    }
+
+    #[test]
+    fn channels_clocks_and_dom_exceptions() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://www.chan.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              const log = (s) => console.log(s);
+              // Time passes while a script runs.
+              const t0 = performance.now(), d0 = Date.now();
+              let spins = 0;
+              while (performance.now() - t0 < 2) spins++;
+              log('clock ' + (spins > 0) + ' ' + (Date.now() >= d0));
+              const ch = new MessageChannel();
+              ch.port2.onmessage = (e) => log('port ' + e.data.n);
+              ch.port1.postMessage({ n: 1 });
+              log('sync first');
+              const a = new BroadcastChannel('x'), b2 = new BroadcastChannel('x');
+              b2.addEventListener('message', (e) => log('broadcast ' + e.data));
+              a.onmessage = () => log('sender got its own message');
+              a.postMessage('hi');
+              const ex = new DOMException('gone', 'NotFoundError');
+              log('dom ' + ex.name + ' ' + ex.code + ' ' + ex.message + ' ' + (ex instanceof Error) + ' ' + DOMException.NOT_FOUND_ERR);
+              log('domain ' + document.domain);
+              const ac = new AbortController();
+              ac.signal.addEventListener('abort', () => log('aborted ' + ac.signal.reason.name));
+              ac.abort();
+              AbortSignal.timeout(5).onabort = function () { log('timeout ' + this.reason.name); };
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(20.0, &mut h);
+        let at = |s: &str| h.logs.iter().position(|l| l == s);
+        for want in [
+            "clock true true",
+            "sync first",
+            "port 1",
+            "broadcast hi",
+            "dom NotFoundError 8 gone true 8",
+            "domain www.chan.test",
+            "aborted AbortError",
+            "timeout TimeoutError",
+        ] {
+            assert!(at(want).is_some(), "{want}: {:?}", h.logs);
+        }
+        assert!(at("sync first") < at("port 1"), "messages arrive later");
+        assert!(at("sender got its own message").is_none());
     }
 
     #[test]

@@ -974,17 +974,85 @@
   class AbortSignal extends EventTarget {
     constructor() { super(); this.aborted = false; this.reason = undefined; this.onabort = null; }
     throwIfAborted() { if (this.aborted) throw this.reason; }
-    static timeout() { return new AbortSignal(); }
-    static abort(reason) { const s = new AbortSignal(); s.aborted = true; s.reason = reason; return s; }
-    static any() { return new AbortSignal(); }
+    // Signals an abort: `onabort` and `abort` listeners run once.
+    _abort(reason) {
+      if (this.aborted) return;
+      this.aborted = true;
+      this.reason = reason === undefined ? new DOMException('signal is aborted without reason', 'AbortError') : reason;
+      const e = new Event('abort');
+      if (typeof this.onabort === 'function') call(this.onabort, this, [e]);
+      this.dispatchEvent(e);
+    }
+    static timeout(ms) {
+      const s = new AbortSignal();
+      addTimer(() => s._abort(new DOMException('signal timed out', 'TimeoutError')), ms, [], false);
+      return s;
+    }
+    static abort(reason) { const s = new AbortSignal(); s._abort(reason); return s; }
+    static any(signals) {
+      const s = new AbortSignal();
+      for (const t of signals) {
+        if (t.aborted) { s._abort(t.reason); break; }
+        t.addEventListener('abort', () => s._abort(t.reason));
+      }
+      return s;
+    }
   }
-  // Workers and channels exist but never deliver messages (no threads
-  // here): enough for feature checks and for pages that use them optionally.
+  // DOMException (WebIDL): an Error with a name and its legacy code.
+  const DOM_CODES = { IndexSizeError: 1, HierarchyRequestError: 3, WrongDocumentError: 4, InvalidCharacterError: 5, NoModificationAllowedError: 7, NotFoundError: 8, NotSupportedError: 9, InvalidStateError: 11, SyntaxError: 12, InvalidModificationError: 13, NamespaceError: 14, InvalidAccessError: 15, TypeMismatchError: 17, SecurityError: 18, NetworkError: 19, AbortError: 20, URLMismatchError: 21, QuotaExceededError: 22, TimeoutError: 23, InvalidNodeTypeError: 24, DataCloneError: 25 };
+  class DOMException extends Error {
+    constructor(message = '', name = 'Error') {
+      super(String(message));
+      Object.defineProperty(this, 'name', { value: String(name), configurable: true, writable: true });
+      Object.defineProperty(this, 'code', { value: DOM_CODES[name] || 0, configurable: true });
+    }
+  }
+  for (const [n, c] of Object.entries(DOM_CODES)) {
+    DOMException[n.replace(/Error$/, '').replace(/([a-z])([A-Z])/g, '$1_$2').toUpperCase() + '_ERR'] = c;
+  }
+
+  // Message ports (HTML "Channel messaging"): a message posted on one port
+  // of a channel arrives at the other as a `message` event in a later task
+  // once that port is enabled (`start()`, or setting `onmessage`).
   class MessagePort extends EventTarget {
-    postMessage() {}
-    start() {}
-    close() {}
+    constructor() {
+      super();
+      Object.defineProperty(this, '_q', { value: [], writable: true });
+      this._other = null;
+      this._started = false;
+      this._closed = false;
+      this._onmessage = null;
+    }
+    get onmessage() { return this._onmessage; }
+    set onmessage(f) { this._onmessage = typeof f === 'function' ? f : null; this.start(); }
+    postMessage(data) {
+      const to = this._other;
+      if (this._closed || !to || to._closed) return;
+      const copy = structuredClone(data);
+      addTimer(() => to._deliver(copy), 0, [], false);
+    }
+    _deliver(data) {
+      if (this._closed) return;
+      if (!this._started) { this._q.push(data); return; }
+      const e = new Event('message');
+      e.data = data;
+      e.origin = '';
+      e.ports = [];
+      e.source = null;
+      if (this._onmessage) call(this._onmessage, this, [e]);
+      this.dispatchEvent(e);
+    }
+    start() {
+      if (this._started) return;
+      this._started = true;
+      const q = this._q;
+      this._q = [];
+      for (const d of q) addTimer(() => this._deliver(d), 0, [], false);
+    }
+    close() { this._closed = true; }
   }
+  // Workers exist but never run (no threads here): enough for feature
+  // checks and for pages that use them optionally.
   class Worker extends EventTarget {
     constructor(url) { super(); this.url = String(url); }
     postMessage() {}
@@ -994,20 +1062,45 @@
     constructor(url) { super(); this.port = new MessagePort(); }
   }
   class MessageChannel {
-    constructor() { this.port1 = new MessagePort(); this.port2 = new MessagePort(); }
+    constructor() {
+      this.port1 = new MessagePort();
+      this.port2 = new MessagePort();
+      this.port1._other = this.port2;
+      this.port2._other = this.port1;
+    }
   }
-  class BroadcastChannel extends MessagePort {
-    constructor(name) { super(); this.name = String(name); }
+  // BroadcastChannel: messages reach the other channels of the same name
+  // (in this page; there are no other same-origin contexts).
+  const broadcastChannels = new Set();
+  class BroadcastChannel extends EventTarget {
+    constructor(name) {
+      super();
+      this.name = String(name);
+      this.onmessage = null;
+      this._closed = false;
+      broadcastChannels.add(this);
+    }
+    postMessage(data) {
+      if (this._closed) throw new DOMException('BroadcastChannel is closed', 'InvalidStateError');
+      const copy = structuredClone(data);
+      for (const c of broadcastChannels) {
+        if (c === this || c.name !== this.name) continue;
+        addTimer(() => {
+          if (c._closed) return;
+          const e = new Event('message');
+          e.data = structuredClone(copy);
+          e.origin = location.origin;
+          if (typeof c.onmessage === 'function') call(c.onmessage, c, [e]);
+          c.dispatchEvent(e);
+        }, 0, [], false);
+      }
+    }
+    close() { this._closed = true; broadcastChannels.delete(this); }
   }
 
   class AbortController {
     constructor() { this.signal = new AbortSignal(); }
-    abort(reason) {
-      if (this.signal.aborted) return;
-      this.signal.aborted = true;
-      this.signal.reason = reason === undefined ? new Error('AbortError') : reason;
-      if (typeof this.signal.onabort === 'function') call(this.signal.onabort, this.signal, [{ type: 'abort' }]);
-    }
+    abort(reason) { this.signal._abort(reason); }
   }
 
   // HTTP from scripts goes through the browser (same origin only); the
@@ -1933,6 +2026,13 @@
   }
   // Cookies set by scripts last for the page.
   let cookieJar = '';
+  // document.domain: the host (setting it is ignored, as in browsers
+  // with origin-keyed agent clusters).
+  Object.defineProperty(document, 'domain', {
+    configurable: true,
+    get: () => location.hostname,
+    set: () => {},
+  });
   Object.defineProperty(document, 'cookie', {
     configurable: true,
     get: () => cookieJar,
@@ -2114,6 +2214,7 @@
     Worker,
     SharedWorker,
     MessageChannel,
+    DOMException,
     MessagePort,
     BroadcastChannel,
     Headers,

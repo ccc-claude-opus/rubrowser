@@ -122,8 +122,9 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `history_go(delta: i32)` | 在歷史中移動（-1 是上一頁） |
 | `navigate(ptr, len)` | 以目前頁面為基準開啟網址 |
 | `log(ptr, len)` | 輸出到主控台（原生版為 stderr，網頁版為瀏覽器 console） |
-| `now() -> f64` | 瀏覽器啟動後的毫秒數 |
+| `now() -> f64` | 瀏覽器啟動後的毫秒數（一次呼叫中依已用的 fuel 前進） |
 | `wall_time() -> f64` | 真實時間：Unix epoch 起的毫秒數（`Date.now()`） |
+| `interrupted() -> i32` | 1：這次呼叫已用完 fuel，請在下一個安全點結束（還有一小段寬限的 fuel） |
 
 ## 4. 沙箱
 
