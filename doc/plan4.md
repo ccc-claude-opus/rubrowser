@@ -79,6 +79,7 @@
 | 2 | 完整的 2D `transform`（`rotate`、`scale`、`skew`、`matrix`、`matrix3d` 的 2D 部分）、`rotate` / `scale` 屬性、`transform-origin`；非平移的變換以離屏圖層繪製後雙線性重取樣 |
 | 3 | `text-overflow: ellipsis`：裁切的方塊中超出內容框的行在結尾截斷並加上 `…`（區塊的字型） |
 | 4 | `object-fit`（`fill` / `contain` / `cover` / `none` / `scale-down`）與 `object-position`，內容超出內容框的部分裁掉 |
+| 5 | `<iframe>`：`src` / `srcdoc` 載入巢狀文件（自己的 CSS、圖片、字型），預設 300×150、在 iframe 的內容框中繪製；滾輪捲動 frame；frame 內的連結在 frame 內載入（`_top` / `_parent` 換整頁、其他名稱開新分頁）。frame 內不執行 JS，也不支援 frame 中的 frame |
 
 ### 第二批調查
 

@@ -42,6 +42,8 @@ pub struct Painter<'a> {
     /// The transformed box being painted into its layer (painted without
     /// its transform there).
     pub flat: std::cell::Cell<Option<usize>>,
+    /// Documents of `<iframe>` elements.
+    pub frames: &'a HashMap<NodeId, crate::document::Frame>,
 }
 
 /// What an image layer paints.
@@ -79,7 +81,10 @@ impl Painter<'_> {
 
     /// Paints the whole document with the viewport's top-left at `origin`.
     pub fn paint(&self, c: &mut Canvas, origin: (f32, f32)) {
-        let vp = &self.tree.boxes[LayoutTree::VIEWPORT];
+        // Not laid out yet (a frame whose document just arrived).
+        let Some(vp) = self.tree.boxes.get(LayoutTree::VIEWPORT) else {
+            return;
+        };
         let clip = self.phys(RectF {
             x: origin.0,
             y: origin.1,
@@ -276,6 +281,14 @@ impl Painter<'_> {
             }
             self.image(c, b, node, style, r);
             c.set_round_clip(outer);
+        }
+        if let Some(frame) = b
+            .node
+            .filter(|_| style.visible)
+            .and_then(|n| self.frames.get(&n)?.doc.as_deref())
+        {
+            let (cx, cy) = b.content_offset();
+            frame.paint(c, (r.x + cx, r.y + cy), self.scale, self.fonts);
         }
         if own && style.overflow.scrolls() {
             self.scrollbar(c, r, b.content_h, sy);

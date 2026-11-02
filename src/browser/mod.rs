@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use crate::abi::key;
 use crate::css::ElementState;
-use crate::document::Document;
+use crate::document::{Document, FrameLoad};
 use crate::dom::{Element, NodeId};
 use crate::gfx::Canvas;
 use crate::input::{Cursor, Event, Host, Modifiers};
@@ -74,6 +74,8 @@ enum Request {
     Stylesheet {
         tab: u64,
         serial: u64,
+        /// The `<iframe>` whose document it is for (`None`: the page).
+        frame: Option<NodeId>,
         /// The `<link>`, or `None` for an `@import`.
         link: Option<NodeId>,
         url: String,
@@ -86,13 +88,24 @@ enum Request {
     Image {
         tab: u64,
         serial: u64,
+        frame: Option<NodeId>,
         node: Option<NodeId>,
         src: String,
     },
     Font {
         tab: u64,
         serial: u64,
+        frame: Option<NodeId>,
         font: crate::document::FontRequest,
+    },
+    /// The document of `<iframe>` `node` (`source` as the page requested
+    /// it).
+    Frame {
+        tab: u64,
+        serial: u64,
+        node: NodeId,
+        source: String,
+        url: String,
     },
     /// An HTTP request from script `script` (its request `id`).
     Http {
@@ -478,6 +491,14 @@ struct Tab {
 }
 
 impl Tab {
+    /// The page's document, or that of its `<iframe>` `frame`.
+    fn doc_at(&mut self, frame: Option<NodeId>) -> Option<&mut Document> {
+        match frame {
+            None => Some(&mut self.doc),
+            Some(n) => self.doc.frame_mut(n),
+        }
+    }
+
     /// Number of `<script>`s queued since the page loaded (run or not).
     fn scripts_seen(&self) -> usize {
         self.script_count
@@ -779,6 +800,7 @@ impl Browser {
             let req = Request::Stylesheet {
                 tab: id,
                 serial,
+                frame: None,
                 link: Some(link),
                 url: target.clone(),
             };
@@ -1042,6 +1064,7 @@ impl Browser {
             let req = Request::Stylesheet {
                 tab: id,
                 serial,
+                frame: None,
                 link: Some(link),
                 url: target.clone(),
             };
@@ -1275,6 +1298,7 @@ impl Browser {
             Request::Stylesheet {
                 tab,
                 serial,
+                frame,
                 link,
                 url,
             } => {
@@ -1285,15 +1309,18 @@ impl Browser {
                     return;
                 };
                 let kind = if result.is_ok() { "load" } else { "error" };
-                if let Ok(bytes) = result {
+                if let Ok(bytes) = result
+                    && let Some(doc) = self.tabs[i].doc_at(frame)
+                {
                     let css = String::from_utf8_lossy(&bytes).into_owned();
                     match link {
-                        Some(link) => self.tabs[i].doc.add_stylesheet(link, css, &url),
-                        None => self.tabs[i].doc.add_import(&url, css),
+                        Some(link) => doc.add_stylesheet(link, css, &url),
+                        None => doc.add_import(&url, css),
                     }
                     self.dirty = true;
                 }
-                if let Some(link) = link {
+                // Frames run no scripts: no events for their sheets.
+                if let Some(link) = link.filter(|_| frame.is_none()) {
                     if self.tabs[i].loaded {
                         self.element_event(i, link, kind, host);
                     } else {
@@ -1304,18 +1331,44 @@ impl Browser {
             Request::Image {
                 tab,
                 serial,
+                frame,
                 node,
                 src,
             } => {
                 if let Some(i) = self
                     .tab_index(tab)
                     .filter(|&i| self.tabs[i].serial == serial)
+                    && let Some(doc) = self.tabs[i].doc_at(frame)
                 {
-                    self.tabs[i].doc.image_loaded(node, &src, result);
+                    doc.image_loaded(node, &src, result);
                     self.dirty = true;
                 }
             }
-            Request::Font { tab, serial, font } => {
+            Request::Frame {
+                tab,
+                serial,
+                node,
+                source,
+                url,
+            } => {
+                if let Some(i) = self
+                    .tab_index(tab)
+                    .filter(|&i| self.tabs[i].serial == serial)
+                {
+                    let html = match result {
+                        Ok(bytes) => as_html(&url, &bytes),
+                        Err(e) => error_page(&url, &e),
+                    };
+                    self.tabs[i].doc.frame_loaded(node, &source, &html, &url);
+                    self.frame_loaded(i, node, host);
+                }
+            }
+            Request::Font {
+                tab,
+                serial,
+                frame,
+                font,
+            } => {
                 if std::env::var_os("RUBROWSER_PROFILE").is_some() {
                     eprintln!(
                         "[profile] font {} weight={} italic={} {}: {:?}",
@@ -1333,8 +1386,9 @@ impl Browser {
                     && self
                         .fonts
                         .add_web_font(&font.family, font.weight, font.italic, &bytes)
+                    && let Some(doc) = self.tabs[i].doc_at(frame)
                 {
-                    self.tabs[i].doc.fonts_changed();
+                    doc.fonts_changed();
                     self.dirty = true;
                 }
             }
@@ -1753,7 +1807,14 @@ impl Browser {
             Event::MouseDown { .. } | Event::MouseUp { .. } => {}
             Event::Wheel { dy, .. } => {
                 let (t, lx, ly) = self.target_at(self.pointer.0, self.pointer.1);
-                if self.doc_mut(t).scroll_by(lx, ly, dy as f32) {
+                // A frame under the pointer scrolls first.
+                let doc = &mut self.tabs[self.active].doc;
+                if t == Target::Page
+                    && let Some((n, fx, fy)) = doc.frame_at(lx, ly)
+                    && doc.frame_mut(n).is_some_and(|f| f.scroll_by(fx, fy, dy as f32))
+                {
+                    self.dirty = true;
+                } else if self.doc_mut(t).scroll_by(lx, ly, dy as f32) {
                     self.dirty = true;
                     // Content moved under the pointer: refresh hover.
                     let (px, py) = self.pointer;
@@ -1890,6 +1951,7 @@ impl Browser {
     }
 
     fn mouse_down(&mut self, x: f32, y: f32, host: &mut dyn Host) {
+        self.pointer = (x, y);
         let (t, lx, ly) = self.target_at(x, y);
         // An open <select> list takes the click first.
         if self.tabs[self.active].doc.forms.open_select.is_some() {
@@ -1960,6 +2022,7 @@ impl Browser {
     }
 
     fn mouse_up(&mut self, x: f32, y: f32, host: &mut dyn Host) {
+        self.pointer = (x, y);
         let Some(press) = self.press.take() else {
             return;
         };
@@ -2031,6 +2094,9 @@ impl Browser {
     /// link, toggle a checkbox, open a select, submit a form, …
     fn activate(&mut self, node: NodeId, host: &mut dyn Host) {
         use crate::document::{Control, control, label_target};
+        if self.tabs[self.active].doc.frame(node).is_some() {
+            return self.activate_in_frame(node, host);
+        }
         let doc = &self.tabs[self.active].doc;
         // The innermost control or label around the clicked node.
         let mut n = Some(node);
@@ -2086,6 +2152,41 @@ impl Browser {
                     return self.new_tab(&target, host);
                 }
                 return self.navigate(&target, host);
+            }
+            n = doc.dom.parent(id);
+        }
+    }
+
+    /// A click on `<iframe>` `frame` at the pointer: follows a link in its
+    /// document (frames run no scripts, so there is nothing else to do).
+    fn activate_in_frame(&mut self, frame: NodeId, host: &mut dyn Host) {
+        let vp = self.viewport_rect();
+        let (x, y) = (self.pointer.0 - vp.x, self.pointer.1 - vp.y);
+        let tab = &self.tabs[self.active];
+        let Some((_, fx, fy)) = tab.doc.frame_at(x, y) else { return };
+        let Some(doc) = tab.doc.frame(frame) else { return };
+        let mut n = doc.hit_test(fx, fy).element;
+        while let Some(id) = n {
+            if let Some(href) = doc.link(id) {
+                let target = url::resolve(&doc.base_url(), &href);
+                let name = doc.dom.attr(id, "target").unwrap_or("");
+                return match name {
+                    "" | "_self" => {
+                        let (tab_id, serial) = (tab.id, tab.serial);
+                        self.tabs[self.active].doc.navigate_frame(frame, &target);
+                        let req = Request::Frame {
+                            tab: tab_id,
+                            serial,
+                            node: frame,
+                            source: target.clone(),
+                            url: target.clone(),
+                        };
+                        self.fetch(req, &target, host);
+                        self.dirty = true;
+                    }
+                    "_top" | "_parent" => self.navigate(&target, host),
+                    _ => self.new_tab(&target, host),
+                };
             }
             n = doc.dom.parent(id);
         }
@@ -2421,33 +2522,92 @@ impl Browser {
     /// Starts loading images of the active page that have a new `src`
     /// (from the HTML or set later by scripts).
     fn request_images(&mut self, host: &mut dyn Host) {
+        self.request_resources(None, host);
         let tab = &mut self.tabs[self.active];
         let (id, serial) = (tab.id, tab.serial);
-        let base = tab.doc.base_url();
-        for url in tab.doc.import_requests() {
+        for (node, load) in tab.doc.frame_requests() {
+            match load {
+                FrameLoad::Url(target) => {
+                    let req = Request::Frame {
+                        tab: id,
+                        serial,
+                        node,
+                        source: target.clone(),
+                        url: target.clone(),
+                    };
+                    self.fetch(req, &target, host);
+                }
+                FrameLoad::Html(html) => {
+                    let tab = &mut self.tabs[self.active];
+                    let base = tab.doc.base_url();
+                    tab.doc
+                        .frame_loaded(node, &format!("srcdoc:{html}"), &html, &base);
+                    self.frame_loaded(self.active, node, host);
+                }
+            }
+        }
+        let frames: Vec<NodeId> = self.tabs[self.active].doc.frames.keys().copied().collect();
+        for n in frames {
+            self.request_resources(Some(n), host);
+        }
+    }
+
+    /// Requests the stylesheets of the newly loaded document of `<iframe>`
+    /// `node` in tab `i` (its other resources follow on updates).
+    fn frame_loaded(&mut self, i: usize, node: NodeId, host: &mut dyn Host) {
+        let tab = &mut self.tabs[i];
+        let (id, serial) = (tab.id, tab.serial);
+        let Some(doc) = tab.doc.frame_mut(node) else { return };
+        let base = doc.base_url();
+        for (link, href) in doc.stylesheet_links() {
+            let target = url::resolve(&base, &href);
             let req = Request::Stylesheet {
                 tab: id,
                 serial,
+                frame: Some(node),
+                link: Some(link),
+                url: target.clone(),
+            };
+            self.fetch(req, &target, host);
+        }
+        self.dirty = true;
+    }
+
+    /// Requests `@import`s, fonts and images of the active page's document
+    /// or one of its frames.
+    fn request_resources(&mut self, frame: Option<NodeId>, host: &mut dyn Host) {
+        let tab = &mut self.tabs[self.active];
+        let (id, serial) = (tab.id, tab.serial);
+        let Some(doc) = tab.doc_at(frame) else { return };
+        let base = doc.base_url();
+        let imports = doc.import_requests();
+        let fonts = doc.font_requests();
+        let images = doc.image_requests();
+        for url in imports {
+            let req = Request::Stylesheet {
+                tab: id,
+                serial,
+                frame,
                 link: None,
                 url: url.clone(),
             };
             self.fetch(req, &url, host);
         }
-        let tab = &mut self.tabs[self.active];
-        for font in tab.doc.font_requests() {
+        for font in fonts {
             let url = url::resolve(&base, &font.url);
             let req = Request::Font {
                 tab: id,
                 serial,
+                frame,
                 font,
             };
             self.fetch(req, &url, host);
         }
-        let tab = &mut self.tabs[self.active];
-        for (node, src) in tab.doc.image_requests() {
+        for (node, src) in images {
             let req = Request::Image {
                 tab: id,
                 serial,
+                frame,
                 node,
                 src: src.clone(),
             };
@@ -3593,6 +3753,53 @@ mod tests {
         let canvas = b.render(1.0, &mut h);
         let (px, py) = ((vp.x + a.x + 5.0) as usize, (vp.y + a.y + 5.0) as usize);
         assert_eq!(canvas.pixels()[py * canvas.width() + px], 0xff0000);
+    }
+
+    #[test]
+    fn iframes_load_render_and_follow_links() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://host.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0">
+            <iframe id=f src="inner.html" style="width:300px;height:100px;border:0"></iframe>
+            <iframe id=s srcdoc="<a id=top target=_top href=https://other.test/>top</a>"></iframe>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let find = |h: &TestHost, url: &str| h.fetched.iter().rev().find(|f| f.1 == url).map(|f| f.0);
+        let inner = find(&h, "https://host.test/inner.html").expect("frame requested");
+        let html = r#"<link rel=stylesheet href=s.css><body style="margin:0">
+            <a href="next.html" style="display:block;height:100px">next</a><div style="height:500px"></div>"#;
+        b.fetch_done(inner, Ok(html.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert!(find(&h, "https://host.test/s.css").is_some(), "frame stylesheet");
+        let f = page_el(&b, "f");
+        let frame = b.tabs[b.active].doc.frame(f).unwrap();
+        assert!(frame.dom.text_content(crate::dom::Dom::ROOT).contains("next"));
+
+        // The wheel over the frame scrolls the frame, not the page.
+        let vp = b.viewport_rect();
+        let r = b.tabs[b.active].doc.content_box(f).unwrap();
+        let (x, y) = ((vp.x + r.x + 50.0) as i32, (vp.y + r.y + 50.0) as i32);
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        b.event(Event::Wheel { dx: 0, dy: 40 }, 0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.frame(f).unwrap().scroll_y(), 40.0);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 0.0);
+        b.event(Event::Wheel { dx: 0, dy: -40 }, 0.0, &mut h);
+
+        // A link inside loads into the frame; the page stays.
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert!(find(&h, "https://host.test/next.html").is_some());
+        assert_eq!(b.tabs[b.active].url(), "https://host.test/");
+
+        // target=_top replaces the page.
+        let s = page_el(&b, "s");
+        let r = b.tabs[b.active].doc.content_box(s).unwrap();
+        let (x, y) = ((vp.x + r.x + 12.0) as i32, (vp.y + r.y + 12.0) as i32);
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        assert!(find(&h, "https://other.test/").is_some());
     }
 
     #[test]

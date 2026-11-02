@@ -38,6 +38,25 @@ pub struct Hit {
     pub scrollers: Vec<Option<NodeId>>,
 }
 
+/// The document an `<iframe>` shows.
+pub struct Frame {
+    /// What the attributes asked for: the resolved `src`, or `srcdoc:` and
+    /// its HTML (a change loads it again).
+    pub requested: String,
+    /// What is loading or shown (differs after a link in the frame).
+    pub source: String,
+    /// `None` while loading.
+    pub doc: Option<Box<Document>>,
+}
+
+/// How to load an `<iframe>`'s document.
+#[derive(Clone, Debug, PartialEq)]
+pub enum FrameLoad {
+    Url(String),
+    /// `srcdoc`: the HTML itself.
+    Html(String),
+}
+
 pub struct Document {
     pub url: String,
     pub dom: Dom,
@@ -77,6 +96,8 @@ pub struct Document {
     pub popup_hover: Option<usize>,
     pub images: Images,
     pub forms: FormState,
+    /// Nested documents of `<iframe>` elements.
+    pub frames: HashMap<NodeId, Frame>,
 }
 
 impl Document {
@@ -109,6 +130,7 @@ impl Document {
             popup_hover: None,
             images: Images::default(),
             forms: FormState::default(),
+            frames: HashMap::new(),
         }
     }
 
@@ -131,7 +153,78 @@ impl Document {
     }
 
     pub fn needs_update(&self) -> bool {
-        self.needs_style || self.needs_layout || !self.restyle_roots.is_empty()
+        self.needs_style
+            || self.needs_layout
+            || !self.restyle_roots.is_empty()
+            || self.frames.values().any(|f| f.doc.as_ref().is_some_and(|d| d.needs_update()))
+    }
+
+    /// `<iframe>`s whose document to load (new, or `src` / `srcdoc`
+    /// changed). `about:blank` and an empty `src` give an empty document.
+    pub fn frame_requests(&mut self) -> Vec<(NodeId, FrameLoad)> {
+        let base = self.base_url();
+        let mut out = Vec::new();
+        for n in self.dom.descendants(Dom::ROOT) {
+            if self.dom.tag(n) != Some("iframe") {
+                continue;
+            }
+            let load = match (self.dom.attr(n, "srcdoc"), self.dom.attr(n, "src")) {
+                (Some(html), _) => FrameLoad::Html(html.to_string()),
+                (None, Some(src)) if !src.trim().is_empty() => {
+                    FrameLoad::Url(crate::net::url::resolve(&base, src.trim()))
+                }
+                _ => FrameLoad::Url("about:blank".into()),
+            };
+            let source = match &load {
+                FrameLoad::Url(u) => u.clone(),
+                FrameLoad::Html(h) => format!("srcdoc:{h}"),
+            };
+            if self.frames.get(&n).is_some_and(|f| f.requested == source) {
+                continue;
+            }
+            let blank = load == FrameLoad::Url("about:blank".into());
+            let doc = blank.then(|| Box::new(Document::from_html("", "about:blank")));
+            let requested = source.clone();
+            self.frames.insert(n, Frame { requested, source, doc });
+            if !blank {
+                out.push((n, load));
+            }
+        }
+        out
+    }
+
+    /// The document of `<iframe>` `n` arrived (`source` as requested).
+    pub fn frame_loaded(&mut self, n: NodeId, source: &str, html: &str, url: &str) {
+        if let Some(f) = self.frames.get_mut(&n).filter(|f| f.source == source) {
+            f.doc = Some(Box::new(Document::from_html(html, url)));
+        }
+    }
+
+    /// Loads `url` into `<iframe>` `n` (a link inside it was followed).
+    pub fn navigate_frame(&mut self, n: NodeId, url: &str) {
+        if let Some(f) = self.frames.get_mut(&n) {
+            f.source = url.to_string();
+            f.doc = None;
+        }
+    }
+
+    /// The `<iframe>` with a loaded document at viewport point `(x, y)`,
+    /// and the point in that document's viewport.
+    pub fn frame_at(&self, x: f32, y: f32) -> Option<(NodeId, f32, f32)> {
+        let n = self.hit_test(x, y).element?;
+        self.frame(n)?;
+        let (_, content) = self.box_rects(n)?;
+        let (fx, fy) = (x - content.x, y - content.y);
+        (fx >= 0.0 && fy >= 0.0 && fx < content.w && fy < content.h).then_some((n, fx, fy))
+    }
+
+    /// The loaded document of `<iframe>` `n`.
+    pub fn frame_mut(&mut self, n: NodeId) -> Option<&mut Document> {
+        self.frames.get_mut(&n)?.doc.as_deref_mut()
+    }
+
+    pub fn frame(&self, n: NodeId) -> Option<&Document> {
+        self.frames.get(&n)?.doc.as_deref()
     }
 
     /// The viewport size in logical pixels.
@@ -340,6 +433,18 @@ impl Document {
                 );
             }
         }
+        // Frames get their `<iframe>`'s content box as their viewport.
+        let sizes: Vec<(NodeId, (f32, f32))> = self
+            .frames
+            .keys()
+            .filter_map(|&n| Some((n, self.box_rects(n).map(|(_, c)| (c.w, c.h))?)))
+            .collect();
+        for (n, (w, h)) in sizes {
+            if let Some(doc) = self.frame_mut(n) {
+                doc.set_viewport(w, h);
+                doc.update(fonts);
+            }
+        }
     }
 
     /// The value of CSS property `prop` for element `n`, as
@@ -507,6 +612,7 @@ impl Document {
             forms: &self.forms,
             view_top: Default::default(),
             flat: Default::default(),
+            frames: &self.frames,
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -605,6 +711,11 @@ impl Document {
         for n in self.dom.descendants(Dom::ROOT) {
             if let Some(size) = self.control_size(n, fonts) {
                 out.insert(n, size);
+                continue;
+            }
+            // The default object size of the HTML spec.
+            if self.dom.tag(n) == Some("iframe") {
+                out.insert(n, (300.0, 150.0));
                 continue;
             }
             if !matches!(self.dom.tag(n), Some("img" | "svg")) {
