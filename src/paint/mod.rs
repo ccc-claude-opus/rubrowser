@@ -879,12 +879,19 @@ impl Painter<'_> {
         };
         let p = self.phys(area);
         match self.images.get(node) {
-            Some(ImageState::Ready(..)) => {
-                if p.w > 0
-                    && p.h > 0
-                    && let Some(px) = self.images.scaled(node, p.w as u32, p.h as u32)
+            Some(ImageState::Ready(_, bitmap)) => {
+                let density = self.images.density.get(&node).copied().unwrap_or(1.0);
+                let natural = (bitmap.width as f32 / density, bitmap.height as f32 / density);
+                let d = self.phys(object_rect(style, area, natural));
+                if d.w > 0
+                    && d.h > 0
+                    && let Some(px) = self.images.scaled(node, d.w as u32, d.h as u32)
                 {
-                    c.draw_argb(p.x, p.y, p.w as usize, p.h as usize, &px);
+                    // The content box clips what does not fit (`cover`).
+                    let saved = c.clip();
+                    c.set_clip(p.intersect(&saved));
+                    c.draw_argb(d.x, d.y, d.w as usize, d.h as usize, &px);
+                    c.set_clip(saved);
                 }
             }
             Some(ImageState::Failed(_)) | None => {
@@ -1422,4 +1429,62 @@ fn bilinear(canvas: &Canvas, x: f32, y: f32, outside: u32) -> [f32; 3] {
         }
     }
     out
+}
+
+/// Where a replaced element's content goes in its content box `area`
+/// (`object-fit` / `object-position`), given its natural size.
+fn object_rect(style: &Style, area: RectF, (nw, nh): (f32, f32)) -> RectF {
+    let (w, h) = if nw <= 0.0 || nh <= 0.0 {
+        (area.w, area.h)
+    } else {
+        let contain = (area.w / nw).min(area.h / nh);
+        match style.object_fit {
+            cs::ObjectFit::Fill => (area.w, area.h),
+            cs::ObjectFit::Contain => (nw * contain, nh * contain),
+            cs::ObjectFit::Cover => {
+                let k = (area.w / nw).max(area.h / nh);
+                (nw * k, nh * k)
+            }
+            cs::ObjectFit::None => (nw, nh),
+            cs::ObjectFit::ScaleDown => {
+                let k = contain.min(1.0);
+                (nw * k, nh * k)
+            }
+        }
+    };
+    // Percentages place the same point of image and box together.
+    let (px, py) = style.object_position;
+    RectF {
+        x: area.x + px.px_or_zero(area.w - w),
+        y: area.y + py.px_or_zero(area.h - h),
+        w,
+        h,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn object_fit_places_the_image() {
+        let area = RectF { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let at = |fit, position| {
+            let style = Style {
+                object_fit: fit,
+                object_position: position,
+                ..Style::default()
+            };
+            let r = object_rect(&style, area, (200.0, 100.0));
+            (r.x, r.y, r.w, r.h)
+        };
+        let center = (Dim::Percent(50.0), Dim::Percent(50.0));
+        assert_eq!(at(cs::ObjectFit::Fill, center), (0.0, 0.0, 100.0, 100.0));
+        assert_eq!(at(cs::ObjectFit::Contain, center), (0.0, 25.0, 100.0, 50.0));
+        assert_eq!(at(cs::ObjectFit::Cover, center), (-50.0, 0.0, 200.0, 100.0));
+        assert_eq!(at(cs::ObjectFit::None, center), (-50.0, 0.0, 200.0, 100.0));
+        assert_eq!(at(cs::ObjectFit::ScaleDown, center), (0.0, 25.0, 100.0, 50.0));
+        let left = (Dim::Percent(0.0), Dim::Percent(50.0));
+        assert_eq!(at(cs::ObjectFit::Cover, left), (0.0, 0.0, 200.0, 100.0));
+    }
 }

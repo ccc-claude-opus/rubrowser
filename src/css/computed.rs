@@ -189,6 +189,14 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
             VerticalAlign::Super => "super",
         }
         .into(),
+        "object-fit" => match s.object_fit {
+            ObjectFit::Fill => "fill",
+            ObjectFit::Contain => "contain",
+            ObjectFit::Cover => "cover",
+            ObjectFit::None => "none",
+            ObjectFit::ScaleDown => "scale-down",
+        }
+        .into(),
         "text-overflow" => if s.ellipsis { "ellipsis" } else { "clip" }.into(),
         "direction" => if s.rtl { "rtl" } else { "ltr" }.into(),
         "cursor" => match s.cursor {

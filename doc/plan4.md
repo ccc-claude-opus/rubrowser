@@ -78,6 +78,7 @@
 | 1 | `getComputedStyle` 回傳 cascade 算出的值（CSSOM 序列化；`display: none` 的元素也有值）；`matchMedia` 依目前 viewport 判斷 |
 | 2 | 完整的 2D `transform`（`rotate`、`scale`、`skew`、`matrix`、`matrix3d` 的 2D 部分）、`rotate` / `scale` 屬性、`transform-origin`；非平移的變換以離屏圖層繪製後雙線性重取樣 |
 | 3 | `text-overflow: ellipsis`：裁切的方塊中超出內容框的行在結尾截斷並加上 `…`（區塊的字型） |
+| 4 | `object-fit`（`fill` / `contain` / `cover` / `none` / `scale-down`）與 `object-position`，內容超出內容框的部分裁掉 |
 
 ### 第二批調查
 

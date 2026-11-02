@@ -91,6 +91,17 @@ pub enum BackgroundSize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Repeat(pub bool, pub bool);
 
+/// `object-fit`: how a replaced element's content fills its box.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ObjectFit {
+    #[default]
+    Fill,
+    Contain,
+    Cover,
+    None,
+    ScaleDown,
+}
+
 /// One `box-shadow`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Shadow {
@@ -307,6 +318,8 @@ pub struct Style {
     pub translate: (Dim, Dim),
     pub rotate: f32,
     pub scale: (f32, f32),
+    pub object_fit: ObjectFit,
+    pub object_position: (Dim, Dim),
     /// `text-overflow: ellipsis` (lines cut at the end of a clipping box
     /// end in `…`).
     pub ellipsis: bool,
@@ -413,6 +426,8 @@ impl Default for Style {
             rotate: 0.0,
             scale: (1.0, 1.0),
             ellipsis: false,
+            object_fit: ObjectFit::Fill,
+            object_position: (Dim::Percent(50.0), Dim::Percent(50.0)),
             transform: Rc::new([]),
             transform_origin: (Dim::Percent(50.0), Dim::Percent(50.0)),
             aspect_ratio: None,
@@ -872,6 +887,23 @@ impl Style {
                 _ => {}
             },
             "scale" => set(&mut self.scale, super::transform::parse_scale(v)),
+            "object-fit" => {
+                set(
+                    &mut self.object_fit,
+                    match v {
+                        "fill" => Some(ObjectFit::Fill),
+                        "contain" => Some(ObjectFit::Contain),
+                        "cover" => Some(ObjectFit::Cover),
+                        "none" => Some(ObjectFit::None),
+                        "scale-down" => Some(ObjectFit::ScaleDown),
+                        _ => None,
+                    },
+                );
+            }
+            "object-position" => {
+                let t = tokens(v);
+                set(&mut self.object_position, background_position(&t, fc));
+            }
             "transform-origin" => {
                 let t = tokens(v);
                 let t: Vec<&str> = t.iter().take(2).copied().collect();
