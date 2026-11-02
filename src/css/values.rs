@@ -49,7 +49,11 @@ fn color_mix(args: &str, current: Rgba) -> Option<Rgba> {
         return None;
     };
     let space = space.trim().to_ascii_lowercase();
-    let space = space.strip_prefix("in ")?.split_whitespace().next()?.to_string();
+    let space = space
+        .strip_prefix("in ")?
+        .split_whitespace()
+        .next()?
+        .to_string();
     // A color and its optional percentage, in either order.
     let item = |s: &str| -> Option<(Color, Option<f32>)> {
         let t = tokens(s);
@@ -156,7 +160,10 @@ impl Expr {
             Expr::Add(a, b) => a.eval(base) + b.eval(base),
             Expr::Scale(a, k) => a.eval(base) * k,
             Expr::Min(v) => v.iter().map(|e| e.eval(base)).fold(f32::INFINITY, f32::min),
-            Expr::Max(v) => v.iter().map(|e| e.eval(base)).fold(f32::NEG_INFINITY, f32::max),
+            Expr::Max(v) => v
+                .iter()
+                .map(|e| e.eval(base))
+                .fold(f32::NEG_INFINITY, f32::max),
             Expr::Clamp(v) => {
                 let [lo, val, hi] = &**v;
                 let lo = lo.eval(base);
@@ -419,9 +426,9 @@ impl Calc<'_> {
 fn pick(kind: u8, mut args: Vec<Expr>) -> Option<Expr> {
     let lins: Option<Vec<Lin>> = args.iter().map(Expr::lin).collect();
     // All pixels, or all pure percentages (whose order no base changes).
-    let foldable = lins.as_ref().filter(|l| {
-        l.iter().all(|a| a.pct == 0.0) || l.iter().all(|a| a.px == 0.0)
-    });
+    let foldable = lins
+        .as_ref()
+        .filter(|l| l.iter().all(|a| a.pct == 0.0) || l.iter().all(|a| a.px == 0.0));
     let fold = |f: fn(f32, f32) -> f32, start: f32, l: &[Lin]| {
         let (px, pct) = l
             .iter()
@@ -532,9 +539,15 @@ mod tests {
         assert_eq!(dim("max(10px, 2em)", FC), Some(Dim::Px(20.0)));
         assert_eq!(dim("clamp(10px, 50px, 30px)", FC), Some(Dim::Px(30.0)));
         let min = dim("min(100%, 600px)", FC).unwrap();
-        assert_eq!((min.px_or_zero(400.0), min.px_or_zero(1000.0)), (400.0, 600.0));
+        assert_eq!(
+            (min.px_or_zero(400.0), min.px_or_zero(1000.0)),
+            (400.0, 600.0)
+        );
         let clamp = dim("clamp(10px, 50%, 40px)", FC).unwrap();
-        assert_eq!((clamp.px_or_zero(10.0), clamp.px_or_zero(800.0)), (10.0, 40.0));
+        assert_eq!(
+            (clamp.px_or_zero(10.0), clamp.px_or_zero(800.0)),
+            (10.0, 40.0)
+        );
         assert_eq!(dim("min(30%, 50%)", FC), Some(Dim::Percent(30.0)));
         let nested = dim("calc(min(100%, 600px) - 2rem)", FC).unwrap();
         assert_eq!(nested.px_or_zero(400.0), 368.0);
@@ -545,10 +558,22 @@ mod tests {
     #[test]
     fn color_mix_premultiplies() {
         let c = |s| color(s, Rgba::BLACK);
-        assert_eq!(c("color-mix(in srgb, red, blue)"), Some(Rgba::new(128, 0, 128, 255)));
-        assert_eq!(c("color-mix(in srgb, red 20%, transparent)"), Some(Rgba::new(255, 0, 0, 51)));
-        assert_eq!(c("color-mix(in srgb, white 25%, black)"), Some(Rgba::new(64, 64, 64, 255)));
-        assert_eq!(c("color-mix(in srgb, red 30%, blue 30%)").map(|c| c.a), Some(153));
+        assert_eq!(
+            c("color-mix(in srgb, red, blue)"),
+            Some(Rgba::new(128, 0, 128, 255))
+        );
+        assert_eq!(
+            c("color-mix(in srgb, red 20%, transparent)"),
+            Some(Rgba::new(255, 0, 0, 51))
+        );
+        assert_eq!(
+            c("color-mix(in srgb, white 25%, black)"),
+            Some(Rgba::new(64, 64, 64, 255))
+        );
+        assert_eq!(
+            c("color-mix(in srgb, red 30%, blue 30%)").map(|c| c.a),
+            Some(153)
+        );
         assert!(c("color-mix(in oklab, red, blue)").is_some());
         assert_eq!(c("color-mix(red, blue)"), None);
     }

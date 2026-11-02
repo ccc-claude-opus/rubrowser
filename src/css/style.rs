@@ -726,9 +726,13 @@ impl Style {
             }
             "border-radius" => {
                 // One radius for all corners: the first one given.
-                let first = tokens(v).first().map(|t| t.split('/').next().unwrap_or(t).trim());
+                let first = tokens(v)
+                    .first()
+                    .map(|t| t.split('/').next().unwrap_or(t).trim());
                 match first.and_then(&dim) {
-                    Some(Dim::Percent(p)) => (self.border_radius, self.border_radius_pct) = (0.0, p),
+                    Some(Dim::Percent(p)) => {
+                        (self.border_radius, self.border_radius_pct) = (0.0, p)
+                    }
                     Some(d @ (Dim::Px(_) | Dim::Calc(..))) => {
                         (self.border_radius, self.border_radius_pct) = (d.px_or_zero(0.0), 0.0)
                     }

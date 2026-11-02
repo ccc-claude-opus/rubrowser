@@ -405,7 +405,12 @@ fn element(doc: &Document, h: i32) -> Option<NodeId> {
 /// Elements matching `selector`, in document order.
 /// Elements matching `selector` in document order; `None` if it is invalid.
 fn select(doc: &Document, selector: &str) -> Option<Vec<NodeId>> {
-    css::query(&doc.dom, doc.dom.descendants(Dom::ROOT), selector, &doc.state())
+    css::query(
+        &doc.dom,
+        doc.dom.descendants(Dom::ROOT),
+        selector,
+        &doc.state(),
+    )
 }
 
 /// Sets (or with an empty value removes) one property in a `style` attribute.

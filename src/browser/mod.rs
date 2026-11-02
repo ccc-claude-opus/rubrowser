@@ -5,8 +5,8 @@
 //! `data-action` attribute run browser commands, and the tab strip and
 //! address bar are kept in sync by editing the chrome DOM.
 
-use std::rc::Rc;
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::abi::key;
 use crate::css::ElementState;
@@ -1022,7 +1022,10 @@ impl Browser {
     /// previous one.
     fn js_budget(&mut self, i: usize, budget: Option<u64>) -> Option<u64> {
         let tab = &mut self.tabs[i];
-        let rt = tab.runtimes.get(JS_MIME).and_then(|&si| tab.scripts.get_mut(si))?;
+        let rt = tab
+            .runtimes
+            .get(JS_MIME)
+            .and_then(|&si| tab.scripts.get_mut(si))?;
         let rt = rt.as_mut()?;
         let old = rt.budget();
         rt.set_budget(budget);
@@ -1567,7 +1570,9 @@ impl Browser {
         // A language runtime survives one of its scripts being stopped for
         // time; it fails for good if that left it broken.
         if err == crate::script::TOO_LONG
-            && self.tabs[i].scripts[si].as_ref().is_some_and(Script::is_runtime)
+            && self.tabs[i].scripts[si]
+                .as_ref()
+                .is_some_and(Script::is_runtime)
         {
             return;
         }
@@ -1817,7 +1822,9 @@ impl Browser {
                 let doc = &mut self.tabs[self.active].doc;
                 if t == Target::Page
                     && let Some((n, fx, fy)) = doc.frame_at(lx, ly)
-                    && doc.frame_mut(n).is_some_and(|f| f.scroll_by(fx, fy, dy as f32))
+                    && doc
+                        .frame_mut(n)
+                        .is_some_and(|f| f.scroll_by(fx, fy, dy as f32))
                 {
                     self.dirty = true;
                 } else if self.doc_mut(t).scroll_by(lx, ly, dy as f32) {
@@ -2047,7 +2054,9 @@ impl Browser {
     /// `input` if it changed.
     fn slide(&mut self, node: NodeId, lx: f32, host: &mut dyn Host) {
         let doc = &mut self.tabs[self.active].doc;
-        let Some(area) = doc.content_box(node) else { return };
+        let Some(area) = doc.content_box(node) else {
+            return;
+        };
         let (lo, hi) = crate::document::range_bounds(&doc.dom, node);
         let thumb = area.h.min(16.0);
         let span = (area.w - thumb).max(1.0);
@@ -2207,8 +2216,12 @@ impl Browser {
         let vp = self.viewport_rect();
         let (x, y) = (self.pointer.0 - vp.x, self.pointer.1 - vp.y);
         let tab = &self.tabs[self.active];
-        let Some((_, fx, fy)) = tab.doc.frame_at(x, y) else { return };
-        let Some(doc) = tab.doc.frame(frame) else { return };
+        let Some((_, fx, fy)) = tab.doc.frame_at(x, y) else {
+            return;
+        };
+        let Some(doc) = tab.doc.frame(frame) else {
+            return;
+        };
         let mut n = doc.hit_test(fx, fy).element;
         while let Some(id) = n {
             if let Some(href) = doc.link(id) {
@@ -2602,7 +2615,9 @@ impl Browser {
     fn frame_loaded(&mut self, i: usize, node: NodeId, host: &mut dyn Host) {
         let tab = &mut self.tabs[i];
         let (id, serial) = (tab.id, tab.serial);
-        let Some(doc) = tab.doc.frame_mut(node) else { return };
+        let Some(doc) = tab.doc.frame_mut(node) else {
+            return;
+        };
         let base = doc.base_url();
         for (link, href) in doc.stylesheet_links() {
             let target = url::resolve(&base, &href);
@@ -3431,11 +3446,20 @@ mod tests {
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
         b.render(0.0, &mut h);
         let find = |h: &LogHost, url: &str| h.inner.fetched.iter().find(|f| f.1 == url).unwrap().0;
-        let (css, js) = (find(&h, "https://js.test/s.css"), find(&h, "https://js.test/d.js"));
+        let (css, js) = (
+            find(&h, "https://js.test/s.css"),
+            find(&h, "https://js.test/d.js"),
+        );
         b.fetch_done(js, Ok(b"console.log('d ran')".to_vec()), &mut h);
         b.fetch_done(css, Ok(b"#p { color: red }".to_vec()), &mut h);
         b.render(0.0, &mut h);
-        for want in ["current SCRIPT", "inline ran", "d ran", "js load", "css load"] {
+        for want in [
+            "current SCRIPT",
+            "inline ran",
+            "d ran",
+            "js load",
+            "css load",
+        ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
         assert!(!h.logs.iter().any(|l| l == "innerHTML ran"), "{:?}", h.logs);
@@ -3509,9 +3533,25 @@ mod tests {
         let vp = b.viewport_rect();
         let y = (vp.y + area.y + area.h / 2.0) as i32;
         let at = |f: f32| (vp.x + area.x + 8.0 + (area.w - 16.0) * f) as i32;
-        b.event(Event::MouseDown { x: at(0.2), y, button: 0 }, 0.0, &mut h);
+        b.event(
+            Event::MouseDown {
+                x: at(0.2),
+                y,
+                button: 0,
+            },
+            0.0,
+            &mut h,
+        );
         b.event(Event::MouseMove { x: at(0.9), y }, 0.0, &mut h);
-        b.event(Event::MouseUp { x: at(0.9), y, button: 0 }, 0.0, &mut h);
+        b.event(
+            Event::MouseUp {
+                x: at(0.9),
+                y,
+                button: 0,
+            },
+            0.0,
+            &mut h,
+        );
         for want in ["start 5 #000000", "input 2", "input 9", "change 9"] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
@@ -3543,7 +3583,11 @@ mod tests {
             .filter_map(|&c| doc.dom.attr(c, "id"))
             .collect();
         assert_eq!(&order[..3], &["before", "list", "after"]);
-        assert!(h.logs.iter().any(|l| l == "written script ran"), "{:?}", h.logs);
+        assert!(
+            h.logs.iter().any(|l| l == "written script ran"),
+            "{:?}",
+            h.logs
+        );
         assert!(doc.dom.element_by_id("late").is_none());
     }
 
@@ -3572,7 +3616,11 @@ mod tests {
             </script>"#;
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
         b.render(0.0, &mut h);
-        for want in ["flex|rgb(255, 0, 0)|8px|2px|3px|400", "after none", "media true false"] {
+        for want in [
+            "flex|rgb(255, 0, 0)|8px|2px|3px|400",
+            "after none",
+            "media true false",
+        ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
     }
@@ -3590,8 +3638,16 @@ mod tests {
             </script>"#;
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
         b.render(10.0, &mut h);
-        assert!(h.logs.iter().any(|l| l.contains("ran too long")), "{:?}", h.logs);
-        assert!(h.logs.contains(&"still running 2,4".to_string()), "{:?}", h.logs);
+        assert!(
+            h.logs.iter().any(|l| l.contains("ran too long")),
+            "{:?}",
+            h.logs
+        );
+        assert!(
+            h.logs.contains(&"still running 2,4".to_string()),
+            "{:?}",
+            h.logs
+        );
     }
 
     #[test]
@@ -3918,16 +3974,25 @@ mod tests {
             <iframe id=s srcdoc="<a id=top target=_top href=https://other.test/>top</a>"></iframe>"#;
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
         b.render(0.0, &mut h);
-        let find = |h: &TestHost, url: &str| h.fetched.iter().rev().find(|f| f.1 == url).map(|f| f.0);
+        let find =
+            |h: &TestHost, url: &str| h.fetched.iter().rev().find(|f| f.1 == url).map(|f| f.0);
         let inner = find(&h, "https://host.test/inner.html").expect("frame requested");
         let html = r#"<link rel=stylesheet href=s.css><body style="margin:0">
             <a href="next.html" style="display:block;height:100px">next</a><div style="height:500px"></div>"#;
         b.fetch_done(inner, Ok(html.as_bytes().to_vec()), &mut h);
         b.render(0.0, &mut h);
-        assert!(find(&h, "https://host.test/s.css").is_some(), "frame stylesheet");
+        assert!(
+            find(&h, "https://host.test/s.css").is_some(),
+            "frame stylesheet"
+        );
         let f = page_el(&b, "f");
         let frame = b.tabs[b.active].doc.frame(f).unwrap();
-        assert!(frame.dom.text_content(crate::dom::Dom::ROOT).contains("next"));
+        assert!(
+            frame
+                .dom
+                .text_content(crate::dom::Dom::ROOT)
+                .contains("next")
+        );
 
         // The wheel over the frame scrolls the frame, not the page.
         let vp = b.viewport_rect();

@@ -53,7 +53,14 @@ impl Affine {
             return None;
         }
         let (ia, ib, ic, id) = (d / det, -b / det, -c / det, a / det);
-        Some(Affine([ia, ib, ic, id, -(ia * e + ic * f), -(ib * e + id * f)]))
+        Some(Affine([
+            ia,
+            ib,
+            ic,
+            id,
+            -(ia * e + ic * f),
+            -(ib * e + id * f),
+        ]))
     }
 
     /// Only moves (no scaling, rotation or skew).
@@ -209,7 +216,14 @@ mod tests {
     fn parses_and_composes() {
         let ops = parse("translateX(10px) rotate(90deg) scale(2)", px).unwrap();
         assert_eq!(ops.len(), 3);
-        let m = matrix((Dim::Px(0.0), Dim::Px(0.0)), 0.0, (1.0, 1.0), &ops, (0.0, 0.0), (10.0, 10.0));
+        let m = matrix(
+            (Dim::Px(0.0), Dim::Px(0.0)),
+            0.0,
+            (1.0, 1.0),
+            &ops,
+            (0.0, 0.0),
+            (10.0, 10.0),
+        );
         let (x, y) = m.apply(1.0, 0.0);
         assert!((x - 10.0).abs() < 1e-4 && (y - 2.0).abs() < 1e-4, "{x} {y}");
         assert!(parse("none", px).is_none());
@@ -217,7 +231,14 @@ mod tests {
         assert!((angle("0.5turn").unwrap() - std::f32::consts::PI).abs() < 1e-6);
         assert_eq!(parse_scale("50%"), Some((0.5, 0.5)));
         // Rotating 180° around the center maps the corners onto each other.
-        let r = matrix((Dim::Px(0.0), Dim::Px(0.0)), angle("180deg").unwrap(), (1.0, 1.0), &[], (5.0, 5.0), (10.0, 10.0));
+        let r = matrix(
+            (Dim::Px(0.0), Dim::Px(0.0)),
+            angle("180deg").unwrap(),
+            (1.0, 1.0),
+            &[],
+            (5.0, 5.0),
+            (10.0, 10.0),
+        );
         let (x, y) = r.apply(0.0, 0.0);
         assert!((x - 10.0).abs() < 1e-4 && (y - 10.0).abs() < 1e-4);
         let inv = r.invert().unwrap();

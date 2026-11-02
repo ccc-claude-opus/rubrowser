@@ -56,7 +56,9 @@ impl Document {
             .iter()
             .enumerate()
             .filter_map(|(n, s)| {
-                let s = s.as_ref().filter(|s| !s.transitions.properties.is_empty())?;
+                let s = s
+                    .as_ref()
+                    .filter(|s| !s.transitions.properties.is_empty())?;
                 Some((n, self.anim.overlay.get(&n).unwrap_or(s).clone()))
             })
             .collect();
@@ -120,7 +122,9 @@ impl Document {
                     .cloned()
                     .unwrap_or_default();
                 for a in base.animations.list() {
-                    let Some(frames) = keyframes.get(&a.name) else { continue };
+                    let Some(frames) = keyframes.get(&a.name) else {
+                        continue;
+                    };
                     let key = (n, a.name.clone());
                     let start = *self.anim.started.entry(key.clone()).or_insert(now);
                     seen.insert(key);
@@ -138,7 +142,9 @@ impl Document {
                 }
             }
             for &prop in animation::PROPERTIES {
-                let Some(t) = self.anim.transitions.get(&(n, prop)) else { continue };
+                let Some(t) = self.anim.transitions.get(&(n, prop)) else {
+                    continue;
+                };
                 let local = ((now - t.start) as f32 - t.delay) / t.duration;
                 let p = t.timing.apply(local.clamp(0.0, 1.0));
                 running |= local < 1.0;
@@ -151,9 +157,9 @@ impl Document {
             }
         }
         // Finished transitions and animations of elements that lost them.
-        self.anim.transitions.retain(|_, t| {
-            ((now - t.start) as f32) < t.delay + t.duration
-        });
+        self.anim
+            .transitions
+            .retain(|_, t| ((now - t.start) as f32) < t.delay + t.duration);
         self.anim.started.retain(|k, _| seen.contains(k));
         if !overlay.is_empty() || !self.anim.overlay.is_empty() {
             self.anim.overlay = overlay;
@@ -200,7 +206,10 @@ fn sample(
     };
     let below = frames.iter().rev().find(|k| k.offset <= p);
     let above = frames.iter().find(|k| k.offset >= p);
-    let (o1, o2) = (below.map_or(0.0, |k| k.offset), above.map_or(1.0, |k| k.offset));
+    let (o1, o2) = (
+        below.map_or(0.0, |k| k.offset),
+        above.map_or(1.0, |k| k.offset),
+    );
     let (a, b) = (style_at(below), style_at(above));
     let t = if o2 > o1 { (p - o1) / (o2 - o1) } else { 1.0 };
     animation::interpolate(&a, &b, t)

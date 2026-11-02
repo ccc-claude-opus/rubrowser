@@ -6,8 +6,8 @@
 //! when the index is built. Custom properties are inherited and `var()` is
 //! substituted when a declaration is applied.
 
-pub mod computed;
 pub mod animation;
+pub mod computed;
 pub mod gradient;
 pub mod media;
 pub mod selector;
@@ -89,7 +89,10 @@ pub struct ContainerQuery {
 impl ContainerQuery {
     pub fn parse(prelude: &str) -> Option<ContainerQuery> {
         let p = prelude.trim();
-        let first = p.split(|c: char| c.is_whitespace() || c == '(').next().unwrap_or("");
+        let first = p
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .next()
+            .unwrap_or("");
         let named = !first.is_empty() && !matches!(first.to_ascii_lowercase().as_str(), "not");
         let (name, rest) = if named {
             (Some(first.to_string()), p[first.len()..].trim())

@@ -824,7 +824,11 @@ fn language(dom: &Dom, n: NodeId) -> String {
 fn is_rtl(dom: &Dom, n: NodeId) -> bool {
     let mut at = Some(n);
     while let Some(id) = at {
-        match dom.attr(id, "dir").map(|d| d.trim().to_ascii_lowercase()).as_deref() {
+        match dom
+            .attr(id, "dir")
+            .map(|d| d.trim().to_ascii_lowercase())
+            .as_deref()
+        {
             Some("rtl") => return true,
             Some("ltr") => return false,
             Some("auto") => {

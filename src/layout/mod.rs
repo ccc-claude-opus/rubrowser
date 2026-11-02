@@ -77,7 +77,11 @@ impl LBox {
         }
         // Other transforms are applied when painting (see `paint`).
         let m = style.transform_matrix(self.rect.w, self.rect.h);
-        if m.is_translation() { (m.0[4], m.0[5]) } else { (0.0, 0.0) }
+        if m.is_translation() {
+            (m.0[4], m.0[5])
+        } else {
+            (0.0, 0.0)
+        }
     }
 
     /// How far a sticky box moves down so its top stays `sticky_top` below
@@ -192,7 +196,16 @@ pub fn layout(
     // then their content's height, which are only known after layout:
     // re-run with what the previous pass found.
     for _ in 0..4 {
-        let (tree, found) = layout_pass(dom, styles, generated, fonts, width, height, replaced, hints.clone());
+        let (tree, found) = layout_pass(
+            dom,
+            styles,
+            generated,
+            fonts,
+            width,
+            height,
+            replaced,
+            hints.clone(),
+        );
         if found.is_empty() {
             return tree;
         }
@@ -200,7 +213,10 @@ pub fn layout(
         hints.bases.extend(found.bases);
         hints.plans.extend(found.plans);
     }
-    layout_pass(dom, styles, generated, fonts, width, height, replaced, hints).0
+    layout_pass(
+        dom, styles, generated, fonts, width, height, replaced, hints,
+    )
+    .0
 }
 
 /// What layout passes learn for the next one (see [`layout`]).
@@ -330,10 +346,14 @@ impl Builder<'_> {
                 if let Some(&i) = at.get(&n) {
                     let b = &self.boxes[i];
                     let size = (
-                        b.rect.w - b.padding[cs::LEFT] - b.padding[cs::RIGHT]
+                        b.rect.w
+                            - b.padding[cs::LEFT]
+                            - b.padding[cs::RIGHT]
                             - b.border[cs::LEFT]
                             - b.border[cs::RIGHT],
-                        b.rect.h - b.padding[cs::TOP] - b.padding[cs::BOTTOM]
+                        b.rect.h
+                            - b.padding[cs::TOP]
+                            - b.padding[cs::BOTTOM]
                             - b.border[cs::TOP]
                             - b.border[cs::BOTTOM],
                     );
@@ -386,9 +406,13 @@ impl Builder<'_> {
             let Some(index) = self.boxes.iter().position(|b| b.node == Some(id)) else {
                 continue;
             };
-            let Some(css) = self.style(id).cloned() else { continue };
+            let Some(css) = self.style(id).cloned() else {
+                continue;
+            };
             let b = &self.boxes[index];
-            let avail = b.rect.w - b.padding[cs::LEFT] - b.padding[cs::RIGHT]
+            let avail = b.rect.w
+                - b.padding[cs::LEFT]
+                - b.padding[cs::RIGHT]
                 - b.border[cs::LEFT]
                 - b.border[cs::RIGHT]
                 + extra;
@@ -399,7 +423,13 @@ impl Builder<'_> {
                 Some(p) if (p.avail - avail).abs() <= 0.5 => match p.height {
                     None => {
                         let height = columns::balance(&self.boxes, index, n);
-                        changed.insert(id, columns::Plan { avail, height: Some(height) });
+                        changed.insert(
+                            id,
+                            columns::Plan {
+                                avail,
+                                height: Some(height),
+                            },
+                        );
                     }
                     Some(height) => {
                         columns::distribute(&mut self.boxes, index, n, width, gap, height);
@@ -407,7 +437,13 @@ impl Builder<'_> {
                     }
                 },
                 _ => {
-                    changed.insert(id, columns::Plan { avail, height: None });
+                    changed.insert(
+                        id,
+                        columns::Plan {
+                            avail,
+                            height: None,
+                        },
+                    );
                 }
             }
         }
@@ -1447,13 +1483,20 @@ fn calc_px(d: Dim, vertical: bool) -> f32 {
 /// Whether a style has mixed `calc()` values (see [`calc_px`]).
 fn has_calc(s: &Css) -> bool {
     let mixed = |d: &Dim| matches!(d, Dim::Calc(..) | Dim::Expr(_));
-    [s.width, s.height, s.min_width, s.min_height, s.max_width, s.max_height]
-        .iter()
-        .chain(&s.margin)
-        .chain(&s.padding)
-        .chain(&s.inset)
-        .chain([&s.row_gap, &s.column_gap, &s.flex_basis])
-        .any(mixed)
+    [
+        s.width,
+        s.height,
+        s.min_width,
+        s.min_height,
+        s.max_width,
+        s.max_height,
+    ]
+    .iter()
+    .chain(&s.margin)
+    .chain(&s.padding)
+    .chain(&s.inset)
+    .chain([&s.row_gap, &s.column_gap, &s.flex_basis])
+    .any(mixed)
 }
 
 fn dim_on(d: Dim, vertical: bool) -> Dimension {
@@ -1711,7 +1754,12 @@ mod tests {
         );
         let l = lay(&html, 800.0, 600.0);
         let target = l.dom.element_by_id("m").unwrap();
-        let b = l.tree.boxes.iter().find(|b| b.node == Some(target)).unwrap();
+        let b = l
+            .tree
+            .boxes
+            .iter()
+            .find(|b| b.node == Some(target))
+            .unwrap();
         assert_eq!(b.columns, Some((3, 280.0 / 3.0, 20.0)));
         let lines = &b.inline.as_ref().unwrap().lines;
         let in_col = |k: usize| {
@@ -1726,9 +1774,15 @@ mod tests {
         };
         let counts = [in_col(0), in_col(1), in_col(2)];
         assert_eq!(counts.iter().sum::<usize>(), lines.len());
-        assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+        assert!(
+            counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1,
+            "{counts:?}"
+        );
         let tallest = lines.iter().map(|l| l.top + l.height).fold(0.0, f32::max);
-        assert!((b.rect.h - tallest).abs() < 1.0, "the box is as tall as a column");
+        assert!(
+            (b.rect.h - tallest).abs() < 1.0,
+            "the box is as tall as a column"
+        );
         assert_eq!(l.rect("after").y, b.rect.h);
     }
 

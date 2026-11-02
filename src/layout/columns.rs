@@ -183,5 +183,7 @@ pub fn rules(s: &Style, n: u32, width: f32, gap: f32) -> Vec<f32> {
     if s.column_rule.1 == cs::LineStyle::None || s.column_rule.0 <= 0.0 {
         return Vec::new();
     }
-    (1..n).map(|k| k as f32 * (width + gap) - gap / 2.0).collect()
+    (1..n)
+        .map(|k| k as f32 * (width + gap) - gap / 2.0)
+        .collect()
 }

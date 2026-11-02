@@ -247,7 +247,10 @@ fn parse_rules(src: &str, base: Option<&str>) -> Vec<Rule> {
                         .map(|(sel, decls)| (sel, parse_block(decls, base).0))
                         .collect();
                     let name = prelude.trim().trim_matches(['"', '\'']).to_string();
-                    out.push(Rule::Keyframes(name, super::animation::parse_keyframes(&blocks)));
+                    out.push(Rule::Keyframes(
+                        name,
+                        super::animation::parse_keyframes(&blocks),
+                    ));
                 }
                 "container" if has_block => {
                     if let Some(q) = super::ContainerQuery::parse(prelude) {

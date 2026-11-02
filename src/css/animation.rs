@@ -51,7 +51,8 @@ impl Timing {
                 let args: Vec<&str> = args.split(',').map(str::trim).collect();
                 match name.trim() {
                     "cubic-bezier" => {
-                        let n: Vec<f32> = args.iter().map(|a| a.parse().ok()).collect::<Option<_>>()?;
+                        let n: Vec<f32> =
+                            args.iter().map(|a| a.parse().ok()).collect::<Option<_>>()?;
                         let [x1, y1, x2, y2] = n[..] else { return None };
                         Timing::Bezier(x1.clamp(0.0, 1.0), y1, x2.clamp(0.0, 1.0), y2)
                     }
@@ -154,7 +155,11 @@ pub struct Animation {
 }
 
 fn at<T: Copy>(v: &[T], i: usize, default: T) -> T {
-    if v.is_empty() { default } else { v[i % v.len()] }
+    if v.is_empty() {
+        default
+    } else {
+        v[i % v.len()]
+    }
 }
 
 impl Animations {
@@ -283,9 +288,14 @@ impl Transitions {
                 }
             }
             "transition-property" => {
-                self.properties = items.iter().map(|s| s.trim().to_ascii_lowercase()).collect()
+                self.properties = items
+                    .iter()
+                    .map(|s| s.trim().to_ascii_lowercase())
+                    .collect()
             }
-            "transition-duration" => self.durations = items.iter().filter_map(|s| time(s)).collect(),
+            "transition-duration" => {
+                self.durations = items.iter().filter_map(|s| time(s)).collect()
+            }
             "transition-delay" => self.delays = items.iter().filter_map(|s| time(s)).collect(),
             "transition-timing-function" => {
                 self.timings = items.iter().filter_map(|s| Timing::parse(s)).collect()
@@ -359,7 +369,11 @@ pub fn progress(a: &Animation, elapsed: f32) -> (Option<f32>, bool) {
             return (None, false);
         }
         // The end of the last iteration.
-        let iters = if a.iterations.is_finite() { a.iterations } else { 1.0 };
+        let iters = if a.iterations.is_finite() {
+            a.iterations
+        } else {
+            1.0
+        };
         let last = (iters.ceil() - 1.0).max(0.0);
         let frac = iters - last;
         let p = directed(a, frac, last);
@@ -406,7 +420,10 @@ pub fn interpolate(a: &Style, b: &Style, t: f32) -> Style {
     for i in 0..4 {
         out.border_color[i] = rgba(a.border_color[i], b.border_color[i], t);
     }
-    out.translate = (dim(a.translate.0, b.translate.0, t), dim(a.translate.1, b.translate.1, t));
+    out.translate = (
+        dim(a.translate.0, b.translate.0, t),
+        dim(a.translate.1, b.translate.1, t),
+    );
     out.rotate = lerp(a.rotate, b.rotate, t);
     out.scale = (lerp(a.scale.0, b.scale.0, t), lerp(a.scale.1, b.scale.1, t));
     out.transform = transform(&a.transform, &b.transform, t);
@@ -478,9 +495,16 @@ fn rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
         if alpha <= 0.0 {
             return 0;
         }
-        (lerp(x as f32 * aa, y as f32 * ba, t) / alpha).round().clamp(0.0, 255.0) as u8
+        (lerp(x as f32 * aa, y as f32 * ba, t) / alpha)
+            .round()
+            .clamp(0.0, 255.0) as u8
     };
-    Rgba::new(ch(a.r, b.r), ch(a.g, b.g), ch(a.b, b.b), (alpha * 255.0).round() as u8)
+    Rgba::new(
+        ch(a.r, b.r),
+        ch(a.g, b.g),
+        ch(a.b, b.b),
+        (alpha * 255.0).round() as u8,
+    )
 }
 
 fn parts(d: Dim) -> Option<(f32, f32)> {
@@ -527,7 +551,9 @@ fn transform(a: &Rc<[Op]>, b: &Rc<[Op]>, t: f32) -> Rc<[Op]> {
         _ => (a.to_vec(), b.to_vec()),
     };
     let same = a.len() == b.len()
-        && a.iter().zip(&b).all(|(x, y)| std::mem::discriminant(x) == std::mem::discriminant(y));
+        && a.iter()
+            .zip(&b)
+            .all(|(x, y)| std::mem::discriminant(x) == std::mem::discriminant(y));
     if !same {
         let m = |ops: &[Op]| {
             super::transform::matrix(
@@ -570,7 +596,10 @@ pub fn parse_keyframes(blocks: &[(&str, Vec<Decl>)]) -> Rc<[Keyframe]> {
             let offset = match sel.trim().to_ascii_lowercase().as_str() {
                 "from" => Some(0.0),
                 "to" => Some(1.0),
-                p => p.strip_suffix('%').and_then(|v| v.trim().parse::<f32>().ok()).map(|v| v / 100.0),
+                p => p
+                    .strip_suffix('%')
+                    .and_then(|v| v.trim().parse::<f32>().ok())
+                    .map(|v| v / 100.0),
             };
             if let Some(offset) = offset.filter(|o| (0.0..=1.0).contains(o)) {
                 out.push(Keyframe {
@@ -599,11 +628,26 @@ mod tests {
         let mut anims = Animations::default();
         anims.set("animation", "fade 1s linear 0.5s 2 alternate forwards");
         let a = &anims.list()[0];
-        assert_eq!((a.name.as_str(), a.duration, a.delay, a.iterations), ("fade", 1000.0, 500.0, 2.0));
-        assert_eq!(progress(a, 0.0), (None, true), "before the delay, no backwards fill");
+        assert_eq!(
+            (a.name.as_str(), a.duration, a.delay, a.iterations),
+            ("fade", 1000.0, 500.0, 2.0)
+        );
+        assert_eq!(
+            progress(a, 0.0),
+            (None, true),
+            "before the delay, no backwards fill"
+        );
         assert_eq!(progress(a, 750.0).0, Some(0.25));
-        assert_eq!(progress(a, 1750.0).0, Some(0.75), "second iteration runs backwards");
-        assert_eq!(progress(a, 9000.0), (Some(0.0), false), "fills with the end of the last iteration");
+        assert_eq!(
+            progress(a, 1750.0).0,
+            Some(0.75),
+            "second iteration runs backwards"
+        );
+        assert_eq!(
+            progress(a, 9000.0),
+            (Some(0.0), false),
+            "fills with the end of the last iteration"
+        );
 
         let mut tr = Transitions::default();
         tr.set("transition", "opacity .2s ease-in, transform 300ms");
@@ -613,7 +657,11 @@ mod tests {
 
     #[test]
     fn interpolates_colors_and_transforms() {
-        let a = Style { opacity: 0.0, color: Rgba::new(255, 0, 0, 255), ..Style::default() };
+        let a = Style {
+            opacity: 0.0,
+            color: Rgba::new(255, 0, 0, 255),
+            ..Style::default()
+        };
         let b = Style {
             opacity: 1.0,
             color: Rgba::new(0, 0, 255, 255),

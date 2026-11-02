@@ -323,11 +323,19 @@ fn dim(d: Dim, base: f32) -> String {
 }
 
 fn none_if_auto(d: Dim, base: f32) -> String {
-    if d == Dim::Auto { "none".into() } else { dim(d, base) }
+    if d == Dim::Auto {
+        "none".into()
+    } else {
+        dim(d, base)
+    }
 }
 
 fn gap(d: Dim, base: f32) -> String {
-    if d == Dim::Auto { "normal".into() } else { dim(d, base) }
+    if d == Dim::Auto {
+        "normal".into()
+    } else {
+        dim(d, base)
+    }
 }
 
 /// The shorthand serialization of four sides.

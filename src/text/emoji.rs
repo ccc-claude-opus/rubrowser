@@ -38,9 +38,13 @@ impl EmojiFont {
                 "/usr/share/fonts/google-noto-emoji/NotoColorEmoji.ttf",
                 "C:\\Windows\\Fonts\\seguiemj.ttf",
             ] {
-                let Ok(file) = std::fs::File::open(path) else { continue };
+                let Ok(file) = std::fs::File::open(path) else {
+                    continue;
+                };
                 // SAFETY: system font files are not modified while mapped.
-                let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else { continue };
+                let Ok(map) = (unsafe { memmap2::Mmap::map(&file) }) else {
+                    continue;
+                };
                 let font = EmojiFont {
                     data: Box::new(map),
                 };
@@ -184,10 +188,21 @@ mod tests {
     #[test]
     fn splits_emoji_runs() {
         let r = runs("Hi 👍🏽 ok ❤️ 🇹🇼!");
-        let kinds: Vec<(bool, &str)> = r.iter().map(|(e, r)| (*e, &"Hi 👍🏽 ok ❤️ 🇹🇼!"[r.clone()])).collect();
+        let kinds: Vec<(bool, &str)> = r
+            .iter()
+            .map(|(e, r)| (*e, &"Hi 👍🏽 ok ❤️ 🇹🇼!"[r.clone()]))
+            .collect();
         assert_eq!(
             kinds,
-            vec![(false, "Hi "), (true, "👍🏽"), (false, " ok "), (true, "❤️"), (false, " "), (true, "🇹🇼"), (false, "!")]
+            vec![
+                (false, "Hi "),
+                (true, "👍🏽"),
+                (false, " ok "),
+                (true, "❤️"),
+                (false, " "),
+                (true, "🇹🇼"),
+                (false, "!")
+            ]
         );
         assert_eq!(runs("👨‍👩‍👧").len(), 1, "a ZWJ family is one run");
         assert!(!has_emoji("plain ❤ text"));

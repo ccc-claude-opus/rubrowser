@@ -213,7 +213,10 @@ impl Document {
             || self.needs_layout
             || !self.restyle_roots.is_empty()
             || self.anim.running
-            || self.frames.values().any(|f| f.doc.as_ref().is_some_and(|d| d.needs_update()))
+            || self
+                .frames
+                .values()
+                .any(|f| f.doc.as_ref().is_some_and(|d| d.needs_update()))
     }
 
     /// `<iframe>`s whose document to load (new, or `src` / `srcdoc`
@@ -242,7 +245,14 @@ impl Document {
             let blank = load == FrameLoad::Url("about:blank".into());
             let doc = blank.then(|| Box::new(Document::from_html("", "about:blank")));
             let requested = source.clone();
-            self.frames.insert(n, Frame { requested, source, doc });
+            self.frames.insert(
+                n,
+                Frame {
+                    requested,
+                    source,
+                    doc,
+                },
+            );
             if !blank {
                 out.push((n, load));
             }
@@ -327,9 +337,9 @@ impl Document {
     }
 
     fn link_rel(&self, n: NodeId, rel: &str) -> bool {
-        self.dom.attr(n, "rel").is_some_and(|r| {
-            r.split_whitespace().any(|w| w.eq_ignore_ascii_case(rel))
-        })
+        self.dom
+            .attr(n, "rel")
+            .is_some_and(|r| r.split_whitespace().any(|w| w.eq_ignore_ascii_case(rel)))
     }
 
     /// Delivers the text of a `<link rel=stylesheet>` loaded from `url`.
@@ -475,7 +485,11 @@ impl Document {
         // `@container` rules depend on sizes only layout gives: if the
         // containers changed, style and lay out again (once, so sizes that
         // flip-flop settle).
-        if self.cascade.as_ref().is_some_and(|c| c.2.has_container_rules) {
+        if self
+            .cascade
+            .as_ref()
+            .is_some_and(|c| c.2.has_container_rules)
+        {
             let found = self.find_containers();
             if found != self.containers {
                 self.containers = found;
@@ -607,7 +621,9 @@ impl Document {
             checked: &checked,
             containers: &self.containers,
         };
-        Some(crate::css::unrendered_style(cascade, &cx, &venv, &parent, &chain))
+        Some(crate::css::unrendered_style(
+            cascade, &cx, &venv, &parent, &chain,
+        ))
     }
 
     /// Whether media query list `query` matches the viewport (`matchMedia`).
@@ -1103,15 +1119,26 @@ impl Document {
                     TextField::text,
                 );
                 let v = range_value(&self.dom, node, &raw);
-                if v == v.trunc() { format!("{}", v as i64) } else { v.to_string() }
+                if v == v.trunc() {
+                    format!("{}", v as i64)
+                } else {
+                    v.to_string()
+                }
             }
             Some(Control::Color) => {
                 let v = self.dom.attr(node, "value").unwrap_or("");
-                let v = self.inputs.get(&node).map_or(v.to_string(), TextField::text);
+                let v = self
+                    .inputs
+                    .get(&node)
+                    .map_or(v.to_string(), TextField::text);
                 let valid = v.len() == 7
                     && v.starts_with('#')
                     && v[1..].chars().all(|c| c.is_ascii_hexdigit());
-                if valid { v.to_ascii_lowercase() } else { "#000000".into() }
+                if valid {
+                    v.to_ascii_lowercase()
+                } else {
+                    "#000000".into()
+                }
             }
             Some(Control::File) => String::new(),
             _ => self.inputs.get(&node).map_or_else(
@@ -1971,8 +1998,16 @@ mod tests {
             800.0,
             400.0,
         );
-        let color = |id| d.style(d.dom.element_by_id(id).unwrap()).unwrap().color.rgb();
-        assert_eq!((color("a"), color("b"), color("c")), (0x000000, 0xff0000, 0x000000));
+        let color = |id| {
+            d.style(d.dom.element_by_id(id).unwrap())
+                .unwrap()
+                .color
+                .rgb()
+        };
+        assert_eq!(
+            (color("a"), color("b"), color("c")),
+            (0x000000, 0xff0000, 0x000000)
+        );
     }
 
     #[test]
@@ -2000,7 +2035,11 @@ mod tests {
 
         d.dom_mut().element_mut(b).unwrap().set_attr("class", "off");
         d.update(&fonts);
-        assert_eq!(opacity(&d, b), 1.0, "the transition starts from the old value");
+        assert_eq!(
+            opacity(&d, b),
+            1.0,
+            "the transition starts from the old value"
+        );
         d.set_time(2050.0);
         d.update(&fonts);
         assert!((opacity(&d, b) - 0.5).abs() < 0.01);

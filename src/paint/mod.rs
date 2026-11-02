@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use crate::css::Style;
-use crate::css::transform::Affine;
 use crate::css::style::{self as cs, Display, ListStyle};
+use crate::css::transform::Affine;
 use crate::css::values::{Dim, Rgba};
 use crate::document::{
     Control, FormState, ImageState, Images, button_label, control, option_label, options,
@@ -150,9 +150,7 @@ impl Painter<'_> {
         if style.clipped_away {
             return;
         }
-        if b.node == Some(b.style_node)
-            && style.is_transformed()
-            && self.flat.get() != Some(index)
+        if b.node == Some(b.style_node) && style.is_transformed() && self.flat.get() != Some(index)
         {
             let m = style.transform_matrix(b.rect.w, b.rect.h);
             if !m.is_translation() {
@@ -229,13 +227,7 @@ impl Painter<'_> {
                 ..pr
             };
             let s = self.scale;
-            c.set_round_clip(Some([
-                p.x * s,
-                p.y * s,
-                p.w * s,
-                p.h * s,
-                radius * s,
-            ]));
+            c.set_round_clip(Some([p.x * s, p.y * s, p.w * s, p.h * s, radius * s]));
         }
         if let Some(il) = &b.inline {
             let (cx, cy) = b.content_offset();
@@ -301,13 +293,7 @@ impl Painter<'_> {
             let outer = c.round_clip();
             if radius > 0.0 && outer.is_none() {
                 let s = self.scale;
-                c.set_round_clip(Some([
-                    r.x * s,
-                    r.y * s,
-                    r.w * s,
-                    r.h * s,
-                    radius * s,
-                ]));
+                c.set_round_clip(Some([r.x * s, r.y * s, r.w * s, r.h * s, radius * s]));
             }
             self.image(c, b, node, style, r);
             c.set_round_clip(outer);
@@ -369,7 +355,8 @@ impl Painter<'_> {
         // Where the layer lands.
         let (bx0, by0) = (bounds.x as f32, bounds.y as f32);
         let (bx1, by1) = (bx0 + w as f32, by0 + h as f32);
-        let corners = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)].map(|(x, y)| full.apply(x, y));
+        let corners =
+            [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)].map(|(x, y)| full.apply(x, y));
         let min = |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::MAX, f32::min);
         let max = |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::MIN, f32::max);
         let (dx0, dy0) = (min(|p| p.0).floor() as i32, min(|p| p.1).floor() as i32);
@@ -384,8 +371,7 @@ impl Painter<'_> {
                 }
                 let on_white = bilinear(&white, sx, sy, 0xff_ffff);
                 let on_black = bilinear(&black, sx, sy, 0);
-                let cover = 255.0
-                    - (0..3).map(|k| on_white[k] - on_black[k]).sum::<f32>() / 3.0;
+                let cover = 255.0 - (0..3).map(|k| on_white[k] - on_black[k]).sum::<f32>() / 3.0;
                 let alpha = cover.round().clamp(0.0, 255.0) as u8;
                 if alpha == 0 {
                     continue;
@@ -415,7 +401,10 @@ impl Painter<'_> {
             for &child in &b.children {
                 let k = self.subtree_bounds(child, r.x, r.y);
                 if k.w > 0.0 && k.h > 0.0 {
-                    let (x1, y1) = ((out.x + out.w).max(k.x + k.w), (out.y + out.h).max(k.y + k.h));
+                    let (x1, y1) = (
+                        (out.x + out.w).max(k.x + k.w),
+                        (out.y + out.h).max(k.y + k.h),
+                    );
                     out.x = out.x.min(k.x);
                     out.y = out.y.min(k.y);
                     out.w = x1 - out.x;
@@ -734,7 +723,12 @@ impl Painter<'_> {
         });
         // Everywhere but the part of the top border behind the legend.
         let parts = [
-            Rect::new(saved.x, band.bottom(), saved.w, saved.bottom() - band.bottom()),
+            Rect::new(
+                saved.x,
+                band.bottom(),
+                saved.w,
+                saved.bottom() - band.bottom(),
+            ),
             Rect::new(saved.x, band.y, gap.x - saved.x, band.h),
             Rect::new(gap.right(), band.y, saved.right() - gap.right(), band.h),
         ];
@@ -759,7 +753,11 @@ impl Painter<'_> {
         let s = self.scale;
         let (lo, hi) = crate::document::range_bounds(self.dom, node);
         let v = crate::document::range_value(self.dom, node, &self.raw_value(node));
-        let f = if hi > lo { ((v - lo) / (hi - lo)) as f32 } else { 0.0 };
+        let f = if hi > lo {
+            ((v - lo) / (hi - lo)) as f32
+        } else {
+            0.0
+        };
         let thumb = area.h.min(16.0);
         let track_h = 4.0;
         let ty = area.y + (area.h - track_h) / 2.0;
@@ -767,13 +765,37 @@ impl Painter<'_> {
         let at = x0 + (x1 - x0) * f;
         let disabled = self.dom.attr(node, "disabled").is_some();
         let accent = if disabled { 0x9aa0a6 } else { 0x0075ff };
-        let track = (area.x * s, ty * s, area.w * s, track_h * s, track_h / 2.0 * s);
+        let track = (
+            area.x * s,
+            ty * s,
+            area.w * s,
+            track_h * s,
+            track_h / 2.0 * s,
+        );
         c.fill_rounded(track, None, 0xefefef, 255);
-        let edge = (track.0 + 0.5 * s, track.1 + 0.5 * s, track.2 - s, track.3 - s, track.4);
+        let edge = (
+            track.0 + 0.5 * s,
+            track.1 + 0.5 * s,
+            track.2 - s,
+            track.3 - s,
+            track.4,
+        );
         c.fill_rounded(track, Some(edge), 0xb2b2b2, 255);
-        let filled = (area.x * s, ty * s, (at - area.x) * s, track_h * s, track_h / 2.0 * s);
+        let filled = (
+            area.x * s,
+            ty * s,
+            (at - area.x) * s,
+            track_h * s,
+            track_h / 2.0 * s,
+        );
         c.fill_rounded(filled, None, accent, 255);
-        let knob = ((at - thumb / 2.0) * s, (area.y + (area.h - thumb) / 2.0) * s, thumb * s, thumb * s, thumb / 2.0 * s);
+        let knob = (
+            (at - thumb / 2.0) * s,
+            (area.y + (area.h - thumb) / 2.0) * s,
+            thumb * s,
+            thumb * s,
+            thumb / 2.0 * s,
+        );
         c.fill_rounded(knob, None, accent, 255);
     }
 
@@ -805,10 +827,19 @@ impl Painter<'_> {
         use crate::document::{FILE_BUTTON, NO_FILE};
         let area = Self::content_area(b, r);
         let s = self.scale;
-        let w = self.fonts.measure(style.font(), style.font_size, FILE_BUTTON) + 12.0;
+        let w = self
+            .fonts
+            .measure(style.font(), style.font_size, FILE_BUTTON)
+            + 12.0;
         let button = (area.x * s, area.y * s, w * s, area.h * s, 2.0 * s);
         c.fill_rounded(button, None, 0xefefef, 255);
-        let edge = (button.0 + s, button.1 + s, button.2 - 2.0 * s, button.3 - 2.0 * s, s);
+        let edge = (
+            button.0 + s,
+            button.1 + s,
+            button.2 - 2.0 * s,
+            button.3 - 2.0 * s,
+            s,
+        );
         c.fill_rounded(button, Some(edge), 0x767676, 255);
         let baseline = self.centered_baseline(style, area);
         self.text(c, style, area.x + 6.0, baseline, FILE_BUTTON, style.color);
@@ -836,25 +867,51 @@ impl Painter<'_> {
         let radius = (area.h / 2.0).min(4.0);
         let track = (area.x * s, area.y * s, area.w * s, area.h * s, radius * s);
         c.fill_rounded(track, None, 0xefefef, 255);
-        let edge = (track.0 + 0.5 * s, track.1 + 0.5 * s, track.2 - s, track.3 - s, track.4);
+        let edge = (
+            track.0 + 0.5 * s,
+            track.1 + 0.5 * s,
+            track.2 - s,
+            track.3 - s,
+            track.4,
+        );
         c.fill_rounded(track, Some(edge), 0xb2b2b2, 255);
         // An indeterminate progress bar (no value) stays empty.
-        let Some(v) = value.or((!progress).then_some(min)) else { return };
-        let f = if max > min { (v - min) / (max - min) } else { 0.0 };
+        let Some(v) = value.or((!progress).then_some(min)) else {
+            return;
+        };
+        let f = if max > min {
+            (v - min) / (max - min)
+        } else {
+            0.0
+        };
         let color = if progress {
             0x0075ff
         } else {
             let low = num("low").unwrap_or(min).clamp(min, max);
             let high = num("high").unwrap_or(max).clamp(low, max);
             let optimum = num("optimum").unwrap_or((min + max) / 2.0);
-            let region = |x: f32| -> i32 { if x < low { 0 } else if x > high { 2 } else { 1 } };
+            let region = |x: f32| -> i32 {
+                if x < low {
+                    0
+                } else if x > high {
+                    2
+                } else {
+                    1
+                }
+            };
             match (region(optimum) - region(v)).abs() {
                 0 => 0x107c10,
                 1 => 0xffb900,
                 _ => 0xd13438,
             }
         };
-        let fill = (area.x * s, area.y * s, area.w * f * s, area.h * s, radius * s);
+        let fill = (
+            area.x * s,
+            area.y * s,
+            area.w * f * s,
+            area.h * s,
+            radius * s,
+        );
         c.fill_rounded(fill, None, color, 255);
     }
 
@@ -1088,7 +1145,10 @@ impl Painter<'_> {
         match self.images.get(node) {
             Some(ImageState::Ready(_, bitmap)) => {
                 let density = self.images.density.get(&node).copied().unwrap_or(1.0);
-                let natural = (bitmap.width as f32 / density, bitmap.height as f32 / density);
+                let natural = (
+                    bitmap.width as f32 / density,
+                    bitmap.height as f32 / density,
+                );
                 let d = self.phys(object_rect(style, area, natural));
                 if d.w > 0
                     && d.h > 0
@@ -1460,7 +1520,14 @@ impl Painter<'_> {
         let mut at = x;
         for item in items {
             match item {
-                Placed::Text { node, x: tx, width, text, shift, .. } => {
+                Placed::Text {
+                    node,
+                    x: tx,
+                    width,
+                    text,
+                    shift,
+                    ..
+                } => {
                     if x + tx + width <= limit {
                         out.push(item.clone());
                         at = x + tx + width;
@@ -1644,8 +1711,18 @@ fn bilinear(canvas: &Canvas, x: f32, y: f32, outside: u32) -> [f32; 3] {
     let (x0, y0) = (x.floor(), y.floor());
     let (fx, fy) = (x - x0, y - y0);
     let (x0, y0) = (x0 as i32, y0 as i32);
-    let p = [at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1)];
-    let weights = [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy];
+    let p = [
+        at(x0, y0),
+        at(x0 + 1, y0),
+        at(x0, y0 + 1),
+        at(x0 + 1, y0 + 1),
+    ];
+    let weights = [
+        (1.0 - fx) * (1.0 - fy),
+        fx * (1.0 - fy),
+        (1.0 - fx) * fy,
+        fx * fy,
+    ];
     let mut out = [0.0; 3];
     for (c, wgt) in p.iter().zip(weights) {
         for (k, shift) in [16, 8, 0].into_iter().enumerate() {
@@ -1692,7 +1769,12 @@ mod tests {
 
     #[test]
     fn object_fit_places_the_image() {
-        let area = RectF { x: 0.0, y: 0.0, w: 100.0, h: 100.0 };
+        let area = RectF {
+            x: 0.0,
+            y: 0.0,
+            w: 100.0,
+            h: 100.0,
+        };
         let at = |fit, position| {
             let style = Style {
                 object_fit: fit,
@@ -1707,7 +1789,10 @@ mod tests {
         assert_eq!(at(cs::ObjectFit::Contain, center), (0.0, 25.0, 100.0, 50.0));
         assert_eq!(at(cs::ObjectFit::Cover, center), (-50.0, 0.0, 200.0, 100.0));
         assert_eq!(at(cs::ObjectFit::None, center), (-50.0, 0.0, 200.0, 100.0));
-        assert_eq!(at(cs::ObjectFit::ScaleDown, center), (0.0, 25.0, 100.0, 50.0));
+        assert_eq!(
+            at(cs::ObjectFit::ScaleDown, center),
+            (0.0, 25.0, 100.0, 50.0)
+        );
         let left = (Dim::Percent(0.0), Dim::Percent(50.0));
         assert_eq!(at(cs::ObjectFit::Cover, left), (0.0, 0.0, 200.0, 100.0));
     }
