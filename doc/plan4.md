@@ -86,6 +86,7 @@
 | 9 | JS 相容：腳本讀取尺寸 / 位置 / 計算樣式時先排版（同瀏覽器的強制排版）；無效選擇器（含不認得的偽類）讓 `querySelector` / `matches` 丟出 `SyntaxError`，選擇器只解析一次；`document.implementation.createHTMLDocument`、`importNode` / `adoptNode`；`<template>.content`；複製 fragment；模組錯誤附堆疊。jQuery 3.7 完整可用，Wikipedia 的「外觀」面板出現 |
 | 10 | 表單控制項：`range`（滑桿，可點擊與拖曳，觸發 `input` / `change`，值依 min / max / step 清理）、`color`（色塊）、`file`（「Choose File / No file chosen」）、`<progress>`、`<meter>`（依 low / high / optimum 顯示綠、黃、紅）；fieldset 的 legend 跨在上框線上並留缺口 |
 | 11 | 彩色 emoji：系統的彩色 emoji 字型（macOS Apple Color Emoji、Linux Noto Color Emoji，以 `memmap2` 映射不整檔讀入），以 rustybuzz 整形（國旗、ZWJ 組合、膚色），畫出字型裡的 PNG 點陣圖；文字依 emoji / 一般字分段 |
+| 12 | 多欄排版：`column-count` / `column-width` / `columns`、`column-gap`（`normal` 為 1em）、`column-rule`；先以單欄寬排版，再求平衡欄高（不小於最高的不可分段），最後把行與子方塊移到各欄（排版多跑兩次） |
 
 ### 第二批調查
 

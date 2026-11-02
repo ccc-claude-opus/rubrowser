@@ -187,6 +187,19 @@ impl Painter<'_> {
             if style.display == Display::ListItem {
                 self.marker(c, b, style, r);
             }
+            if let Some((n, width, gap)) = b.columns {
+                // Rules between the columns, as tall as the content box.
+                let area = Self::content_area(b, r);
+                let (w, _, color) = style.column_rule;
+                for x in crate::layout::columns::rules(style, n, width, gap) {
+                    let rule = RectF {
+                        x: area.x + x - w / 2.0,
+                        w,
+                        ..area
+                    };
+                    self.fill(c, rule, color);
+                }
+            }
         }
         // Content and children, clipped if the box hides overflow.
         let saved = c.clip();

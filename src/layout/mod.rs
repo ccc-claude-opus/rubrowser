@@ -5,6 +5,7 @@
 //! `inline-block` elements are laid out first as separate taffy trees and
 //! then placed in lines like big glyphs.
 
+pub(crate) mod columns;
 pub mod inline;
 
 use std::collections::HashMap;
@@ -63,6 +64,8 @@ pub struct LBox {
     pub content_shift: f32,
     /// `position: sticky` with a `top` offset (px).
     pub sticky_top: Option<f32>,
+    /// A multi-column container's column count, width and gap.
+    pub columns: Option<(u32, f32, f32)>,
 }
 
 impl LBox {
@@ -155,6 +158,11 @@ struct Builder<'a> {
     bases: HashMap<NodeId, (f32, f32)>,
     /// Elements with mixed `calc()` values, with the bases assumed.
     calc_nodes: Vec<(NodeId, (f32, f32))>,
+    /// Multi-column containers' plans from the previous pass.
+    plans: HashMap<NodeId, columns::Plan>,
+    /// Multi-column containers in this pass, with the padding added to
+    /// narrow their content to one column.
+    multicol: Vec<(NodeId, f32)>,
     /// Positioned elements being built (innermost last), each with the
     /// absolutely positioned descendants hoisted to it as its children.
     abs_stack: Vec<(NodeId, Vec<taffy::NodeId>)>,
@@ -178,30 +186,38 @@ pub fn layout(
 ) -> LayoutTree {
     CALC_BASE.with(|b| b.set((width, height)));
     VIEWPORT.with(|v| v.set((width, height)));
-    let mut caps = HashMap::new();
-    let mut bases = HashMap::new();
-    // Shrink-to-fit needs the container width, and mixed `calc()` values
-    // their containing block's size, which are only known after layout:
+    let mut hints = Hints::default();
+    // Shrink-to-fit needs the container width, mixed `calc()` values their
+    // containing block's size, and multi-column containers their width and
+    // then their content's height, which are only known after layout:
     // re-run with what the previous pass found.
-    for _ in 0..3 {
-        let (tree, overflow, wrong) = layout_pass(
-            dom,
-            styles,
-            generated,
-            fonts,
-            width,
-            height,
-            replaced,
-            caps.clone(),
-            bases.clone(),
-        );
-        if overflow.is_empty() && wrong.is_empty() {
+    for _ in 0..4 {
+        let (tree, found) = layout_pass(dom, styles, generated, fonts, width, height, replaced, hints.clone());
+        if found.is_empty() {
             return tree;
         }
-        caps.extend(overflow);
-        bases.extend(wrong);
+        hints.caps.extend(found.caps);
+        hints.bases.extend(found.bases);
+        hints.plans.extend(found.plans);
     }
-    layout_pass(dom, styles, generated, fonts, width, height, replaced, caps, bases).0
+    layout_pass(dom, styles, generated, fonts, width, height, replaced, hints).0
+}
+
+/// What layout passes learn for the next one (see [`layout`]).
+#[derive(Clone, Default)]
+struct Hints {
+    /// Widths inline-blocks shrink to.
+    caps: HashMap<NodeId, f32>,
+    /// Containing block sizes of elements with mixed `calc()` values.
+    bases: Bases,
+    /// Multi-column containers' widths and column heights.
+    plans: HashMap<NodeId, columns::Plan>,
+}
+
+impl Hints {
+    fn is_empty(&self) -> bool {
+        self.caps.is_empty() && self.bases.is_empty() && self.plans.is_empty()
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -213,9 +229,8 @@ fn layout_pass(
     width: f32,
     height: f32,
     replaced: &Replaced,
-    caps: HashMap<NodeId, f32>,
-    bases: Bases,
-) -> (LayoutTree, HashMap<NodeId, f32>, Bases) {
+    hints: Hints,
+) -> (LayoutTree, Hints) {
     let mut gen_of: HashMap<NodeId, [Option<usize>; 2]> = HashMap::new();
     for (i, g) in generated.iter().enumerate() {
         gen_of.entry(g.owner).or_default()[g.after as usize] = Some(i);
@@ -223,10 +238,12 @@ fn layout_pass(
     let mut b = Builder {
         generated,
         gen_of,
-        caps,
+        caps: hints.caps,
         overflow: HashMap::new(),
-        bases,
+        bases: hints.bases,
         calc_nodes: Vec::new(),
+        plans: hints.plans,
+        multicol: Vec::new(),
         abs_stack: Vec::new(),
         in_block: true,
         fixed: Vec::new(),
@@ -258,6 +275,7 @@ fn layout_pass(
         z: 0,
         content_shift: 0.0,
         sticky_top: None,
+        columns: None,
     });
     if let Some(html) = dom.html().filter(|&h| styles[h].is_some()) {
         let mut tree: TaffyTree<Ctx> = TaffyTree::new();
@@ -287,8 +305,12 @@ fn layout_pass(
         vp.children.extend(fixed);
         vp.content_h = content_h;
     }
-    let wrong = b.wrong_bases();
-    (LayoutTree { boxes: b.boxes }, b.overflow, wrong)
+    let found = Hints {
+        caps: std::mem::take(&mut b.overflow),
+        bases: b.wrong_bases(),
+        plans: b.lay_columns(),
+    };
+    (LayoutTree { boxes: b.boxes }, found)
 }
 
 impl Builder<'_> {
@@ -324,6 +346,72 @@ impl Builder<'_> {
             }
         }
         out
+    }
+
+    /// Lays a multi-column container's content out as one column (extra
+    /// right padding), as tall as its balanced columns once known.
+    fn narrow_to_column(&mut self, id: NodeId, css: &Css, t: &mut Style) {
+        let Some(plan) = self.plans.get(&id).copied() else {
+            self.multicol.push((id, 0.0));
+            return;
+        };
+        let (_, width) = columns::columns(css, plan.avail);
+        let extra = (plan.avail - width).max(0.0);
+        let right = css.padding[cs::RIGHT].px_or_zero(plan.avail);
+        t.padding.right = LengthPercentage::length(right + extra);
+        let content_box = css.box_sizing == cs::BoxSizing::ContentBox;
+        if let (Dim::Px(w), true) = (css.width, content_box) {
+            t.size.width = Dimension::length((w - extra).max(0.0));
+        }
+        if let Some(h) = plan.height {
+            let around = if content_box {
+                0.0
+            } else {
+                css.padding[cs::TOP].px_or_zero(plan.avail)
+                    + css.padding[cs::BOTTOM].px_or_zero(plan.avail)
+                    + css.border(cs::TOP)
+                    + css.border(cs::BOTTOM)
+            };
+            t.size.height = Dimension::length(h + around);
+        }
+        self.multicol.push((id, extra));
+    }
+
+    /// After a pass: measures multi-column containers, and once their
+    /// width and height are settled moves their content into columns.
+    /// Returns the plans that changed (another pass is needed).
+    fn lay_columns(&mut self) -> HashMap<NodeId, columns::Plan> {
+        let mut changed = HashMap::new();
+        for (id, extra) in std::mem::take(&mut self.multicol) {
+            let Some(index) = self.boxes.iter().position(|b| b.node == Some(id)) else {
+                continue;
+            };
+            let Some(css) = self.style(id).cloned() else { continue };
+            let b = &self.boxes[index];
+            let avail = b.rect.w - b.padding[cs::LEFT] - b.padding[cs::RIGHT]
+                - b.border[cs::LEFT]
+                - b.border[cs::RIGHT]
+                + extra;
+            let (n, width) = columns::columns(&css, avail);
+            let gap = columns::gap(&css, avail);
+            let plan = self.plans.get(&id).copied();
+            match plan {
+                Some(p) if (p.avail - avail).abs() <= 0.5 => match p.height {
+                    None => {
+                        let height = columns::balance(&self.boxes, index, n);
+                        changed.insert(id, columns::Plan { avail, height: Some(height) });
+                    }
+                    Some(height) => {
+                        columns::distribute(&mut self.boxes, index, n, width, gap, height);
+                        self.boxes[index].columns = Some((n, width, gap));
+                    }
+                },
+                _ => {
+                    changed.insert(id, columns::Plan { avail, height: None });
+                }
+            }
+        }
+        changed
     }
 
     /// Whether element `id` has a percentage (or calc with %) width.
@@ -476,6 +564,9 @@ impl Builder<'_> {
             self.calc_nodes.push((id, base));
         }
         let mut tstyle = convert(&css);
+        if columns::is_multicol(&css) {
+            self.narrow_to_column(id, &css, &mut tstyle);
+        }
         // `<center>` / `align=center`: block children with no horizontal
         // margins are centered.
         let centered = in_block
@@ -859,6 +950,7 @@ impl Builder<'_> {
             z,
             content_shift: 0.0,
             sticky_top,
+            columns: None,
         });
         let kids: Vec<usize> = tree
             .children(node)
@@ -1608,6 +1700,36 @@ mod tests {
         assert_eq!(a.w, 300.0);
         assert_eq!(a.y, 10.0);
         assert_eq!(b.y, 40.0, "adjacent vertical margins collapse");
+    }
+
+    #[test]
+    fn multi_column_layout_balances_lines() {
+        let text = "word ".repeat(60);
+        let html = format!(
+            "<style>body{{margin:0}} #m{{column-count:3;column-gap:20px;width:320px}}</style>\
+             <div id=m>{text}</div><p id=after style='margin:0'>x</p>"
+        );
+        let l = lay(&html, 800.0, 600.0);
+        let target = l.dom.element_by_id("m").unwrap();
+        let b = l.tree.boxes.iter().find(|b| b.node == Some(target)).unwrap();
+        assert_eq!(b.columns, Some((3, 280.0 / 3.0, 20.0)));
+        let lines = &b.inline.as_ref().unwrap().lines;
+        let in_col = |k: usize| {
+            let x0 = k as f32 * (280.0 / 3.0 + 20.0);
+            lines
+                .iter()
+                .filter(|l| match l.items.first() {
+                    Some(inline::Placed::Text { x, .. }) => *x >= x0 - 1.0 && *x < x0 + 50.0,
+                    _ => false,
+                })
+                .count()
+        };
+        let counts = [in_col(0), in_col(1), in_col(2)];
+        assert_eq!(counts.iter().sum::<usize>(), lines.len());
+        assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{counts:?}");
+        let tallest = lines.iter().map(|l| l.top + l.height).fold(0.0, f32::max);
+        assert!((b.rect.h - tallest).abs() < 1.0, "the box is as tall as a column");
+        assert_eq!(l.rect("after").y, b.rect.h);
     }
 
     #[test]

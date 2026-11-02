@@ -320,6 +320,11 @@ pub struct Style {
     pub translate: (Dim, Dim),
     pub rotate: f32,
     pub scale: (f32, f32),
+    /// Multi-column layout: `column-count` and `column-width` (px), and
+    /// `column-rule` (width, style, color).
+    pub column_count: Option<u32>,
+    pub column_width: Option<f32>,
+    pub column_rule: (f32, LineStyle, Rgba),
     /// `container-type: size | inline-size` (a query container) and its
     /// `container-name`s.
     pub container: bool,
@@ -436,6 +441,9 @@ impl Default for Style {
             rotate: 0.0,
             scale: (1.0, 1.0),
             ellipsis: false,
+            column_count: None,
+            column_width: None,
+            column_rule: (3.0, LineStyle::None, Rgba::BLACK),
             container: false,
             container_names: Rc::new([]),
             object_fit: ObjectFit::Fill,
@@ -922,6 +930,50 @@ impl Style {
                 let mut t = (*self.transitions).clone();
                 if t.set(name, value) {
                     self.transitions = Rc::new(t);
+                }
+            }
+            "column-count" => {
+                self.column_count = v.parse::<u32>().ok().filter(|&n| n > 0);
+            }
+            "column-width" => self.column_width = px(v).filter(|&w| w > 0.0),
+            // `columns: <width> || <count>`
+            "columns" => {
+                self.column_count = None;
+                self.column_width = None;
+                for t in tokens(v) {
+                    if let Ok(n) = t.parse::<u32>() {
+                        self.column_count = Some(n).filter(|&n| n > 0);
+                    } else if let Some(w) = px(t) {
+                        self.column_width = Some(w).filter(|&w| w > 0.0);
+                    }
+                }
+            }
+            "column-rule" => {
+                let mut rule = (3.0, LineStyle::None, self.color);
+                for t in tokens(v) {
+                    if let Some(s) = border_style(t) {
+                        rule.1 = s;
+                    } else if let Some(w) = border_width(t, fc) {
+                        rule.0 = w;
+                    } else if let Some(c) = values::color(t, self.color) {
+                        rule.2 = c;
+                    }
+                }
+                self.column_rule = rule;
+            }
+            "column-rule-width" => {
+                if let Some(w) = border_width(v, fc) {
+                    self.column_rule.0 = w;
+                }
+            }
+            "column-rule-style" => {
+                if let Some(s) = border_style(v) {
+                    self.column_rule.1 = s;
+                }
+            }
+            "column-rule-color" => {
+                if let Some(c) = values::color(v, self.color) {
+                    self.column_rule.2 = c;
                 }
             }
             "container-type" => match v {
