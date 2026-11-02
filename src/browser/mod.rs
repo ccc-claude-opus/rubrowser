@@ -470,8 +470,13 @@ struct Tab {
     pending: std::collections::VecDeque<PendingScript>,
     /// Index in `scripts` of the page's runtime for each script MIME type.
     runtimes: HashMap<String, usize>,
-    /// Number of `<script>`s found when the page loaded.
+    /// Number of script slots given out (the page's, then inserted ones).
     script_count: usize,
+    /// Number of slots that have left the queue (run or skipped): pending
+    /// script `slot` is at index `slot - consumed`.
+    consumed: usize,
+    /// The page's scripts are being queued: nothing runs until all are.
+    queuing: bool,
     /// Whether `DOMContentLoaded` / `load` have fired.
     loaded: bool,
     /// The page's import map (bare specifier or prefix → URL).
@@ -500,11 +505,6 @@ impl Tab {
             None => Some(&mut self.doc),
             Some(n) => self.doc.frame_mut(n),
         }
-    }
-
-    /// Number of `<script>`s queued since the page loaded (run or not).
-    fn scripts_seen(&self) -> usize {
-        self.script_count
     }
 
     fn url(&self) -> &str {
@@ -621,6 +621,8 @@ impl Browser {
             post: None,
             runtimes: HashMap::new(),
             script_count: 0,
+            consumed: 0,
+            queuing: false,
             loaded: false,
             known: Default::default(),
             link_events: Vec::new(),
@@ -789,7 +791,19 @@ impl Browser {
                 .count();
             scripts.insert(at, (Lang::Source(JS_MIME.to_string()), None, code, None));
         }
+        // Module scripts, and classic ones with `src` and `defer` / `async`,
+        // run after the others (HTML: deferred until the document is parsed;
+        // async ones run here then too).
+        let dom = &tab.doc.dom;
+        scripts.sort_by_key(|(lang, src, _, node)| {
+            let has = |a: &str| node.is_some_and(|n| dom.attr(n, a).is_some());
+            let deferred =
+                *lang == Lang::Module || (src.is_some() && (has("defer") || has("async")));
+            deferred as u8
+        });
         tab.script_count = scripts.len();
+        tab.consumed = 0;
+        tab.queuing = true;
         tab.loaded = false;
         tab.link_events.clear();
         tab.known = tab
@@ -859,6 +873,7 @@ impl Browser {
                 }),
             }
         }
+        self.tabs[i].queuing = false;
         self.run_scripts(i, host);
         self.dirty = true;
     }
@@ -866,6 +881,9 @@ impl Browser {
     /// Runs pending scripts of tab `i` from the front while they are ready,
     /// then fires the load events once all have run.
     fn run_scripts(&mut self, i: usize, host: &mut dyn Host) {
+        if self.tabs[i].queuing {
+            return;
+        }
         loop {
             let tab = &mut self.tabs[i];
             if tab.pending.is_empty() {
@@ -895,6 +913,7 @@ impl Browser {
             {
                 let skipped = tab.pending.len();
                 tab.pending.clear();
+                tab.consumed += skipped;
                 host.log(&format!(
                     "skipped {skipped} scripts: the page's script time budget is used up"
                 ));
@@ -904,6 +923,7 @@ impl Browser {
                 return;
             }
             let p = tab.pending.pop_front().unwrap();
+            tab.consumed += 1;
             // Later slots shift down as the front is consumed.
             let body = match p.body.unwrap() {
                 Ok(b) => b,
@@ -960,10 +980,9 @@ impl Browser {
         host: &mut dyn Host,
     ) {
         let (id, serial) = (self.tabs[i].id, self.tabs[i].serial);
-        let total = self.tabs[i].scripts_seen();
         let tab = &mut self.tabs[i];
         let map = tab.import_map.clone();
-        let index = slot.checked_sub(total - tab.pending.len());
+        let index = slot.checked_sub(tab.consumed);
         let Some(p) = index.and_then(|k| tab.pending.get_mut(k)) else {
             return;
         };
@@ -1410,9 +1429,8 @@ impl Browser {
                 };
                 // Slots count from the start of the page's script list;
                 // already-run scripts have left the queue.
-                let total = self.tabs[i].scripts_seen();
                 let tab = &mut self.tabs[i];
-                let index = slot.checked_sub(total - tab.pending.len());
+                let index = slot.checked_sub(tab.consumed);
                 if let Some(p) = index.and_then(|k| tab.pending.get_mut(k)) {
                     match &p.graph {
                         Some(g) => {
@@ -3492,6 +3510,10 @@ mod tests {
               const meta = document.createElement('meta');
               meta.content = 'x';
               console.log('meta ' + meta.content);
+              console.log('annex-b ' + 'abcdef'.substr(1, 3) + ' ' + document.createElement('_x').localName);
+              console.log('frames ' + (window.frames === window) + ' ' + window.length);
+              window.addEventListener('message', (e) => console.log('message ' + e.data.n));
+              window.postMessage({ n: 7 }, '*');
               const doc = document.implementation.createHTMLDocument('t');
               doc.body.innerHTML = '<form></form><form></form>';
               console.log('forms ' + doc.body.childNodes.length + ' ' + doc.title);
@@ -3506,6 +3528,9 @@ mod tests {
             "ok #box:hover",
             "forms 2 t",
             "template 4 2",
+            "annex-b bcd _x",
+            "frames true 0",
+            "message 7",
             "meta x",
         ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
@@ -3555,6 +3580,29 @@ mod tests {
         for want in ["start 5 #000000", "input 2", "input 9", "change 9"] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
+    }
+
+    #[test]
+    fn inline_modules_run_in_order() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script type=module>console.log('mod1')</script>
+            <script type=module>console.log('mod2 ' + typeof globalThis.x)</script>
+            <script>var x = 1; console.log('classic');
+              document.addEventListener('DOMContentLoaded', () => console.log('dcl'));</script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let order: Vec<&str> = h.logs.iter().map(String::as_str).collect();
+        // Module scripts run after the classic one (they are deferred) but
+        // before DOMContentLoaded.
+        assert_eq!(
+            order,
+            ["classic", "mod1", "mod2 number", "dcl"],
+            "{order:?}"
+        );
     }
 
     #[test]

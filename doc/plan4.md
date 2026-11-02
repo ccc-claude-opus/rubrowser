@@ -88,6 +88,7 @@
 | 11 | 彩色 emoji：系統的彩色 emoji 字型（macOS Apple Color Emoji、Linux Noto Color Emoji，以 `memmap2` 映射不整檔讀入），以 rustybuzz 整形（國旗、ZWJ 組合、膚色），畫出字型裡的 PNG 點陣圖；文字依 emoji / 一般字分段 |
 | 12 | 多欄排版：`column-count` / `column-width` / `columns`、`column-gap`（`normal` 為 1em）、`column-rule`；先以單欄寬排版，再求平衡欄高（不小於最高的不可分段），最後把行與子方塊移到各欄（排版多跑兩次） |
 | 13 | 直排 `writing-mode: vertical-rl / vertical-lr`（只含行內內容的元素）：行變成欄（右到左或左到右），欄長為元素高度；中日韓字直立，其他文字轉 90°（`text-orientation: mixed`）。還不支援直排中的區塊排版與標點的直排位置 |
+| 14 | 第三批調查的修正：繪製順序照 CSS 2.1 附錄 E（負 z-index、一般流、定位元素依樹順序與 z-index；相對定位也算定位元素）；行內模組腳本原本不會執行（排隊時用錯索引）已修正，模組與 `defer` / `async` 腳本延到一般腳本之後；boa 開啟 Annex B（`substr`、`escape` 等瀏覽器都有的功能）；`createElement` 依 DOM 標準檢查名稱；`window.frames` / `top` / `parent` / `length`、`window.postMessage` |
 
 ### 第二批調查
 
@@ -98,6 +99,18 @@
 | CNN | 文章與圖片正常；頁首導覽列要等它自己的 JS 顯示（目前 JS 執行失敗） |
 | YouTube、craigslist | 整頁由 JS 產生，尚未能顯示 |
 | Amazon、w3.org、npm、Stack Overflow | 機器人檢查頁（Akamai / Cloudflare），不嘗試通過 |
+
+### 第三批調查（2026-11-02）
+
+| 網站 | 狀況 |
+|---|---|
+| gov.uk、dev.to、ja.wikipedia、kernel.org、docs.python.org、wordpress.org、The Verge | 與 Chrome 相近 |
+| python.org | 首頁的程式碼輪播（JS）現在也會出現 |
+| Cloudflare | 主視覺正確（原本被一個應在下層的白色面板蓋住）；背景影片不播放；頁首選單由它的 JS 隱藏 |
+| w3schools | JS 錯誤已排除；主視覺區的腳本被 Akamai 拒絕（機器人防護，不處理） |
+| NPR | 標誌過大蓋到選單 |
+| NASA | 頁首文字重疊 |
+| microsoft.com | 以 User-Agent 判定為自動程式（保留 rubrowser 字樣，不處理） |
 
 ## 5. 不做的事
 

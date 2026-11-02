@@ -1246,7 +1246,21 @@
       cookieJar = [...rest, pair.trim()].join('; ');
     },
   });
-  for (const name of ['load', 'domcontentloaded', 'keydown', 'click']) handlerProperty(global, name);
+  for (const name of ['load', 'domcontentloaded', 'keydown', 'click', 'message']) handlerProperty(global, name);
+
+  // window.postMessage: a `message` event at this window, later. (There
+  // are no other windows to talk to: frames run no scripts.)
+  global.postMessage = function (data) {
+    const copy = structuredClone(data);
+    addTimer(() => {
+      const e = new Event('message');
+      e.data = copy;
+      e.origin = location.origin;
+      e.source = global;
+      e.ports = [];
+      document.dispatchEvent(e);
+    }, 0, [], false);
+  };
 
   // Properties reflecting attributes: strings, then booleans.
   // <template>.content: a fragment with the parsed contents (moved there
@@ -1353,12 +1367,20 @@
     }
   }
 
+  // window.length: the number of child frames (window.frames is window).
+  Object.defineProperty(global, 'length', {
+    configurable: true,
+    get: () => rb.queryAll('iframe').length,
+  });
   for (const [name, which] of [['innerWidth', 2], ['innerHeight', 3], ['outerWidth', 2], ['outerHeight', 3]]) {
     Object.defineProperty(global, name, { configurable: true, get: () => rb.rect(0, which) });
   }
   Object.assign(global, {
     window: global,
     self: global,
+    frames: global,
+    top: global,
+    parent: global,
     document,
     console,
     location,

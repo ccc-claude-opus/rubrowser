@@ -253,21 +253,27 @@ impl Painter<'_> {
             });
             self.inline(c, il, r.x + cx, r.y + cy - sy, end);
         }
-        // In-flow children first, then positioned ones on top by z-index.
-        let mut positioned = Vec::new();
-        for &child in &b.children {
+        // Children in CSS 2.1 Appendix E order (within this box): positioned
+        // ones with negative z-index, then the flow, then positioned ones by
+        // z-index (tree order among equals: the sort is stable).
+        let bottom = r.y + r.h - b.padding[cs::BOTTOM] - b.border[cs::BOTTOM];
+        let place = |child: usize| {
             let cb = &self.tree.boxes[child];
-            if cb.absolute {
-                positioned.push(child);
+            let shift = if cb.absolute {
+                0.0
             } else {
-                let bottom = r.y + r.h - b.padding[cs::BOTTOM] - b.border[cs::BOTTOM];
-                let shift = cb.sticky_shift(r.y - sy + cb.rect.y, self.view_top.get(), bottom);
-                self.paint_box(c, child, r.x, r.y - sy + shift);
-            }
-        }
+                cb.sticky_shift(r.y - sy + cb.rect.y, self.view_top.get(), bottom)
+            };
+            (r.x, r.y - sy + shift)
+        };
+        let (mut positioned, flow): (Vec<usize>, Vec<usize>) =
+            b.children.iter().partition(|&&k| self.is_positioned(k));
         positioned.sort_by_key(|&k| self.tree.boxes[k].z);
-        for child in positioned {
-            self.paint_box(c, child, r.x, r.y - sy);
+        let (below, above): (Vec<usize>, Vec<usize>) =
+            positioned.iter().partition(|&&k| self.tree.boxes[k].z < 0);
+        for child in below.into_iter().chain(flow).chain(above) {
+            let (x, y) = place(child);
+            self.paint_box(c, child, x, y);
         }
         if let Some(node) = b.node
             && self.dom.tag(node) != Some("button")
@@ -692,6 +698,17 @@ impl Painter<'_> {
             label,
             style.color,
         );
+    }
+
+    /// Whether box `k` is positioned (not `static`), which puts it in the
+    /// positioned painting layers.
+    fn is_positioned(&self, k: usize) -> bool {
+        let b = &self.tree.boxes[k];
+        b.absolute
+            || (b.node == Some(b.style_node)
+                && self
+                    .style(b.style_node)
+                    .is_some_and(|s| s.position != cs::Position::Static))
     }
 
     /// Where the legend of `<fieldset>` box `b` (at `r`) is, if it has one.

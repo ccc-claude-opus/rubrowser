@@ -403,6 +403,24 @@ fn element(doc: &Document, h: i32) -> Option<NodeId> {
 }
 
 /// Elements matching `selector`, in document order.
+/// A valid element local name (DOM standard): starting with an ASCII
+/// letter, anything but whitespace, NUL, `/` and `>`; else `:`, `_` or a
+/// non-ASCII character, then name characters.
+fn valid_element_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if first.is_ascii_alphabetic() {
+        return !name
+            .chars()
+            .any(|c| c.is_ascii_whitespace() || matches!(c, '\0' | '/' | '>'));
+    }
+    let name_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | ':' | '_') || !c.is_ascii();
+    (matches!(first, ':' | '_') || !first.is_ascii()) && chars.all(name_char)
+}
+
 /// Elements matching `selector` in document order; `None` if it is invalid.
 fn select(doc: &Document, selector: &str) -> Option<Vec<NodeId>> {
     css::query(
@@ -749,11 +767,7 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
         "create_element",
         |mut c: C, p: i32, n: i32| -> Result<i32, Error> {
             let tag = read_str(&c, p, n)?;
-            if tag.is_empty()
-                || !tag
-                    .chars()
-                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-            {
+            if !valid_element_name(&tag) {
                 return Ok(-1);
             }
             Ok(c.data_mut()
