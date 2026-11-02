@@ -1342,6 +1342,115 @@
     transferControlToOffscreen() { throw new Error('NotSupportedError'); },
   });
 
+  // ----- <video> / <audio> ---------------------------------------------------
+  // HTMLMediaElement: the browser plays; state is read back with `info`.
+
+  function mediaInfo(el) {
+    const v = String(rb.media(el.__h, 'info') || '').split(',');
+    return {
+      paused: v[0] !== '0', ended: v[1] === '1', currentTime: Number(v[2]) || 0,
+      duration: v[3] === undefined ? NaN : Number(v[3]), readyState: Number(v[4]) || 0,
+      volume: v[5] === undefined ? 1 : Number(v[5]), muted: v[6] === '1',
+      videoWidth: Number(v[7]) || 0, videoHeight: Number(v[8]) || 0,
+      error: Number(v[9]) || 0, src: v.slice(10).join(','),
+    };
+  }
+  class TimeRanges {
+    constructor(ranges) { this._r = ranges; }
+    get length() { return this._r.length; }
+    start(i) { return this._r[i][0]; }
+    end(i) { return this._r[i][1]; }
+  }
+  const mediaMethods = {
+    play() {
+      const r = rb.media(this.__h, 'play');
+      if (r === 'ok') return Promise.resolve();
+      const e = new Error(r === 'NotAllowedError'
+        ? "play() failed because the user didn't interact with the document first."
+        : 'The element has no supported sources.');
+      e.name = r || 'NotSupportedError';
+      return Promise.reject(e);
+    },
+    pause() { rb.media(this.__h, 'pause'); },
+    load() { rb.media(this.__h, 'load'); },
+    canPlayType(type) { return rb.media(this.__h, 'canPlayType' + SEP + String(type)) || ''; },
+    fastSeek(t) { this.currentTime = t; },
+    addTextTrack() { return { mode: 'disabled', cues: [], addCue() {} }; },
+    captureStream() { throw new Error('NotSupportedError'); },
+  };
+  for (const [name, fn] of Object.entries(mediaMethods)) {
+    Object.defineProperty(Element.prototype, name, {
+      configurable: true,
+      writable: true,
+      value: function (...a) {
+        if (this.localName !== 'video' && this.localName !== 'audio') {
+          throw new TypeError(name + ' is not a function');
+        }
+        return fn.apply(this, a);
+      },
+    });
+  }
+  const mediaProps = {
+    paused: (i) => i.paused,
+    ended: (i) => i.ended,
+    duration: (i) => i.duration,
+    readyState: (i) => i.readyState,
+    videoWidth: (i) => i.videoWidth,
+    videoHeight: (i) => i.videoHeight,
+    currentSrc: (i) => i.src,
+    error: (i) => (i.error ? { code: i.error, message: '' } : null),
+    networkState: (i) => (i.error ? 3 : i.src ? 1 : 0),
+    seeking: () => false,
+    playbackRate: () => 1,
+    defaultPlaybackRate: () => 1,
+    buffered: (i) => new TimeRanges(isFinite(i.duration) ? [[0, i.duration]] : []),
+    seekable: (i) => new TimeRanges(isFinite(i.duration) ? [[0, i.duration]] : []),
+    played: () => new TimeRanges([]),
+    textTracks: () => [],
+    audioTracks: () => [],
+    videoTracks: () => [],
+  };
+  for (const [name, get] of Object.entries(mediaProps)) {
+    Object.defineProperty(Element.prototype, name, {
+      configurable: true,
+      get() { return this.localName === 'video' || this.localName === 'audio' ? get(mediaInfo(this)) : undefined; },
+      set() {},
+    });
+  }
+  Object.defineProperty(Element.prototype, 'currentTime', {
+    configurable: true,
+    get() { return mediaInfo(this).currentTime; },
+    set(v) { rb.media(this.__h, 'seek' + SEP + Number(v)); },
+  });
+  Object.defineProperty(Element.prototype, 'volume', {
+    configurable: true,
+    get() { return mediaInfo(this).volume; },
+    set(v) {
+      if (!(v >= 0 && v <= 1)) throw new RangeError('IndexSizeError');
+      rb.media(this.__h, 'volume' + SEP + Number(v));
+    },
+  });
+  Object.defineProperty(Element.prototype, 'muted', {
+    configurable: true,
+    get() { return mediaInfo(this).muted; },
+    set(v) { rb.media(this.__h, 'muted' + SEP + (v ? 1 : 0)); },
+  });
+  for (const [prop, attr] of [['controls'], ['loop'], ['autoplay'], ['defaultMuted', 'muted'], ['playsInline', 'playsinline']]) {
+    Object.defineProperty(Element.prototype, prop, {
+      configurable: true,
+      get() { return this.hasAttribute(attr || prop); },
+      set(v) {
+        this.toggleAttribute(attr || prop, !!v);
+        if (prop === 'loop') rb.media(this.__h, 'loop' + SEP + (v ? 1 : 0));
+      },
+    });
+  }
+  Object.defineProperty(Element.prototype, 'poster', {
+    configurable: true,
+    get() { return absolute(this.getAttribute('poster')); },
+    set(v) { this.setAttribute('poster', v); },
+  });
+
   // A document that is not shown (DOMParser, createHTMLDocument): its
   // elements live detached in the page's DOM; scripts in it never run.
   function detachedDocument(markup) {
@@ -1565,7 +1674,9 @@
   for (const name of ['load', 'error', 'click', 'dblclick', 'contextmenu', 'input', 'change', 'submit',
     'reset', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'mousedown', 'mouseup', 'mousemove',
     'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'wheel', 'scroll', 'pointerdown', 'pointerup',
-    'animationend', 'transitionend']) {
+    'animationend', 'transitionend', 'play', 'pause', 'playing', 'ended', 'timeupdate',
+    'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'durationchange', 'volumechange',
+    'seeking', 'seeked', 'progress', 'waiting', 'loadstart', 'emptied', 'stalled', 'suspend']) {
     Object.defineProperty(Element.prototype, 'on' + name, {
       configurable: true,
       enumerable: true,
@@ -1674,6 +1785,16 @@
     HTMLFormElement: Element,
     HTMLImageElement: Element,
     HTMLCanvasElement: Element,
+    HTMLMediaElement: Element,
+    HTMLVideoElement: Element,
+    HTMLAudioElement: Element,
+    HTMLSourceElement: Element,
+    TimeRanges,
+    Audio: function Audio(src) {
+      const a = document.createElement('audio');
+      if (src !== undefined) a.src = src;
+      return a;
+    },
     CanvasRenderingContext2D,
     CanvasGradient,
     CanvasPattern,

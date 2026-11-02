@@ -48,6 +48,8 @@ pub struct Painter<'a> {
     pub overlay: &'a HashMap<NodeId, Style>,
     /// Bitmaps of `<canvas>` elements.
     pub canvases: &'a crate::document::canvas::Canvases,
+    /// Players of `<video>` / `<audio>` elements.
+    pub media: &'a crate::document::media::MediaElements,
 }
 
 /// What an image layer paints.
@@ -310,6 +312,7 @@ impl Painter<'_> {
                         }
                     }
                 }
+                Some("video" | "audio") => self.media_element(c, b, node, style, r),
                 Some("progress") => self.bar(c, b, node, r, true),
                 Some("meter") => self.bar(c, b, node, r, false),
                 _ => {}
@@ -885,6 +888,184 @@ impl Painter<'_> {
         let baseline = self.centered_baseline(style, area);
         self.text(c, style, area.x + 6.0, baseline, FILE_BUTTON, style.color);
         self.text(c, style, area.x + w + 6.0, baseline, NO_FILE, style.color);
+    }
+
+    /// A video's current frame (once it was started, or when it has no
+    /// poster) or else its poster, and the control bar of `controls`.
+    fn media_element(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
+        let el = self.media.get(&node);
+        let video = self.dom.tag(node) == Some("video");
+        let has_poster = matches!(self.images.get(node), Some(ImageState::Ready(..)));
+        let frame = el
+            .filter(|m| m.started || !has_poster)
+            .and_then(|m| m.frame())
+            .filter(|_| video);
+        let area = Self::content_area(b, r);
+        if let Some(f) = frame {
+            let d = self.phys(object_rect(style, area, (f.width as f32, f.height as f32)));
+            let saved = c.clip();
+            c.set_clip(self.phys(area).intersect(&saved));
+            c.blit_scaled(d, f.width as usize, f.height as usize, &f.rgb);
+            c.set_clip(saved);
+        } else if video && has_poster {
+            self.image(c, b, node, style, r);
+        }
+        if self.dom.attr(node, "controls").is_some() {
+            let info = el.map(|m| m.info()).unwrap_or_default();
+            self.media_controls(c, area, &info, el.is_some_and(|m| m.muted), video);
+        }
+    }
+
+    /// The control bar at the bottom of `area` (all of it for audio):
+    /// play / pause, time, a progress track and the speaker.
+    fn media_controls(
+        &self,
+        c: &mut Canvas,
+        area: RectF,
+        info: &crate::media::Info,
+        muted: bool,
+        video: bool,
+    ) {
+        let s = self.scale;
+        let h = crate::document::media::CONTROLS_HEIGHT.min(area.h);
+        let bar = RectF {
+            y: area.y + area.h - h,
+            h,
+            ..area
+        };
+        let (fg, bg) = if video {
+            (Rgba::new(255, 255, 255, 255), Rgba::new(0, 0, 0, 140))
+        } else {
+            (Rgba::new(32, 33, 36, 255), Rgba::new(241, 243, 244, 255))
+        };
+        let round = if video { 0.0 } else { h / 2.0 };
+        c.fill_rounded(
+            (bar.x * s, bar.y * s, bar.w * s, bar.h * s, round * s),
+            None,
+            bg.rgb(),
+            bg.a,
+        );
+        let mid = bar.y + h / 2.0;
+        // Play (a triangle) or pause (two bars).
+        let (px, size) = (bar.x + 14.0, 12.0);
+        if info.paused {
+            for k in 0..(size as i32) {
+                let y = mid - size / 2.0 + k as f32;
+                let w = size * (1.0 - (2.0 * k as f32 / size - 1.0).abs()) * 0.85;
+                self.fill(
+                    c,
+                    RectF {
+                        x: px,
+                        y,
+                        w,
+                        h: 1.0,
+                    },
+                    fg,
+                );
+            }
+        } else {
+            for dx in [0.0, 7.0] {
+                self.fill(
+                    c,
+                    RectF {
+                        x: px + dx,
+                        y: mid - size / 2.0,
+                        w: 4.0,
+                        h: size,
+                    },
+                    fg,
+                );
+            }
+        }
+        // Time: current / total.
+        let clock = |t: f64| {
+            if !t.is_finite() {
+                return "0:00".to_string();
+            }
+            let t = t.max(0.0) as u64;
+            format!("{}:{:02}", t / 60, t % 60)
+        };
+        let label = format!("{} / {}", clock(info.current_time), clock(info.duration));
+        let text_style = Style {
+            font_size: 12.0,
+            color: fg,
+            ..Style::default()
+        };
+        let m = self.fonts.line_metrics(text_style.font(), 12.0);
+        let tx = px + size + 12.0;
+        self.text(
+            c,
+            &text_style,
+            tx,
+            mid + (m.ascent - m.descent) / 2.0,
+            &label,
+            fg,
+        );
+        // Progress track.
+        let (x0, x1) = crate::document::media::progress_track(area);
+        if x1 > x0 {
+            let track = RectF {
+                x: x0,
+                y: mid - 2.0,
+                w: x1 - x0,
+                h: 4.0,
+            };
+            let faint = Rgba { a: 90, ..fg };
+            c.fill_rounded(
+                (track.x * s, track.y * s, track.w * s, track.h * s, 2.0 * s),
+                None,
+                faint.rgb(),
+                faint.a,
+            );
+            let f = if info.duration.is_finite() && info.duration > 0.0 {
+                (info.current_time / info.duration).clamp(0.0, 1.0) as f32
+            } else {
+                0.0
+            };
+            c.fill_rounded(
+                (
+                    track.x * s,
+                    track.y * s,
+                    track.w * f * s,
+                    track.h * s,
+                    2.0 * s,
+                ),
+                None,
+                fg.rgb(),
+                fg.a,
+            );
+        }
+        // Speaker, crossed when muted.
+        let sx = area.x + area.w - 26.0;
+        self.fill(
+            c,
+            RectF {
+                x: sx,
+                y: mid - 3.0,
+                w: 4.0,
+                h: 6.0,
+            },
+            fg,
+        );
+        for k in 0..6 {
+            let k = k as f32;
+            self.fill(
+                c,
+                RectF {
+                    x: sx + 4.0 + k,
+                    y: mid - 3.0 - k,
+                    w: 1.0,
+                    h: 6.0 + 2.0 * k,
+                },
+                fg,
+            );
+        }
+        if muted {
+            let (ax, ay) = (((sx + 12.0) * s) as i32, ((mid - 4.0) * s) as i32);
+            let d = (8.0 * s) as i32;
+            c.line(ax, ay, ax + d, ay + d, s.max(1.0) as i32 + 1, fg.rgb());
+            c.line(ax, ay + d, ax + d, ay, s.max(1.0) as i32 + 1, fg.rgb());
+        }
     }
 
     /// `<progress>` (`progress`) or `<meter>`: a rounded track, filled to

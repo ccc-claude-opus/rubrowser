@@ -24,6 +24,7 @@ mod animate;
 pub mod canvas;
 mod forms;
 mod image;
+pub mod media;
 
 pub use forms::{
     Control, FormState, control, form_of, label_target, option_label, options, urlencode,
@@ -140,6 +141,12 @@ pub struct Document {
     fonts: Option<Rc<Fonts>>,
     /// Bitmaps of `<canvas>` elements drawn on by scripts.
     pub canvases: canvas::Canvases,
+    /// Players of `<video>` / `<audio>` elements.
+    pub media: media::MediaElements,
+    /// Media events (element, type) not fired yet.
+    media_events: Vec<(NodeId, &'static str)>,
+    /// The user has interacted with the page (sound may autoplay).
+    pub user_activated: bool,
 }
 
 impl Document {
@@ -177,6 +184,9 @@ impl Document {
             anim: Default::default(),
             fonts: None,
             canvases: Default::default(),
+            media: Default::default(),
+            media_events: Vec::new(),
+            user_activated: false,
         }
     }
 
@@ -484,6 +494,10 @@ impl Document {
 
     /// Recomputes styles and layout if needed.
     pub fn update(&mut self, fonts: &Fonts) {
+        if self.needs_style {
+            self.find_media();
+        }
+        self.update_media();
         self.update_once(fonts);
         self.animate();
         // `@container` rules depend on sizes only layout gives: if the
@@ -738,6 +752,7 @@ impl Document {
             frames: &self.frames,
             overlay: &self.anim.overlay,
             canvases: &self.canvases,
+            media: &self.media,
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -843,6 +858,24 @@ impl Document {
             match self.dom.tag(n) {
                 Some("iframe") => {
                     out.insert(n, (300.0, 150.0));
+                    continue;
+                }
+                Some("video") => {
+                    // The video's size, else its poster's, else 300 × 150.
+                    let video = self.media.get(&n).map(|m| m.info()).filter(|i| i.width > 0);
+                    let poster = match self.images.get(n) {
+                        Some(ImageState::Ready(_, b)) => Some((b.width as f32, b.height as f32)),
+                        _ => None,
+                    };
+                    let size = video
+                        .map(|i| (i.width as f32, i.height as f32))
+                        .or(poster)
+                        .unwrap_or((300.0, 150.0));
+                    out.insert(n, size);
+                    continue;
+                }
+                Some("audio") => {
+                    out.insert(n, (300.0, 54.0));
                     continue;
                 }
                 Some("canvas") => {
@@ -1026,10 +1059,15 @@ impl Document {
             dark: false,
         };
         for n in self.dom.descendants(Dom::ROOT) {
-            if self.dom.tag(n) != Some("img") {
-                continue;
-            }
-            let (src, density) = image::current_source(&self.dom, n, &env);
+            let (src, density) = match self.dom.tag(n) {
+                Some("img") => image::current_source(&self.dom, n, &env),
+                // A video's poster frame is an image of the element.
+                Some("video") => match self.dom.attr(n, "poster") {
+                    Some(p) if !p.trim().is_empty() => (p.trim().to_string(), 1.0),
+                    _ => continue,
+                },
+                _ => continue,
+            };
             if self.images.get(n).is_some_and(|s| s.src() == src) {
                 continue;
             }

@@ -2,3 +2,8 @@
 # is no OS source, so lang::js supplies them (getrandom "custom" backend).
 [target.wasm32-unknown-unknown]
 rustflags = ["--cfg", "getrandom_backend=\"custom\""]
+
+# ffmpeg-sys (feature `media`) generates bindings with clang, which needs
+# the macOS SDK's headers; an SDKROOT set in the environment wins.
+[env]
+SDKROOT = { value = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk", force = false }

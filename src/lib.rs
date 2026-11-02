@@ -26,6 +26,8 @@ pub mod lang;
 #[cfg(feature = "core")]
 pub mod layout;
 #[cfg(feature = "core")]
+pub mod media;
+#[cfg(feature = "core")]
 pub mod net;
 #[cfg(feature = "core")]
 pub mod paint;

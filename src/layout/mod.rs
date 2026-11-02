@@ -673,7 +673,10 @@ impl Builder<'_> {
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
-        if matches!(self.dom.tag(id), Some("img" | "svg" | "canvas")) {
+        if matches!(
+            self.dom.tag(id),
+            Some("img" | "svg" | "canvas" | "video" | "audio")
+        ) {
             let size = self.replaced.get(&id).copied().unwrap_or((0.0, 0.0));
             if size.0 > 0.0 && size.1 > 0.0 {
                 tstyle.aspect_ratio = Some(size.0 / size.1);

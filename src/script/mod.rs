@@ -653,6 +653,26 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
     )?;
     l.func_wrap(
         "rb",
+        "media",
+        |mut c: C, h: i32, p: i32, n: i32, out: i32, cap: i32| -> Result<i32, Error> {
+            // A request to a <video> / <audio> element (see doc/abi.md).
+            let cmd = read_str(&c, p, n)?;
+            let result = if let Some(mime) = cmd.strip_prefix("canPlayType\u{1}") {
+                Some(crate::media::can_play(mime).to_string())
+            } else {
+                let doc = &mut c.data_mut().doc;
+                element(doc, h)
+                    .filter(|&e| crate::document::media::is_media(&doc.dom, e))
+                    .and_then(|e| doc.media_command(e, &cmd, false))
+            };
+            match result {
+                Some(v) => write_str(&mut c, out, cap, &v),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
         "media_matches",
         |c: C, p: i32, n: i32| -> Result<i32, Error> {
             let query = read_str(&c, p, n)?;

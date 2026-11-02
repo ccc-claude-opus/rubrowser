@@ -416,6 +416,9 @@ fn parse_import_map(json: &str, base: &str) -> Vec<(String, String)> {
 /// The JavaScript runtime module (boa compiled to wasm).
 const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js.wasm");
 
+/// Time between video frames while media plays (ms).
+const MEDIA_FRAME_MS: f64 = 1000.0 / 60.0;
+
 /// Extra fields of a dispatched event.
 #[derive(Clone, Copy, Debug, Default)]
 struct EventInit {
@@ -522,6 +525,8 @@ impl Tab {
 /// Platform-independent browser state. Platforms feed it input events and
 /// the window size, and put the rendered canvas on screen.
 pub struct Browser {
+    /// When playing media last updated (see [`Browser::media_due`]).
+    media_drawn: f64,
     /// Whether web pages may run scripts (built-in pages always can).
     javascript: bool,
     /// Shared with page documents, which lay out on demand for scripts.
@@ -561,6 +566,7 @@ impl Browser {
     /// [`Fonts::with_system_fonts`]).
     pub fn with_fonts(width: usize, height: usize, scale: f32, fonts: Fonts) -> Self {
         let mut b = Browser {
+            media_drawn: 0.0,
             fonts: Rc::new(fonts),
             canvas: Canvas::new(width, height),
             scale: sanitize_scale(scale),
@@ -2006,6 +2012,9 @@ impl Browser {
             }
         }
         let hit = self.doc(t).hit_test(lx, ly);
+        if t == Target::Page {
+            self.tabs[self.active].doc.user_activated = true;
+        }
         if t == Target::Page
             && let Some(e) = hit.element
         {
@@ -2168,6 +2177,10 @@ impl Browser {
         if self.tabs[self.active].doc.frame(node).is_some() {
             return self.activate_in_frame(node, host);
         }
+        if self.activate_media(node) {
+            self.dirty = true;
+            return;
+        }
         let doc = &self.tabs[self.active].doc;
         // The innermost control or label around the clicked node.
         let mut n = Some(node);
@@ -2226,6 +2239,35 @@ impl Browser {
             }
             n = doc.dom.parent(id);
         }
+    }
+
+    /// A click on a media element with `controls`: seeks on the progress
+    /// track, else plays or pauses. Returns whether it was one.
+    fn activate_media(&mut self, node: NodeId) -> bool {
+        let vp = self.viewport_rect();
+        let doc = &mut self.tabs[self.active].doc;
+        if !crate::document::media::is_media(&doc.dom, node)
+            || doc.dom.attr(node, "controls").is_none()
+        {
+            return false;
+        }
+        let Some(area) = doc.content_box(node) else {
+            return false;
+        };
+        let (x, y) = (self.pointer.0 - vp.x, self.pointer.1 - vp.y);
+        let bar_top = area.y + area.h - crate::document::media::CONTROLS_HEIGHT;
+        let (x0, x1) = crate::document::media::progress_track(area);
+        let duration = doc.media(node).map_or(f64::NAN, |m| m.info().duration);
+        if y >= bar_top && x >= x0 - 4.0 && x <= x1 + 4.0 && duration.is_finite() {
+            let f = ((x - x0) / (x1 - x0)).clamp(0.0, 1.0) as f64;
+            doc.media_command(node, &format!("seek\u{1}{}", f * duration), true);
+        } else if y >= bar_top && x >= area.x + area.w - 34.0 {
+            let muted = doc.media(node).is_some_and(|m| m.muted);
+            doc.media_command(node, &format!("muted\u{1}{}", !muted as u8), true);
+        } else {
+            doc.toggle_media(node);
+        }
+        true
     }
 
     /// A click on `<iframe>` `frame` at the pointer: follows a link in its
@@ -2592,6 +2634,13 @@ impl Browser {
         doc.set_viewport(vp.w, vp.h);
         doc.set_time(self.now);
         doc.update(&self.fonts);
+        if doc.media_playing() {
+            self.media_drawn = self.now;
+        }
+        let i = self.active;
+        for (node, kind) in self.tabs[i].doc.take_media_events() {
+            self.element_event(i, node, kind, host);
+        }
         self.request_images(host);
     }
 
@@ -2693,14 +2742,22 @@ impl Browser {
         }
     }
 
-    /// Whether the active page has animations or transitions running.
+    /// Whether the active page has animations, transitions or media
+    /// running.
     pub fn animating(&self) -> bool {
-        self.tabs[self.active].doc.animating()
+        let doc = &self.tabs[self.active].doc;
+        doc.animating() || doc.media_playing()
+    }
+
+    /// Whether playing media is due for its next frame.
+    fn media_due(&self, now: f64) -> bool {
+        now - self.media_drawn >= MEDIA_FRAME_MS && self.tabs[self.active].doc.media_playing()
     }
 
     /// Whether a new frame should be drawn at time `now`.
     pub fn needs_redraw(&self, now: f64) -> bool {
         self.dirty
+            || self.media_due(now)
             || !self.local.is_empty()
             || self.next_timer().is_some_and(|t| t <= now)
             || self.chrome.needs_update()
@@ -2717,6 +2774,10 @@ impl Browser {
     pub fn next_wakeup(&self, now: f64) -> Option<f64> {
         if self.needs_redraw(now) {
             return Some(now);
+        }
+        // Playing media: the next video frame (about 60 per second).
+        if self.tabs[self.active].doc.media_playing() {
+            return Some(self.media_drawn + MEDIA_FRAME_MS);
         }
         let caret = self.focused_text_input().map(|_| {
             let phase = (now - self.caret_epoch) / CARET_BLINK_MS;
@@ -3631,6 +3692,42 @@ mod tests {
         assert_eq!(at(90.0, 10.0), 0x0000ff);
         for want in ["px 0,0,255,255", "in true false", "size 100x50"] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+    }
+
+    #[test]
+    fn media_elements_without_a_player() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://js.test/index.html", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<video id=v controls src="clip.mp4"></video><audio id=a></audio><script>
+              const v = document.getElementById('v');
+              console.log('state ' + v.paused + ' ' + isNaN(v.duration) + ' ' + v.currentSrc.endsWith('clip.mp4') + ' ' + typeof v.canPlayType('video/mp4'));
+              v.play().catch((e) => console.log('rejected ' + e.name));
+              v.muted = true;
+              console.log('muted ' + v.muted + ' ' + v.controls + ' ' + v.loop);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let doc = &b.tabs[b.active].doc;
+        let (v, a) = (page_el(&b, "v"), page_el(&b, "a"));
+        // 300 x 150 by default; audio without controls is not shown.
+        let r = doc.content_box(v).unwrap();
+        assert_eq!((r.w, r.h), (300.0, 150.0));
+        assert!(doc.content_box(a).is_none());
+        let want: &[&str] = if cfg!(feature = "media") {
+            &["muted true true false"]
+        } else {
+            &[
+                "state true true true string",
+                "rejected NotSupportedError",
+                "muted true true false",
+            ]
+        };
+        for w in want {
+            assert!(h.logs.iter().any(|l| l == w), "{w}: {:?}", h.logs);
         }
     }
 
