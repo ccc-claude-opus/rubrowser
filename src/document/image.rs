@@ -1,6 +1,6 @@
 //! `<img>` support: loading state, decoding and resized copies.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -14,6 +14,18 @@ use crate::dom::{Dom, NodeId};
 /// Largest image (each side) the browser decodes.
 const MAX_SIDE: u32 = 8192;
 
+/// Most pixels kept over all frames of an animated image; longer
+/// animations stop at their last frame that fits.
+const MAX_ANIMATION_PIXELS: usize = 64 << 20;
+
+/// One frame of an animated image (GIF, APNG, animated WebP).
+#[derive(Debug, PartialEq)]
+pub struct AnimFrame {
+    pub pixels: Vec<u32>,
+    /// How long it shows, in milliseconds.
+    pub delay: f64,
+}
+
 /// A decoded image in `0xAARRGGBB` pixels, or an SVG drawing that is
 /// rasterized at whatever size it is painted.
 #[derive(Debug, PartialEq)]
@@ -21,9 +33,14 @@ pub struct Bitmap {
     /// Natural size in CSS pixels.
     pub width: u32,
     pub height: u32,
-    /// Empty for SVG.
+    /// Empty for SVG; the first frame of an animation.
     pub pixels: Vec<u32>,
     pub svg: Option<Svg>,
+    /// All frames of an animated image (empty for still images).
+    pub frames: Vec<AnimFrame>,
+    /// When the animation was first painted (document clock, ms): it plays
+    /// from there, looping.
+    pub start: Cell<Option<f64>>,
 }
 
 /// A parsed SVG document.
@@ -62,6 +79,8 @@ impl Bitmap {
             height: size.height().ceil() as u32,
             pixels: Vec::new(),
             svg: Some(Svg(Rc::new(tree))),
+            frames: Vec::new(),
+            start: Cell::new(None),
         })
     }
 
@@ -88,7 +107,8 @@ impl Bitmap {
             .collect()
     }
 
-    /// Decodes PNG, JPEG, GIF (first frame), WebP, BMP or SVG.
+    /// Decodes PNG (and APNG), JPEG, GIF, WebP, BMP, SVG, or AVIF with the
+    /// `media` feature.
     pub fn decode(bytes: &[u8]) -> Result<Bitmap, String> {
         if is_svg(bytes) {
             return Self::svg(bytes);
@@ -97,12 +117,112 @@ impl Bitmap {
         limits.max_image_width = Some(MAX_SIDE);
         limits.max_image_height = Some(MAX_SIDE);
         limits.max_alloc = Some(512 << 20);
+        if let Some(b) = Self::decode_animation(bytes, &limits) {
+            return Ok(b);
+        }
         let mut reader = image::ImageReader::new(Cursor::new(bytes))
             .with_guessed_format()
             .map_err(|e| e.to_string())?;
         reader.limits(limits);
         let img = reader.decode().map_err(|e| e.to_string())?.to_rgba8();
         Ok(Self::from_rgba(img))
+    }
+
+    /// Decodes an animated GIF, APNG or WebP with more than one frame.
+    fn decode_animation(bytes: &[u8], limits: &image::Limits) -> Option<Bitmap> {
+        use image::AnimationDecoder;
+        use image::codecs::{gif::GifDecoder, png::PngDecoder, webp::WebPDecoder};
+        let frames = match image::guess_format(bytes).ok()? {
+            image::ImageFormat::Gif => {
+                let mut d = GifDecoder::new(Cursor::new(bytes)).ok()?;
+                image::ImageDecoder::set_limits(&mut d, limits.clone()).ok()?;
+                d.into_frames()
+            }
+            image::ImageFormat::Png => {
+                let mut d = PngDecoder::new(Cursor::new(bytes)).ok()?;
+                image::ImageDecoder::set_limits(&mut d, limits.clone()).ok()?;
+                if !d.is_apng().ok()? {
+                    return None;
+                }
+                d.apng().ok()?.into_frames()
+            }
+            image::ImageFormat::WebP => {
+                let mut d = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+                image::ImageDecoder::set_limits(&mut d, limits.clone()).ok()?;
+                if !d.has_animation() {
+                    return None;
+                }
+                d.into_frames()
+            }
+            _ => return None,
+        };
+        let mut out: Vec<AnimFrame> = Vec::new();
+        let mut size = (0, 0);
+        let mut total = 0;
+        for f in frames {
+            let Ok(f) = f else { break };
+            let (n, d) = f.delay().numer_denom_ms();
+            let mut delay = n as f64 / d.max(1) as f64;
+            // As in browsers: very short delays mean the default 100 ms.
+            if delay <= 10.0 {
+                delay = 100.0;
+            }
+            let b = Self::from_rgba(f.into_buffer());
+            total += b.pixels.len();
+            if total > MAX_ANIMATION_PIXELS && !out.is_empty() {
+                break;
+            }
+            size = (b.width, b.height);
+            out.push(AnimFrame {
+                pixels: b.pixels,
+                delay,
+            });
+        }
+        if out.len() < 2 {
+            return None;
+        }
+        Some(Bitmap {
+            width: size.0,
+            height: size.1,
+            pixels: out[0].pixels.clone(),
+            svg: None,
+            frames: out,
+            start: Cell::new(None),
+        })
+    }
+
+    /// Which frame shows at time `now` (0 for still images). The animation
+    /// starts the first time this is asked.
+    pub fn frame_at(&self, now: f64) -> usize {
+        if self.frames.len() < 2 {
+            return 0;
+        }
+        let start = *self.start.get().get_or_insert(now);
+        self.start.set(Some(start));
+        let total: f64 = self.frames.iter().map(|f| f.delay).sum();
+        let mut t = (now - start).max(0.0) % total;
+        for (i, f) in self.frames.iter().enumerate() {
+            if t < f.delay {
+                return i;
+            }
+            t -= f.delay;
+        }
+        self.frames.len() - 1
+    }
+
+    /// When the shown frame next changes, if the animation has started.
+    pub fn next_change(&self, now: f64) -> Option<f64> {
+        let start = self.start.get().filter(|_| self.frames.len() > 1)?;
+        let total: f64 = self.frames.iter().map(|f| f.delay).sum();
+        let cycle = ((now - start).max(0.0) / total).floor();
+        let mut t = start + cycle * total;
+        for f in &self.frames {
+            t += f.delay;
+            if t > now {
+                return Some(t);
+            }
+        }
+        Some(t)
     }
 
     fn from_rgba(img: image::RgbaImage) -> Bitmap {
@@ -119,19 +239,22 @@ impl Bitmap {
             height,
             pixels,
             svg: None,
+            frames: Vec::new(),
+            start: Cell::new(None),
         }
     }
 
-    /// A copy resized to `w × h` (smooth filtering).
-    pub fn resized(&self, w: u32, h: u32) -> Vec<u32> {
+    /// A copy of frame `frame` (0 for still images) resized to `w × h`
+    /// (smooth filtering).
+    pub fn resized(&self, frame: usize, w: u32, h: u32) -> Vec<u32> {
         if let Some(svg) = &self.svg {
             return Self::render_svg(svg, w, h);
         }
+        let pixels = self.frames.get(frame).map_or(&self.pixels, |f| &f.pixels);
         if (w, h) == (self.width, self.height) {
-            return self.pixels.clone();
+            return pixels.clone();
         }
-        let rgba: Vec<u8> = self
-            .pixels
+        let rgba: Vec<u8> = pixels
             .iter()
             .flat_map(|&p| [(p >> 16) as u8, (p >> 8) as u8, p as u8, (p >> 24) as u8])
             .collect();
@@ -173,8 +296,8 @@ impl ImageState {
 /// A rendered gradient: (CSS text, width, height).
 type GradientKey = (String, u32, u32);
 
-/// A resized copy of an image: (width, height, pixels).
-type Scaled = (u32, u32, Rc<Vec<u32>>);
+/// A resized copy of an image: (width, height, frame, pixels).
+type Scaled = (u32, u32, usize, Rc<Vec<u32>>);
 
 /// All images of a document, plus resized copies for painting.
 #[derive(Default)]
@@ -190,6 +313,8 @@ pub struct Images {
     pub density: HashMap<NodeId, f32>,
     /// Rendered gradients by (CSS text, width, height).
     gradients: RefCell<HashMap<GradientKey, Rc<Vec<u32>>>>,
+    /// The document clock (ms), which picks frames of animated images.
+    pub now: Cell<f64>,
 }
 
 impl Images {
@@ -200,28 +325,30 @@ impl Images {
     /// Pixels of image `node` resized to `w × h`, cached.
     pub fn scaled(&self, node: NodeId, w: u32, h: u32) -> Option<Rc<Vec<u32>>> {
         let bitmap = self.states.get(&node)?.bitmap()?;
+        let frame = bitmap.frame_at(self.now.get());
         let mut cache = self.scaled.borrow_mut();
-        if let Some((cw, ch, px)) = cache.get(&node)
-            && (*cw, *ch) == (w, h)
+        if let Some((cw, ch, cf, px)) = cache.get(&node)
+            && (*cw, *ch, *cf) == (w, h, frame)
         {
             return Some(px.clone());
         }
-        let px = Rc::new(bitmap.resized(w, h));
-        cache.insert(node, (w, h, px.clone()));
+        let px = Rc::new(bitmap.resized(frame, w, h));
+        cache.insert(node, (w, h, frame, px.clone()));
         Some(px)
     }
 
     /// Pixels of background image `url` resized to `w × h`, cached.
     pub fn scaled_url(&self, url: &str, w: u32, h: u32) -> Option<Rc<Vec<u32>>> {
         let bitmap = self.urls.get(url)?.bitmap()?;
+        let frame = bitmap.frame_at(self.now.get());
         let mut cache = self.scaled_urls.borrow_mut();
-        if let Some((cw, ch, px)) = cache.get(url)
-            && (*cw, *ch) == (w, h)
+        if let Some((cw, ch, cf, px)) = cache.get(url)
+            && (*cw, *ch, *cf) == (w, h, frame)
         {
             return Some(px.clone());
         }
-        let px = Rc::new(bitmap.resized(w, h));
-        cache.insert(url.to_string(), (w, h, px.clone()));
+        let px = Rc::new(bitmap.resized(frame, w, h));
+        cache.insert(url.to_string(), (w, h, frame, px.clone()));
         Some(px)
     }
 
@@ -244,6 +371,16 @@ impl Images {
         let px = Rc::new(g.render(w, h, scale));
         cache.insert(key, px.clone());
         px
+    }
+
+    /// When an animated image that has been painted next changes frame.
+    pub fn next_frame(&self) -> Option<f64> {
+        let now = self.now.get();
+        self.states
+            .values()
+            .chain(self.urls.values())
+            .filter_map(|s| s.bitmap()?.next_change(now))
+            .min_by(f64::total_cmp)
     }
 
     pub fn set_url(&mut self, url: &str, state: ImageState) {
@@ -327,10 +464,14 @@ fn slot_width(sizes: Option<&str>, env: &MediaEnv) -> f32 {
     env.width
 }
 
-/// Image types this browser decodes.
+/// Image types this browser decodes (AVIF needs the `media` feature).
 fn supported_type(t: &str) -> bool {
+    let t = t.trim().to_ascii_lowercase();
+    if t == "image/avif" {
+        return cfg!(feature = "media");
+    }
     matches!(
-        t.trim().to_ascii_lowercase().as_str(),
+        t.as_str(),
         "" | "image/png"
             | "image/jpeg"
             | "image/jpg"
@@ -543,12 +684,30 @@ mod tests {
         out
     }
 
+    /// A 64 × 32 green AVIF (SVT-AV1).
+    #[cfg(feature = "media")]
+    const GREEN_AVIF: &str = "00000020667479706176696600000000617669666d6966316d6961664d413142000000f96d657461000000000000002f68646c720000000000000000706963740000000000000000000000005069637475726548616e646c6572000000000e7069746d0000000000010000001e696c6f63000000004400000100010000000100000121000000230000002869696e660000000000010000001a696e6665020000000001000061763031436f6c6f72000000006a697072700000004b6970636f0000001469737065000000000000004000000020000000107069786900000000030808080000000c6176314381000c0000000013636f6c726e636c78000200020002000000001769706d610000000000000001000104010283040000002b6d6461740a0a00000002a7ff1abe4010321510009780104082000010002c68e46044d807af21b8";
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn decodes_avif() {
+        let bytes: Vec<u8> = (0..GREEN_AVIF.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&GREEN_AVIF[i..i + 2], 16).unwrap())
+            .collect();
+        let b = Bitmap::decode(&bytes).unwrap();
+        assert_eq!((b.width, b.height), (64, 32));
+        let p = b.pixels[16 * 64 + 32];
+        let (r, g, bl) = ((p >> 16) & 255, (p >> 8) & 255, p & 255);
+        assert!(g > 200 && r < 40 && bl < 40, "{p:08x}");
+    }
+
     #[test]
     fn decodes_and_resizes() {
         let b = Bitmap::decode(&png()).unwrap();
         assert_eq!((b.width, b.height), (2, 1));
         assert_eq!(b.pixels, vec![0xff_ff0000, 0x80_0000ff]);
-        assert_eq!(b.resized(4, 2).len(), 8);
+        assert_eq!(b.resized(0, 4, 2).len(), 8);
         assert!(Bitmap::decode(b"not an image").is_err());
     }
 
@@ -572,7 +731,13 @@ mod tests {
         assert_eq!(current_source(&dom, i, &env(400.0)), ("m.jpg".into(), 1.2));
         let p = dom.element_by_id("p").unwrap();
         assert_eq!(current_source(&dom, p, &env(500.0)).0, "small.webp");
-        assert_eq!(current_source(&dom, p, &env(1000.0)).0, "fallback.jpg");
+        // AVIF sources are skipped unless this build decodes AVIF.
+        let wide = if cfg!(feature = "media") {
+            "a.avif"
+        } else {
+            "fallback.jpg"
+        };
+        assert_eq!(current_source(&dom, p, &env(1000.0)).0, wide);
     }
 
     #[test]
@@ -580,7 +745,7 @@ mod tests {
         let svg = br#"<?xml version="1.0"?><svg xmlns="http://www.w3.org/2000/svg" width="20" height="10"><rect width="10" height="10" fill="red"/></svg>"#;
         let b = Bitmap::decode(svg).unwrap();
         assert_eq!((b.width, b.height), (20, 10));
-        let px = b.resized(40, 20);
+        let px = b.resized(0, 40, 20);
         assert_eq!(px.len(), 800);
         assert_eq!(px[0], 0xff_ff0000);
         assert_eq!(px[39] >> 24, 0, "right half is transparent");

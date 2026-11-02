@@ -2746,7 +2746,7 @@ impl Browser {
     /// running.
     pub fn animating(&self) -> bool {
         let doc = &self.tabs[self.active].doc;
-        doc.animating() || doc.media_playing()
+        doc.animating() || doc.media_playing() || doc.next_image_frame().is_some()
     }
 
     /// Whether playing media is due for its next frame.
@@ -2758,6 +2758,10 @@ impl Browser {
     pub fn needs_redraw(&self, now: f64) -> bool {
         self.dirty
             || self.media_due(now)
+            || self.tabs[self.active]
+                .doc
+                .next_image_frame()
+                .is_some_and(|t| t <= now)
             || !self.local.is_empty()
             || self.next_timer().is_some_and(|t| t <= now)
             || self.chrome.needs_update()
@@ -2783,10 +2787,12 @@ impl Browser {
             let phase = (now - self.caret_epoch) / CARET_BLINK_MS;
             self.caret_epoch + (phase.floor() + 1.0) * CARET_BLINK_MS
         });
-        match (caret, self.next_timer()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        // The next frame of an animated image.
+        let image = self.tabs[self.active].doc.next_image_frame();
+        [caret, self.next_timer(), image]
+            .into_iter()
+            .flatten()
+            .min_by(f64::total_cmp)
     }
 
     /// Draws the whole browser and returns the result.
@@ -3599,6 +3605,63 @@ mod tests {
     }
 
     #[test]
+    fn intl_formats_dates_numbers_and_lists() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://intl.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              const d = new Date(Date.UTC(2026, 10, 3, 14, 5, 9));
+              const tz = { timeZone: 'UTC' };
+              const f = (o) => new Intl.DateTimeFormat('en-US', { ...tz, ...o }).format(d);
+              const log = (s) => console.log(s);
+              log('d1 ' + f({}));
+              log('d2 ' + f({ month: 'short', day: 'numeric' }));
+              log('d3 ' + f({ dateStyle: 'medium' }));
+              log('d4 ' + f({ dateStyle: 'full', timeStyle: 'short' }));
+              log('d5 ' + f({ hour: 'numeric', minute: '2-digit', hour12: false }));
+              log('d6 ' + new Intl.DateTimeFormat('en', { ...tz, month: 'long', year: 'numeric' }).formatToParts(d).map((p) => p.type).join());
+              log('d7 ' + d.toLocaleDateString('en-US', { ...tz, weekday: 'short', month: 'short', day: 'numeric' }));
+              const n = (v, o) => new Intl.NumberFormat('en-US', o).format(v);
+              log('n1 ' + n(1234567.891));
+              log('n2 ' + n(0.256, { style: 'percent' }));
+              log('n3 ' + n(-1234.5, { style: 'currency', currency: 'USD' }));
+              log('n4 ' + n(1530, { notation: 'compact' }) + ' ' + n(2400000, { notation: 'compact', compactDisplay: 'long' }));
+              log('n5 ' + n(5, { minimumIntegerDigits: 2 }) + ' ' + n(1.5, { minimumFractionDigits: 2 }) + ' ' + (12345.678).toLocaleString());
+              log('n6 ' + [1, 2].map(new Intl.NumberFormat().format).join('|'));
+              const r = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+              log('r ' + r.format(-1, 'day') + ' / ' + r.format(3, 'hours') + ' / ' + r.format(-2, 'month'));
+              log('l ' + new Intl.ListFormat('en').format(['a', 'b', 'c']) + ' / ' + new Intl.ListFormat('en', { type: 'disjunction' }).format(['a', 'b']));
+              log('p ' + [1, 2, 3, 4, 11].map((v) => new Intl.PluralRules('en', { type: 'ordinal' }).select(v)).join());
+              log('c ' + ['b', 'a', 'B', 'á', 'item10', 'item2'].sort(new Intl.Collator('en', { numeric: true }).compare).join());
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in [
+            "d1 11/3/2026",
+            "d2 Nov 3",
+            "d3 Nov 3, 2026",
+            "d4 Tuesday, November 3, 2026, 2:05 PM",
+            "d5 14:05",
+            "d6 month,literal,year",
+            "d7 Tue, Nov 3",
+            "n1 1,234,567.891",
+            "n2 26%",
+            "n3 -$1,234.50",
+            "n4 1.5K 2.4 million",
+            "n5 05 1.50 12,345.678",
+            "n6 1|2",
+            "r yesterday / in 3 hours / 2 months ago",
+            "l a, b, and c / a or b",
+            "p one,two,few,other,other",
+            "c a,á,b,B,item2,item10",
+        ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+    }
+
+    #[test]
     fn range_inputs_follow_the_pointer() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);
@@ -4136,6 +4199,66 @@ mod tests {
         let canvas = b.render(1.0, &mut h);
         let (px, py) = ((vp.x + a.x + 5.0) as usize, (vp.y + a.y + 5.0) as usize);
         assert_eq!(canvas.pixels()[py * canvas.width() + px], 0xff0000);
+    }
+
+    fn gif_data_url(colors: &[[u8; 4]], delay_ms: u32) -> String {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let mut bytes = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut bytes);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for &c in colors {
+                let img = image::RgbaImage::from_pixel(4, 4, image::Rgba(c));
+                let delay = image::Delay::from_numer_denom_ms(delay_ms, 1);
+                enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay))
+                    .unwrap();
+            }
+        }
+        format!("data:image/gif;base64,{}", base64(&bytes))
+    }
+
+    fn base64(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut b64 = String::new();
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().fold(0u32, |a, &b| a << 8 | b as u32) << (8 * (3 - chunk.len()));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    b64.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    b64.push('=');
+                }
+            }
+        }
+        b64
+    }
+
+    #[test]
+    fn animated_gifs_play() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://gif.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let gif = gif_data_url(&[[255, 0, 0, 255], [0, 0, 255, 255]], 200);
+        let page = format!(r#"<body style="margin:0"><img id=a src="{gif}" width=40></body>"#);
+        b.fetch_done(id, Ok(page.into_bytes()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(0.0, &mut h);
+        let n = page_el(&b, "a");
+        let r = b.tabs[b.active].doc.content_box(n).unwrap();
+        let vp = b.viewport_rect();
+        let (px, py) = ((vp.x + r.x + 5.0) as usize, (vp.y + r.y + 5.0) as usize);
+        let at = |b: &mut Browser, h: &mut TestHost, t: f64| {
+            let c = b.render(t, h);
+            c.pixels()[py * c.width() + px]
+        };
+        assert_eq!(at(&mut b, &mut h, 10.0), 0xff0000);
+        // The browser asks to wake up when the frame changes.
+        assert!(b.animating());
+        let next = b.next_wakeup(50.0).unwrap();
+        assert!((next - 200.0).abs() < 20.0, "{next}");
+        assert_eq!(at(&mut b, &mut h, 250.0), 0x0000ff);
+        // It loops.
+        assert_eq!(at(&mut b, &mut h, 450.0), 0xff0000);
     }
 
     #[test]

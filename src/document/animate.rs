@@ -38,10 +38,20 @@ impl Document {
     /// Sets the document's clock (milliseconds) for animations.
     pub fn set_time(&mut self, now: f64) {
         self.anim.now = now;
+        self.images.now.set(now);
     }
 
     pub(super) fn anim_time(&self) -> f64 {
         self.anim.now
+    }
+
+    /// When an animated image (here or in a frame) next changes frame.
+    pub fn next_image_frame(&self) -> Option<f64> {
+        self.frames
+            .values()
+            .filter_map(|f| f.doc.as_ref()?.next_image_frame())
+            .chain(self.images.next_frame())
+            .min_by(f64::total_cmp)
     }
 
     /// Whether animations or transitions are running.

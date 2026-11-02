@@ -32,7 +32,7 @@ core = [
 native = ["core", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2"]
 # Audio and video playback with FFmpeg (needs FFmpeg 8 installed, e.g.
 # `brew install ffmpeg`); without it, media elements report an error.
-media = ["native", "dep:ffmpeg-next", "dep:cpal"]
+media = ["native", "dep:ffmpeg-next", "dep:cpal", "image/avif-native"]
 # Canvas version running inside a web browser (extra).
 web = ["core"]
 # The JavaScript runtime (boa) built as js.wasm; see scripts/build.sh.
