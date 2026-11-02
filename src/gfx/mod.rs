@@ -327,6 +327,26 @@ impl Canvas {
         }
     }
 
+    /// Composites a premultiplied pixel (`color` already scaled by `alpha`)
+    /// at `(x, y)`, honoring the clip, rounded clip and global alpha.
+    pub fn composite_premul(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
+        if !self.clip.contains(x, y) || alpha == 0 {
+            return;
+        }
+        let mut g = self.global_alpha as u32;
+        if self.round_clip.is_some() {
+            g = g * self.round_coverage(x, y) as u32 / 255;
+        }
+        let keep = 255 * 255 - alpha as u32 * g;
+        let d = &mut self.pixels[y as usize * self.width + x as usize];
+        let mix = |shift: u32| {
+            let dc = (*d >> shift) & 0xff;
+            let sc = (color >> shift) & 0xff;
+            ((dc * keep + sc * g * 255 + 255 * 255 / 2) / (255 * 255)).min(255) << shift
+        };
+        *d = mix(16) | mix(8) | mix(0);
+    }
+
     /// Draws `w × h` pixels in `0xAARRGGBB` at `(x, y)`, blending by their
     /// alpha, clipped.
     pub fn draw_argb(&mut self, x: i32, y: i32, w: usize, h: usize, src: &[u32]) {

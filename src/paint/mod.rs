@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use crate::css::Style;
+use crate::css::transform::Affine;
 use crate::css::style::{self as cs, Display, ListStyle};
 use crate::css::values::{Dim, Rgba};
 use crate::document::{
@@ -38,6 +39,9 @@ pub struct Painter<'a> {
     pub forms: &'a FormState,
     /// Top of the page viewport while painting (for sticky boxes).
     pub view_top: std::cell::Cell<f32>,
+    /// The transformed box being painted into its layer (painted without
+    /// its transform there).
+    pub flat: std::cell::Cell<Option<usize>>,
 }
 
 /// What an image layer paints.
@@ -136,6 +140,16 @@ impl Painter<'_> {
         };
         if style.clipped_away {
             return;
+        }
+        if b.node == Some(b.style_node)
+            && style.is_transformed()
+            && self.flat.get() != Some(index)
+        {
+            let m = style.transform_matrix(b.rect.w, b.rect.h);
+            if !m.is_translation() {
+                self.transformed(c, index, ox, oy, m);
+                return;
+            }
         }
         let (tx, ty) = b.translation(style);
         let r = RectF {
@@ -263,6 +277,107 @@ impl Painter<'_> {
             self.outline(c, style, r);
         }
         c.set_global_alpha(alpha);
+    }
+
+    /// Paints box `index` (placed at `ox, oy`) through transform `m` (in px
+    /// from its border box's top left, not just a translation): the subtree
+    /// is painted into a layer twice, over white and over black, which gives
+    /// its colors and coverage; the layer is then resampled into `c`.
+    fn transformed(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32, m: Affine) {
+        let b = &self.tree.boxes[index];
+        let (x0, y0) = (ox + b.rect.x, oy + b.rect.y);
+        let s = self.scale;
+        // Physical pixels to physical pixels.
+        let full = Affine([s, 0.0, 0.0, s, 0.0, 0.0])
+            .then(&Affine::translate(x0, y0))
+            .then(&m)
+            .then(&Affine::translate(-x0, -y0))
+            .then(&Affine([1.0 / s, 0.0, 0.0, 1.0 / s, 0.0, 0.0]));
+        // A singular matrix (`scale(0)`) leaves nothing to see.
+        let Some(inverse) = full.invert() else { return };
+        let bounds = self.phys(self.subtree_bounds(index, ox, oy));
+        if bounds.w <= 0 || bounds.h <= 0 {
+            return;
+        }
+        let previous = self.flat.replace(Some(index));
+        if bounds.w > 4096 || bounds.h > 4096 || bounds.w as i64 * bounds.h as i64 > 8_000_000 {
+            // Too large to buffer: painted untransformed.
+            self.paint_box(c, index, ox, oy);
+            self.flat.set(previous);
+            return;
+        }
+        let (w, h) = (bounds.w as usize, bounds.h as usize);
+        let (lx, ly) = (ox - bounds.x as f32 / s, oy - bounds.y as f32 / s);
+        let mut white = Canvas::new(w, h);
+        white.clear(0xff_ffff);
+        let mut black = Canvas::new(w, h);
+        self.paint_box(&mut white, index, lx, ly);
+        self.paint_box(&mut black, index, lx, ly);
+        self.flat.set(previous);
+        // Where the layer lands.
+        let (bx0, by0) = (bounds.x as f32, bounds.y as f32);
+        let (bx1, by1) = (bx0 + w as f32, by0 + h as f32);
+        let corners = [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)].map(|(x, y)| full.apply(x, y));
+        let min = |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::MAX, f32::min);
+        let max = |f: fn(&(f32, f32)) -> f32| corners.iter().map(f).fold(f32::MIN, f32::max);
+        let (dx0, dy0) = (min(|p| p.0).floor() as i32, min(|p| p.1).floor() as i32);
+        let (dx1, dy1) = (max(|p| p.0).ceil() as i32, max(|p| p.1).ceil() as i32);
+        let dst = Rect::new(dx0, dy0, dx1 - dx0, dy1 - dy0).intersect(&c.clip());
+        for y in dst.y..dst.bottom() {
+            for x in dst.x..dst.right() {
+                let (sx, sy) = inverse.apply(x as f32 + 0.5, y as f32 + 0.5);
+                let (sx, sy) = (sx - bx0 - 0.5, sy - by0 - 0.5);
+                if sx < -1.0 || sy < -1.0 || sx > w as f32 || sy > h as f32 {
+                    continue;
+                }
+                let on_white = bilinear(&white, sx, sy, 0xff_ffff);
+                let on_black = bilinear(&black, sx, sy, 0);
+                let cover = 255.0
+                    - (0..3).map(|k| on_white[k] - on_black[k]).sum::<f32>() / 3.0;
+                let alpha = cover.round().clamp(0.0, 255.0) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                let channel = |k: usize| on_black[k].round().clamp(0.0, 255.0) as u32;
+                let color = channel(0) << 16 | channel(1) << 8 | channel(2);
+                c.composite_premul(x, y, color, alpha);
+            }
+        }
+    }
+
+    /// The area box `index` (placed at `ox, oy`) and its descendants paint,
+    /// roughly: border boxes, unless an ancestor clips them.
+    fn subtree_bounds(&self, index: usize, ox: f32, oy: f32) -> RectF {
+        let b = &self.tree.boxes[index];
+        let r = RectF {
+            x: ox + b.rect.x,
+            y: oy + b.rect.y,
+            ..b.rect
+        };
+        let clips = b.node.is_some()
+            && self
+                .style(b.style_node)
+                .is_some_and(|s| s.overflow != cs::Overflow::Visible);
+        let mut out = r;
+        if !clips {
+            for &child in &b.children {
+                let k = self.subtree_bounds(child, r.x, r.y);
+                if k.w > 0.0 && k.h > 0.0 {
+                    let (x1, y1) = ((out.x + out.w).max(k.x + k.w), (out.y + out.h).max(k.y + k.h));
+                    out.x = out.x.min(k.x);
+                    out.y = out.y.min(k.y);
+                    out.w = x1 - out.x;
+                    out.h = y1 - out.y;
+                }
+            }
+        }
+        // Glyphs and antialiasing reach a little past the boxes.
+        RectF {
+            x: out.x - 2.0,
+            y: out.y - 2.0,
+            w: out.w + 4.0,
+            h: out.h + 4.0,
+        }
     }
 
     /// The outline, outside the border box.
@@ -1196,4 +1311,30 @@ pub fn select_popup(
             style.color.rgb(),
         );
     }
+}
+
+/// The color of `canvas` at fractional pixel `(x, y)` (pixel centers at
+/// whole numbers), as `[r, g, b]`; outside it is `outside`.
+fn bilinear(canvas: &Canvas, x: f32, y: f32, outside: u32) -> [f32; 3] {
+    let (w, h) = (canvas.width() as i32, canvas.height() as i32);
+    let px = canvas.pixels();
+    let at = |x: i32, y: i32| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            outside
+        } else {
+            px[(y * w + x) as usize]
+        }
+    };
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let p = [at(x0, y0), at(x0 + 1, y0), at(x0, y0 + 1), at(x0 + 1, y0 + 1)];
+    let weights = [(1.0 - fx) * (1.0 - fy), fx * (1.0 - fy), (1.0 - fx) * fy, fx * fy];
+    let mut out = [0.0; 3];
+    for (c, wgt) in p.iter().zip(weights) {
+        for (k, shift) in [16, 8, 0].into_iter().enumerate() {
+            out[k] += ((c >> shift) & 0xff) as f32 * wgt;
+        }
+    }
+    out
 }

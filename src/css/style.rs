@@ -302,9 +302,13 @@ pub struct Style {
     pub flex_basis: Dim,
     pub vertical_align: VerticalAlign,
     pub opacity: f32,
-    /// `translate` / `transform: translate…()` (percentages of the border
-    /// box); applied when painting and hit-testing.
+    /// The `translate`, `rotate` and `scale` properties and `transform`
+    /// (see [`Style::transform_matrix`]).
     pub translate: (Dim, Dim),
+    pub rotate: f32,
+    pub scale: (f32, f32),
+    pub transform: Rc<[super::transform::Op]>,
+    pub transform_origin: (Dim, Dim),
     /// `aspect-ratio` (width / height).
     pub aspect_ratio: Option<f32>,
     /// `clip` / `clip-path` that leave nothing visible (the usual
@@ -403,6 +407,10 @@ impl Default for Style {
             vertical_align: VerticalAlign::Baseline,
             opacity: 1.0,
             translate: (Dim::Px(0.0), Dim::Px(0.0)),
+            rotate: 0.0,
+            scale: (1.0, 1.0),
+            transform: Rc::new([]),
+            transform_origin: (Dim::Percent(50.0), Dim::Percent(50.0)),
             aspect_ratio: None,
             clipped_away: false,
             z_index: None,
@@ -452,6 +460,34 @@ impl Default for Style {
 }
 
 impl Style {
+    /// Whether any transform applies (`translate`, `rotate`, `scale` or
+    /// `transform`).
+    pub fn is_transformed(&self) -> bool {
+        self.translate != (Dim::Px(0.0), Dim::Px(0.0))
+            || self.rotate != 0.0
+            || self.scale != (1.0, 1.0)
+            || !self.transform.is_empty()
+    }
+
+    /// The transform of a `w × h` border box, in px from its top left.
+    pub fn transform_matrix(&self, w: f32, h: f32) -> super::transform::Affine {
+        if !self.is_transformed() {
+            return super::transform::Affine::IDENTITY;
+        }
+        let origin = (
+            self.transform_origin.0.px_or_zero(w),
+            self.transform_origin.1.px_or_zero(h),
+        );
+        super::transform::matrix(
+            self.translate,
+            self.rotate,
+            self.scale,
+            &self.transform,
+            origin,
+            (w, h),
+        )
+    }
+
     /// Initial values, with inherited properties taken from `parent`.
     pub fn inherit(parent: &Style) -> Style {
         Style {
@@ -817,7 +853,20 @@ impl Style {
                     (x, y)
                 };
             }
-            "transform" => self.translate = transform_translate(value, |v| dim(v)),
+            "transform" => {
+                if v == "none" {
+                    self.transform = Rc::new([]);
+                } else if let Some(ops) = super::transform::parse(value, |v| dim(v)) {
+                    self.transform = ops.into();
+                }
+            }
+            "rotate" => set(&mut self.rotate, super::transform::parse_rotate(v)),
+            "scale" => set(&mut self.scale, super::transform::parse_scale(v)),
+            "transform-origin" => {
+                let t = tokens(v);
+                let t: Vec<&str> = t.iter().take(2).copied().collect();
+                set(&mut self.transform_origin, background_position(&t, fc));
+            }
             "opacity" => {
                 if let Some(o) = values::number(v).or_else(|| {
                     v.strip_suffix('%')
@@ -1334,30 +1383,6 @@ fn logical(name: &str, value: &str) -> Option<Vec<(String, String)>> {
 }
 
 /// The translation part of a `transform` list (other functions ignored).
-fn transform_translate(value: &str, dim: impl Fn(&str) -> Option<Dim>) -> (Dim, Dim) {
-    let zero = Dim::Px(0.0);
-    let (mut x, mut y) = (zero, zero);
-    for t in values::tokens(value) {
-        let lower = t.to_ascii_lowercase();
-        let Some((name, args)) = lower.split_once('(') else {
-            continue;
-        };
-        let args: Vec<&str> = args
-            .trim_end_matches(')')
-            .split(',')
-            .map(str::trim)
-            .collect();
-        let d = |i: usize| args.get(i).and_then(|a| dim(a)).unwrap_or(zero);
-        match name {
-            "translate" | "translate3d" => (x, y) = (d(0), d(1)),
-            "translatex" => x = d(0),
-            "translatey" => y = d(0),
-            _ => {}
-        }
-    }
-    (x, y)
-}
-
 fn is_inherited(name: &str) -> bool {
     name.starts_with("font")
         || matches!(

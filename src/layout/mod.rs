@@ -72,10 +72,9 @@ impl LBox {
         if self.node != Some(self.style_node) {
             return (0.0, 0.0);
         }
-        (
-            style.translate.0.px_or_zero(self.rect.w),
-            style.translate.1.px_or_zero(self.rect.h),
-        )
+        // Other transforms are applied when painting (see `paint`).
+        let m = style.transform_matrix(self.rect.w, self.rect.h);
+        if m.is_translation() { (m.0[4], m.0[5]) } else { (0.0, 0.0) }
     }
 
     /// How far a sticky box moves down so its top stays `sticky_top` below

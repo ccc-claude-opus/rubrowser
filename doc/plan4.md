@@ -69,6 +69,15 @@
 - Wikipedia（英、中）與 GitHub 仍與 Chrome 相近，且 Wikipedia 的 ResourceLoader 模組現在會執行。
 - craigslist：已能跑到自己的載入流程，但主程式（1.2 MB）在 boa 上太慢而逾時；效能留到最後處理。
 
+### 第四輪：標準功能補齊
+
+依「對多數網站的影響」排序，每項一版、一個 commit：
+
+| 版 | 內容 |
+|---|---|
+| 1 | `getComputedStyle` 回傳 cascade 算出的值（CSSOM 序列化；`display: none` 的元素也有值）；`matchMedia` 依目前 viewport 判斷 |
+| 2 | 完整的 2D `transform`（`rotate`、`scale`、`skew`、`matrix`、`matrix3d` 的 2D 部分）、`rotate` / `scale` 屬性、`transform-origin`；非平移的變換以離屏圖層繪製後雙線性重取樣 |
+
 ### 第二批調查
 
 | 網站 | 狀況 |

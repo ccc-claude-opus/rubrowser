@@ -214,12 +214,20 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
         }),
         "outline-style" => line_style(s.outline_style).into(),
         "outline-color" => color(s.outline_color),
-        "transform" => match s.translate {
-            (Dim::Px(x), Dim::Px(y)) if x != 0.0 || y != 0.0 => {
-                format!("matrix(1, 0, 0, 1, {}, {})", number(x), number(y))
-            }
-            _ => "none".into(),
-        },
+        "transform" if s.transform.is_empty() => "none".into(),
+        "transform" => {
+            // The `transform` functions alone, as one matrix.
+            let (w, h) = used.content.unwrap_or_default();
+            let plain = Style {
+                translate: (Dim::Px(0.0), Dim::Px(0.0)),
+                rotate: 0.0,
+                scale: (1.0, 1.0),
+                transform_origin: (Dim::Px(0.0), Dim::Px(0.0)),
+                ..s.clone()
+            };
+            let m = plain.transform_matrix(w, h).0.map(number);
+            format!("matrix({})", m.join(", "))
+        }
         "content" => s.content.as_deref().unwrap_or("normal").into(),
         "box-shadow" if s.box_shadow.is_empty() => "none".into(),
         _ => String::new(),

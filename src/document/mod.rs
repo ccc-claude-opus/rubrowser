@@ -506,6 +506,7 @@ impl Document {
             images: &self.images,
             forms: &self.forms,
             view_top: Default::default(),
+            flat: Default::default(),
         }
         .paint(canvas, origin);
         if let Some((rect, items)) = self.select_popup(fonts) {
@@ -1681,5 +1682,26 @@ mod tests {
         d.paint(&mut c, (0.0, 0.0), 2.0, &fonts);
         assert_eq!(c.pixels()[99 * 100 + 99], 0x00ff00);
         assert!(c.pixels().contains(&0));
+    }
+
+    #[test]
+    fn transforms_rotate_scale_and_hide() {
+        let (d, fonts) = doc(
+            r#"<body style="margin:0;background:#fff">
+              <div style="margin:20px;width:40px;height:40px;background:#f00;transform:rotate(45deg)"></div>
+              <div style="margin:20px;width:40px;height:40px;background:#00f;transform:scale(0)"></div>"#,
+            100.0,
+            200.0,
+        );
+        let mut c = Canvas::new(100, 200);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let px = |x: usize, y: usize| c.pixels()[y * 100 + x];
+        // The center stays red; the square's corner is now outside the diamond.
+        assert_eq!(px(40, 40), 0xff0000);
+        assert_eq!(px(22, 22), 0xffffff);
+        // ...and its diamond tip reaches above the square's top edge.
+        assert_eq!(px(40, 14), 0xff0000);
+        // scale(0) paints nothing.
+        assert!(!c.pixels().contains(&0x0000ff));
     }
 }
