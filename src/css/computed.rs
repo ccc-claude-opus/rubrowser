@@ -240,6 +240,9 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
         }
         "content" => s.content.as_deref().unwrap_or("normal").into(),
         "box-shadow" if s.box_shadow.is_empty() => "none".into(),
+        "text-shadow" if s.text_shadow.is_empty() => "none".into(),
+        "filter" if s.filter.is_empty() => "none".into(),
+        "clip-path" if s.clip_path.is_none() => "none".into(),
         _ => String::new(),
     }
 }

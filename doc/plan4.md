@@ -93,6 +93,7 @@
 | 16 | `<video>` / `<audio>` 元素：依 `src` 或第一個可播放的 `<source>` 選擇資源，`poster`（依 `object-fit: contain`）、`controls` 控制列（播放 / 暫停、時間、可點擊的進度條、靜音），預設 300×150（audio 有 controls 時 300×54，沒有則不顯示）；`HTMLMediaElement` API（`play()` 的 Promise、`pause`、`currentTime`、`duration`、`volume`、`muted`、`canPlayType`、事件、`Audio()`）；Chrome 的自動播放規則（有聲音需使用者互動）。實際播放由後端提供（v17：FFmpeg），沒有後端時照標準回報錯誤 |
 | 17 | FFmpeg 播放後端（feature `media`，需安裝 FFmpeg 8）：每個媒體元素一條解碼執行緒（FFmpeg 自己開啟檔案與 http(s) 網址），影格轉成 RGB 送入有上限的佇列，聲音重新取樣後由 `cpal` 輸出（音量、靜音）；主執行緒依時鐘顯示到期的影格，觸發 `loadedmetadata`、`playing`、`timeupdate`、`seeked`、`ended` 等事件；跳轉從關鍵影格解碼並丟棄目標之前的影格與聲音；`loop`；播放或載入中時視窗以約 60 fps 更新，截圖會等待 |
 | 18 | 動態圖片：GIF、APNG、動態 WebP 依各影格延遲播放並循環（延遲 ≤ 10 ms 視為 100 ms，與瀏覽器相同；所有影格合計上限 64M 像素），第一次畫出時開始，視窗在下一影格到期時醒來；`<img>`、CSS 背景圖與 `drawImage` 都用當下影格。AVIF（feature `media`，以 dav1d 解碼）。`Intl`（ECMA-402，只有 en-US 資料）：`DateTimeFormat`（各欄位、`dateStyle`/`timeStyle`、`hour12`、UTC 時區、`formatToParts`）、`NumberFormat`（百分比、貨幣、單位、`compact`、小數位數、`signDisplay`）、`RelativeTimeFormat`（`numeric: "auto"`）、`PluralRules`（含序數）、`Collator`（`numeric`、`sensitivity`）、`ListFormat`、`Segmenter`、`DisplayNames`、`Locale`；`Date`/`Number` 的 `toLocale*String` 與 `localeCompare` 都經由它 |
+| 19 | `filter`（`blur`、`brightness`、`contrast`、`grayscale`、`hue-rotate`、`invert`、`opacity`、`saturate`、`sepia`、`drop-shadow`，依序套用；顏色類用規格的色彩矩陣，模糊以三次方框模糊近似高斯）與 `clip-path` 基本形狀（`inset()`（含 `round`）、`circle()`、`ellipse()`、`polygon()`，以 border box 為參考框，每像素 4×4 取樣做反鋸齒）：元素整棵子樹先畫進圖層再處理後合成，順序在 `transform` 之前；`text-shadow`（多重、模糊、半透明色彩，可繼承）；`getComputedStyle` 對這三者回報 `none` |
 
 ### 第二批調查
 

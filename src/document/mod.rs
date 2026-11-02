@@ -749,6 +749,7 @@ impl Document {
             forms: &self.forms,
             view_top: Default::default(),
             flat: Default::default(),
+            flat_fx: Default::default(),
             frames: &self.frames,
             overlay: &self.anim.overlay,
             canvases: &self.canvases,
@@ -2116,5 +2117,38 @@ mod tests {
         assert_eq!(px(40, 14), 0xff0000);
         // scale(0) paints nothing.
         assert!(!c.pixels().contains(&0x0000ff));
+    }
+
+    #[test]
+    fn filters_clip_paths_and_text_shadows() {
+        let (d, fonts) = doc(
+            r#"<body style="margin:0;background:#fff">
+              <div style="width:40px;height:20px;background:#f00;filter:grayscale(1)"></div>
+              <div style="width:40px;height:20px;background:#f00;filter:invert(1)"></div>
+              <div style="width:40px;height:40px;background:#00f;clip-path:circle(50%)"></div>
+              <div style="margin:10px;width:20px;height:20px;background:#0f0;filter:blur(4px)"></div>
+              <div style="font-size:30px;color:transparent;text-shadow:40px 0 #f0f">X</div>"#,
+            100.0,
+            200.0,
+        );
+        let mut c = Canvas::new(100, 200);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let px = |x: usize, y: usize| c.pixels()[y * 100 + x];
+        // grayscale(1) of red: 0.2126 · 255 ≈ 54.
+        let g = px(20, 10);
+        assert!(
+            g >> 16 == g & 0xff && (50..60).contains(&(g & 0xff)),
+            "{g:06x}"
+        );
+        // invert(1) of red is cyan.
+        assert_eq!(px(20, 30), 0x00ffff);
+        // The circle keeps the center and cuts the corners.
+        assert_eq!(px(20, 60), 0x0000ff);
+        assert_eq!(px(1, 41), 0xffffff);
+        // The blur spreads green outside the box and softens its middle edge.
+        assert_ne!(px(8, 100), 0xffffff);
+        assert_ne!(px(20, 100) & 0xff00, 0);
+        // The shadow is drawn 40 px to the right of the (invisible) glyph.
+        assert!((130..160).any(|y| (40..80).any(|x| px(x, y) == 0xff00ff)));
     }
 }

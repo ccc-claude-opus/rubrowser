@@ -8,6 +8,7 @@
 
 pub mod animation;
 pub mod computed;
+pub mod effects;
 pub mod gradient;
 pub mod media;
 pub mod selector;

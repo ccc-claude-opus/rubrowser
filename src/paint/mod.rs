@@ -42,6 +42,9 @@ pub struct Painter<'a> {
     /// The transformed box being painted into its layer (painted without
     /// its transform there).
     pub flat: std::cell::Cell<Option<usize>>,
+    /// Same for the box whose `filter` / `clip-path` layer is being
+    /// painted.
+    pub flat_fx: std::cell::Cell<Option<usize>>,
     /// Documents of `<iframe>` elements.
     pub frames: &'a HashMap<NodeId, crate::document::Frame>,
     /// Animated styles, in place of `styles`.
@@ -161,6 +164,11 @@ impl Painter<'_> {
                 self.transformed(c, index, ox, oy, m);
                 return;
             }
+        }
+        if b.node == Some(b.style_node) && style.has_effects() && self.flat_fx.get() != Some(index)
+        {
+            self.effects(c, index, ox, oy, style);
+            return;
         }
         let (tx, ty) = b.translation(style);
         let r = RectF {
@@ -412,6 +420,142 @@ impl Painter<'_> {
                 let channel = |k: usize| on_black[k].round().clamp(0.0, 255.0) as u32;
                 let color = channel(0) << 16 | channel(1) << 8 | channel(2);
                 c.composite_premul(x, y, color, alpha);
+            }
+        }
+    }
+
+    /// Paints box `index` (placed at `ox, oy`) with its `filter` and
+    /// `clip-path`: the subtree goes into a layer (over white and over
+    /// black, which gives colors and coverage), the filters run over its
+    /// premultiplied pixels in order, the clip shape masks it, and the
+    /// result is composited into `c`.
+    fn effects(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32, style: &Style) {
+        use crate::css::effects::{self, Filter};
+        let b = &self.tree.boxes[index];
+        let s = self.scale;
+        let (tx, ty) = b.translation(style);
+        // Where the box's border box is (CSS px).
+        let (bx, by) = (ox + b.rect.x + tx, oy + b.rect.y + ty);
+        let outset: f32 = style.filter.iter().map(Filter::outset).sum();
+        let mut area = self.subtree_bounds(index, ox, oy);
+        area = RectF {
+            x: area.x - outset,
+            y: area.y - outset,
+            w: area.w + 2.0 * outset,
+            h: area.h + 2.0 * outset,
+        };
+        // Only what can show (plus room for blurring in from outside).
+        let clip = c.clip();
+        let pad = (outset * s).ceil() as i32;
+        let visible = Rect::new(
+            clip.x - pad,
+            clip.y - pad,
+            clip.w + 2 * pad,
+            clip.h + 2 * pad,
+        );
+        let bounds = self.phys(area).intersect(&visible);
+        let previous = self.flat_fx.replace(Some(index));
+        if bounds.w <= 0 || bounds.h <= 0 || bounds.w as i64 * bounds.h as i64 > 8_000_000 {
+            if bounds.w > 0 && bounds.h > 0 {
+                // Too large to buffer: painted without effects.
+                self.paint_box(c, index, ox, oy);
+            }
+            self.flat_fx.set(previous);
+            return;
+        }
+        let (w, h) = (bounds.w as usize, bounds.h as usize);
+        let (lx, ly) = (ox - bounds.x as f32 / s, oy - bounds.y as f32 / s);
+        let mut white = Canvas::new(w, h);
+        white.clear(0xff_ffff);
+        let mut black = Canvas::new(w, h);
+        self.paint_box(&mut white, index, lx, ly);
+        self.paint_box(&mut black, index, lx, ly);
+        self.flat_fx.set(previous);
+        // Premultiplied RGBA in 0..1.
+        let mut px: Vec<[f32; 4]> = white
+            .pixels()
+            .iter()
+            .zip(black.pixels())
+            .map(|(&wp, &bp)| {
+                let ch = |p: u32, k: u32| ((p >> k) & 0xff) as f32 / 255.0;
+                let a = 1.0 - (0..3).map(|k| ch(wp, k * 8) - ch(bp, k * 8)).sum::<f32>() / 3.0;
+                let a = a.clamp(0.0, 1.0);
+                [ch(bp, 16).min(a), ch(bp, 8).min(a), ch(bp, 0).min(a), a]
+            })
+            .collect();
+        for f in style.filter.iter() {
+            match *f {
+                Filter::Blur(r) => effects::blur(&mut px, w, h, r * s),
+                Filter::DropShadow { x, y, blur, color } => {
+                    // The layer's alpha, offset, blurred and colored, under it.
+                    let (dx, dy) = ((x * s).round() as isize, (y * s).round() as isize);
+                    let ca = color.a as f32 / 255.0;
+                    let rgb = [color.r, color.g, color.b].map(|v| v as f32 / 255.0 * ca);
+                    let mut shadow = vec![[0.0f32; 4]; w * h];
+                    for j in 0..h as isize {
+                        for i in 0..w as isize {
+                            let (si, sj) = (i - dx, j - dy);
+                            if si < 0 || sj < 0 || si >= w as isize || sj >= h as isize {
+                                continue;
+                            }
+                            let a = px[sj as usize * w + si as usize][3];
+                            shadow[j as usize * w + i as usize] =
+                                [rgb[0] * a, rgb[1] * a, rgb[2] * a, ca * a];
+                        }
+                    }
+                    effects::blur(&mut shadow, w, h, blur * s);
+                    for (p, sh) in px.iter_mut().zip(&shadow) {
+                        let keep = 1.0 - p[3];
+                        for k in 0..4 {
+                            p[k] += sh[k] * keep;
+                        }
+                    }
+                }
+                ref f => {
+                    let Some(m) = f.matrix() else { continue };
+                    for p in px.iter_mut() {
+                        if p[3] <= 0.0 {
+                            continue;
+                        }
+                        let straight = [p[0] / p[3], p[1] / p[3], p[2] / p[3], p[3]];
+                        let row = |r: &[f32; 5]| {
+                            (r[0] * straight[0]
+                                + r[1] * straight[1]
+                                + r[2] * straight[2]
+                                + r[3] * straight[3]
+                                + r[4])
+                                .clamp(0.0, 1.0)
+                        };
+                        let a = row(&m[3]);
+                        *p = [row(&m[0]) * a, row(&m[1]) * a, row(&m[2]) * a, a];
+                    }
+                }
+            }
+        }
+        let shape = style
+            .clip_path
+            .as_ref()
+            .map(|cp| cp.resolve(b.rect.w, b.rect.h));
+        for j in 0..h {
+            let y = bounds.y + j as i32;
+            for i in 0..w {
+                let p = px[j * w + i];
+                let mut a = p[3];
+                if a <= 0.0 {
+                    continue;
+                }
+                let x = bounds.x + i as i32;
+                let mut k = 1.0;
+                if let Some(shape) = &shape {
+                    k = shape.coverage(x as f32 / s - bx, y as f32 / s - by, s);
+                    if k <= 0.0 {
+                        continue;
+                    }
+                }
+                a *= k;
+                let ch = |v: f32| ((v * k * 255.0).round().clamp(0.0, 255.0)) as u32;
+                let color = ch(p[0]) << 16 | ch(p[1]) << 8 | ch(p[2]);
+                c.composite_premul(x, y, color, (a * 255.0).round().clamp(0.0, 255.0) as u8);
             }
         }
     }
@@ -1927,6 +2071,10 @@ impl Painter<'_> {
 
     fn text(&self, c: &mut Canvas, st: &Style, x: f32, baseline: f32, text: &str, color: Rgba) {
         let s = self.scale;
+        // `text-shadow`: the first shadow is on top, all under the text.
+        for sh in st.text_shadow.iter().rev() {
+            self.text_shadow(c, st, x + sh.x, baseline + sh.y, text, sh);
+        }
         self.fonts.draw(
             c,
             st.font(),
@@ -1936,6 +2084,71 @@ impl Painter<'_> {
             text,
             color.rgb(),
         );
+    }
+
+    /// One `text-shadow` of `text` with its baseline at `(x, baseline)`:
+    /// the glyphs' coverage, blurred, in the shadow's color.
+    fn text_shadow(
+        &self,
+        c: &mut Canvas,
+        st: &Style,
+        x: f32,
+        baseline: f32,
+        text: &str,
+        sh: &crate::css::style::Shadow,
+    ) {
+        if sh.color.a == 0 {
+            return;
+        }
+        let s = self.scale;
+        let size = st.font_size * s;
+        let pad = (sh.blur * s * 1.5).ceil() as usize + 2;
+        let width = (self.fonts.measure(st.font(), st.font_size, text) * s).ceil() as usize;
+        let (w, h) = (width + 2 * pad, (size * 1.6).ceil() as usize + 2 * pad);
+        if w * h > 4_000_000 {
+            return;
+        }
+        let ascent = size * 1.2;
+        let mut layer = Canvas::new(w, h);
+        self.fonts.draw(
+            &mut layer,
+            st.font(),
+            size,
+            pad as f32,
+            pad as f32 + ascent,
+            text,
+            0xff_ffff,
+        );
+        let mut px: Vec<[f32; 4]> = layer
+            .pixels()
+            .iter()
+            .map(|&p| {
+                let a = ((p >> 8) & 0xff) as f32 / 255.0;
+                [a; 4]
+            })
+            .collect();
+        crate::css::effects::blur(&mut px, w, h, sh.blur * s / 2.0);
+        let (x0, y0) = (
+            (x * s).round() as i32 - pad as i32,
+            (baseline * s - ascent).round() as i32 - pad as i32,
+        );
+        let ca = sh.color.a as f32 / 255.0;
+        for j in 0..h {
+            for i in 0..w {
+                let a = px[j * w + i][3] * ca;
+                if a <= 0.002 {
+                    continue;
+                }
+                let ch = |v: u8| (v as f32 * a).round() as u32;
+                let color = ch(sh.color.r) << 16 | ch(sh.color.g) << 8 | ch(sh.color.b);
+                c.composite_premul(
+                    x0 + i as i32,
+                    y0 + j as i32,
+                    color,
+                    (a * 255.0).round() as u8,
+                );
+            }
+        }
     }
 
     /// A thin overlay scrollbar on the right of `r` if content overflows.

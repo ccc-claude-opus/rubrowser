@@ -361,6 +361,11 @@ pub struct Style {
     /// painted above) `background_image`.
     pub background_gradient: Option<(Rc<super::gradient::Gradient>, bool)>,
     pub box_shadow: Rc<[Shadow]>,
+    /// `text-shadow` (inherited).
+    pub text_shadow: Rc<[Shadow]>,
+    /// `filter` functions, applied in order.
+    pub filter: Rc<[super::effects::Filter]>,
+    pub clip_path: Option<Rc<super::effects::ClipPath>>,
     pub background_size: BackgroundSize,
     pub background_repeat: Repeat,
     /// `background-position` as fractions (0 = left/top, 1 = right/bottom)
@@ -469,6 +474,9 @@ impl Default for Style {
             background_image: None,
             background_gradient: None,
             box_shadow: Rc::new([]),
+            text_shadow: Rc::new([]),
+            filter: Rc::new([]),
+            clip_path: None,
             background_size: BackgroundSize::Auto,
             background_repeat: Repeat(true, true),
             background_position: (Dim::Percent(0.0), Dim::Percent(0.0)),
@@ -513,6 +521,11 @@ impl Style {
 
     /// Whether any transform applies (`translate`, `rotate`, `scale` or
     /// `transform`).
+    /// Whether `filter` or `clip-path` paint the box through a layer.
+    pub fn has_effects(&self) -> bool {
+        !self.filter.is_empty() || self.clip_path.is_some()
+    }
+
     pub fn is_transformed(&self) -> bool {
         self.translate != (Dim::Px(0.0), Dim::Px(0.0))
             || self.rotate != 0.0
@@ -564,6 +577,7 @@ impl Style {
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
             text_transform: parent.text_transform,
+            text_shadow: parent.text_shadow.clone(),
             vars: parent.vars.clone(),
             ..Style::default()
         }
@@ -894,6 +908,17 @@ impl Style {
                     || v.starts_with("inset(100%")
                     || v.replace(' ', "") == "polygon(0000,0000,0000)"
                     || v.replace(' ', "").starts_with("circle(0");
+                self.clip_path = super::effects::parse_clip_path(v, fc).map(Rc::new);
+            }
+            "filter" => {
+                if let Some(f) = super::effects::parse_filter(v, fc, self.color) {
+                    self.filter = f.into();
+                }
+            }
+            "text-shadow" => {
+                if let Some(sh) = super::effects::parse_text_shadow(v, fc, self.color) {
+                    self.text_shadow = sh.into();
+                }
             }
             "aspect-ratio" => {
                 // `auto`, `16 / 9`, `1.5`, `auto 4 / 3`
