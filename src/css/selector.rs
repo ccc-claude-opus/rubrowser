@@ -318,7 +318,10 @@ impl<'a> Parser<'a> {
             "before" | "after" | "first-line" | "first-letter"
         );
         if double || legacy_element {
+            // One after another (`::part(x)::after`, `::before::marker`)
+            // is a part of a part, which nothing here has.
             *element = Some(match name.as_str() {
+                _ if element.is_some() => PseudoElement::Other,
                 "before" => PseudoElement::Before,
                 "after" => PseudoElement::After,
                 "marker" => PseudoElement::Marker,
@@ -1149,6 +1152,11 @@ mod tests {
         assert_eq!(s("li:not(#x)").specificity, [1, 0, 1]);
         assert_eq!(s(":where(#x) p").specificity, [0, 0, 1]);
         assert_eq!(s("a::before").pseudo_element, Some(PseudoElement::Before));
+        assert_eq!(
+            s("::part(x)::after").pseudo_element,
+            Some(PseudoElement::Other),
+            "a pseudo-element of a part is not ::after of the element"
+        );
         assert_eq!(s("a:after").pseudo_element, Some(PseudoElement::After));
         assert_eq!(
             s("::-webkit-scrollbar").pseudo_element,

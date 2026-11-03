@@ -106,6 +106,7 @@ imports! {
     fn event_int(which: i32) -> i32;
     fn event_pos(which: i32) -> f64;
     fn location(p: *mut u8, cap: usize) -> i32;
+    fn languages(p: *mut u8, cap: usize) -> i32;
     fn history_go(delta: i32);
     fn get_checked(h: i32) -> i32;
     fn set_checked(h: i32, v: i32);
@@ -169,6 +170,16 @@ pub fn body() -> Option<Element> {
 /// The page's URL.
 pub fn location() -> String {
     read_string(|p, cap| unsafe { ffi::location(p, cap) }).unwrap_or_default()
+}
+
+/// The user's preferred languages (BCP 47 tags, most preferred first).
+pub fn languages() -> Vec<String> {
+    read_string(|p, cap| unsafe { ffi::languages(p, cap) })
+        .unwrap_or_default()
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 /// Moves through the tab's history (`-1` is back).

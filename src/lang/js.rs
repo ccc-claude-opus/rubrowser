@@ -401,6 +401,11 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
                 &read_string(|p, n| unsafe { ffi::location(p, n) }).unwrap_or_default(),
             ))
         }),
+        ("languages", 0, |_, _, _| {
+            Ok(string(
+                &read_string(|p, n| unsafe { ffi::languages(p, n) }).unwrap_or_default(),
+            ))
+        }),
         ("historyGo", 1, |_, a, c| {
             unsafe { ffi::history_go(int(a, 0, c)?) };
             Ok(JsValue::undefined())

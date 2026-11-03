@@ -108,3 +108,7 @@ required-features = ["js-runtime"]
 
 [package.metadata.docs.rs]
 features = ["native", "sdk"]
+
+# taffy 0.15.1 with a fix for clearance (vendor/taffy/PATCHED.md).
+[patch.crates-io]
+taffy = { path = "vendor/taffy" }

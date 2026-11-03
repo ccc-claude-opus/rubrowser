@@ -153,25 +153,6 @@ fn user_agent() -> String {
     )
 }
 
-/// `Accept-Language` from the system locale (`LANG`, e.g. `zh_TW.UTF-8`),
-/// with English as a fallback.
-fn accept_language() -> String {
-    let lang = std::env::var("LC_ALL")
-        .or_else(|_| std::env::var("LANG"))
-        .unwrap_or_default();
-    let tag = lang
-        .split(['.', '@'])
-        .next()
-        .unwrap_or("")
-        .replace('_', "-");
-    let primary = tag.split('-').next().unwrap_or("").to_string();
-    match (tag.as_str(), primary.as_str()) {
-        ("" | "C" | "POSIX", _) | (_, "en") => "en-US,en;q=0.9".into(),
-        (t, p) if t != p => format!("{t},{p};q=0.9,en-US;q=0.8,en;q=0.7"),
-        (t, _) => format!("{t},en-US;q=0.8,en;q=0.7"),
-    }
-}
-
 /// The HTTP client shared by all loads.
 fn agent() -> &'static ureq::Agent {
     static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
@@ -295,14 +276,14 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<(Vec<u8>, Option<Str
                     agent()
                         .post(url)
                         .header("Accept", "*/*")
-                        .header("Accept-Language", accept_language())
+                        .header("Accept-Language", crate::net::accept_language())
                         .header("Content-Type", ctype)
                         .send(&r.body[..])
                 }
                 None => agent()
                     .get(url)
                     .header("Accept", if request.is_some() { "*/*" } else { accept })
-                    .header("Accept-Language", accept_language())
+                    .header("Accept-Language", crate::net::accept_language())
                     .call(),
             }
             .map_err(|e| e.to_string())?;

@@ -184,6 +184,14 @@ struct Builder<'a> {
     /// Positioned elements being built (innermost last), each with the
     /// absolutely positioned descendants hoisted to it as its children.
     abs_stack: Vec<(NodeId, Vec<taffy::NodeId>)>,
+    /// Floats that a previous pass found fit on the single line of the
+    /// inline content before them: placed ahead of it (see `float_runs`).
+    raise: std::collections::HashSet<NodeId>,
+    /// Floats right after a run of inline content (its anonymous block),
+    /// in this pass.
+    float_runs: HashMap<taffy::NodeId, Vec<(taffy::NodeId, NodeId)>>,
+    /// Floats found to fit beside the line before them in this pass.
+    raised: std::collections::HashSet<NodeId>,
 }
 
 /// Containing block sizes (width, height) by element.
@@ -260,6 +268,7 @@ pub fn layout(
         hints.caps.extend(found.caps);
         hints.bases.extend(found.bases);
         hints.plans.extend(found.plans);
+        hints.raise.extend(found.raise);
     }
     layout_pass(
         dom, styles, generated, fonts, width, height, replaced, hints,
@@ -276,11 +285,16 @@ struct Hints {
     bases: Bases,
     /// Multi-column containers' widths and column heights.
     plans: HashMap<NodeId, columns::Plan>,
+    /// Floats raised to the line before them.
+    raise: std::collections::HashSet<NodeId>,
 }
 
 impl Hints {
     fn is_empty(&self) -> bool {
-        self.caps.is_empty() && self.bases.is_empty() && self.plans.is_empty()
+        self.caps.is_empty()
+            && self.bases.is_empty()
+            && self.plans.is_empty()
+            && self.raise.is_empty()
     }
 }
 
@@ -309,6 +323,9 @@ fn layout_pass(
         plans: hints.plans,
         multicol: Vec::new(),
         abs_stack: Vec::new(),
+        raise: hints.raise,
+        float_runs: HashMap::new(),
+        raised: Default::default(),
         in_block: true,
         fixed: Vec::new(),
         replaced,
@@ -374,6 +391,7 @@ fn layout_pass(
         caps: std::mem::take(&mut b.overflow),
         bases: b.wrong_bases(),
         plans: b.lay_columns(),
+        raise: std::mem::take(&mut b.raised),
     };
     (LayoutTree { boxes: b.boxes }, found)
 }
@@ -801,9 +819,38 @@ impl Builder<'_> {
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
         let mut kids = Vec::new();
+        // The last run of inline content, if only floats came after it:
+        // its index in `kids` and anonymous block.
+        let mut run: Option<(usize, taffy::NodeId)> = None;
         for p in parts {
             match p {
-                Part::Block(c) => kids.push(c),
+                Part::Block(c) => {
+                    // A float may sit at the top of the line holding the
+                    // content before it (CSS 2.1 §9.5.1), which for a run
+                    // of one line is as if it came first.
+                    let float = tree.get_node_context(c).and_then(|x| x.node).filter(|&n| {
+                        self.style(n).is_some_and(|s| {
+                            s.float != cs::Float::None
+                                && s.clear == (false, false)
+                                && s.position != cs::Position::Absolute
+                        })
+                    });
+                    match (float, run) {
+                        (Some(f), Some((at, anon))) if !is_flex && !is_grid => {
+                            if self.raise.contains(&f) {
+                                kids.insert(at, c);
+                                run = Some((at + 1, anon));
+                            } else {
+                                kids.push(c);
+                                self.float_runs.entry(anon).or_default().push((c, f));
+                            }
+                        }
+                        _ => {
+                            run = None;
+                            kids.push(c);
+                        }
+                    }
+                }
                 Part::Inline(items) => {
                     let content = Content { owner: id, items };
                     if content.is_blank(self.styles) {
@@ -832,7 +879,9 @@ impl Builder<'_> {
                         keeps_ratio: false,
                         ratio_only: false,
                     };
-                    kids.push(tree.new_leaf_with_context(anon, ctx).unwrap());
+                    let anon = tree.new_leaf_with_context(anon, ctx).unwrap();
+                    kids.push(anon);
+                    run = Some((kids.len() - 1, anon));
                 }
             }
         }
@@ -1056,6 +1105,19 @@ impl Builder<'_> {
             let mut il = inline::layout(content, w.max(0.0), self.styles, self.fonts);
             if let Some(owner) = self.style(content.owner) {
                 inline::align(&mut il, owner.text_align, w, owner.rtl);
+            }
+            // Floats after a single line that fit beside it go up to it.
+            if let (Some(floats), [line]) = (self.float_runs.get(&node), &il.lines[..]) {
+                let width: f32 = floats
+                    .iter()
+                    .map(|&(f, _)| {
+                        let fl = tree.layout(f).unwrap();
+                        fl.size.width + fl.margin.left + fl.margin.right
+                    })
+                    .sum();
+                if line.width + width <= w + 0.5 {
+                    self.raised.extend(floats.iter().map(|&(_, n)| n));
+                }
             }
             il
         });
@@ -2106,6 +2168,40 @@ mod tests {
         let (f, p) = (l.rect("f"), l.rect("p"));
         assert_eq!(f.x, 200.0);
         assert!(p.x + p.w <= 200.5, "text block beside the float: {p:?}");
+    }
+
+    #[test]
+    fn floats_after_a_line_go_up_to_it() {
+        // A float after one line of text it fits beside sits on that line
+        // (CSS 2.1 §9.5.1); after a longer run, below it.
+        let long = "word ".repeat(40);
+        let l = lay(
+            &format!(
+                r#"<style>body{{margin:0}}</style>
+                <div style="width:300px">author <span id=a style="float:right;width:50px">x</span><span id=b style="float:right;width:50px">y</span></div>
+                <div style="width:300px">{long}<span id=c style="float:right;width:50px">z</span></div>"#
+            ),
+            800.0,
+            600.0,
+        );
+        let (a, b, c) = (l.rect("a"), l.rect("b"), l.rect("c"));
+        assert_eq!((a.x, a.y), (250.0, 0.0));
+        assert_eq!((b.x, b.y), (200.0, 0.0));
+        assert!(c.y > 40.0, "below the run of several lines: {c:?}");
+    }
+
+    #[test]
+    fn a_cleared_box_holding_floats_stays_below_its_parent_padding() {
+        let l = lay(
+            r#"<style>body{margin:0}</style>
+            <div style="float:left;width:100px;height:100px"></div>
+            <div style="clear:both;padding-top:20px">
+              <div id=w style="clear:both"><div style="float:left;width:50px;height:50px"></div></div>
+            </div>"#,
+            800.0,
+            600.0,
+        );
+        assert_eq!(l.rect("w").y, 120.0);
     }
 
     #[test]

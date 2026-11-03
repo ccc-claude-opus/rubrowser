@@ -119,6 +119,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `set_timeout(ms: f64, timer: i32)` | `ms` 毫秒後呼叫 `rb_timer(timer)` |
 | `clear_timeout(timer: i32)` | 取消尚未觸發的計時器 |
 | `location(ptr, cap) -> i32` | 目前網頁的網址 |
+| `languages(ptr, cap) -> i32` | 使用者偏好的語言（BCP 47，以逗號分隔，最優先的在前） |
 | `history_go(delta: i32)` | 在歷史中移動（-1 是上一頁） |
 | `navigate(ptr, len)` | 以目前頁面為基準開啟網址 |
 | `log(ptr, len)` | 輸出到主控台（原生版為 stderr，網頁版為瀏覽器 console） |

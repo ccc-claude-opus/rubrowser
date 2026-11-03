@@ -1153,6 +1153,13 @@ fn linker(engine: &Engine) -> Result<Linker<State>, wasmi::errors::LinkerError> 
             write_str(&mut c, p, cap, &url)
         },
     )?;
+    l.func_wrap(
+        "rb",
+        "languages",
+        |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+            write_str(&mut c, p, cap, &crate::net::languages().join(","))
+        },
+    )?;
     l.func_wrap("rb", "history_go", |mut c: C, delta: i32| {
         c.data_mut().out.history = delta.clamp(-100, 100);
     })?;

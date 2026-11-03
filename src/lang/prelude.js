@@ -2094,8 +2094,11 @@
 
   const navigator = {
     userAgent: 'Mozilla/5.0 rubrowser',
-    language: 'en-US',
-    languages: ['en-US', 'en'],
+    get languages() {
+      const l = rb.languages().split(',').filter(Boolean);
+      return Object.freeze(l.length ? l : ['en-US', 'en']);
+    },
+    get language() { return this.languages[0]; },
     platform: '',
     cookieEnabled: false,
     onLine: true,
