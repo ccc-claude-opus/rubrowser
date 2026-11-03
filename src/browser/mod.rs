@@ -797,15 +797,23 @@ impl Browser {
                 .count();
             scripts.insert(at, (Lang::Source(JS_MIME.to_string()), None, code, None));
         }
-        // Module scripts, and classic ones with `src` and `defer` / `async`,
-        // run after the others (HTML: deferred until the document is parsed;
-        // async ones run here then too).
+        // Module scripts, and classic ones with `src` and `defer`, run after
+        // the others (HTML: deferred until the document is parsed). Async
+        // ones run whenever they are ready, in no set order: here after all
+        // of those, the page's own (same origin) before other sites'.
         let dom = &tab.doc.dom;
+        let page_origin = origin(url);
         scripts.sort_by_key(|(lang, src, _, node)| {
             let has = |a: &str| node.is_some_and(|n| dom.attr(n, a).is_some());
-            let deferred =
-                *lang == Lang::Module || (src.is_some() && (has("defer") || has("async")));
-            deferred as u8
+            let external = src.is_some() || *lang == Lang::Module;
+            if external && has("async") {
+                let foreign = src
+                    .as_deref()
+                    .is_some_and(|s| origin(&url::resolve(url, s)) != page_origin);
+                2 + foreign as u8
+            } else {
+                (*lang == Lang::Module || (src.is_some() && has("defer"))) as u8
+            }
         });
         tab.script_count = scripts.len();
         tab.consumed = 0;

@@ -23,6 +23,9 @@ pub enum Item {
         height: f32,
         baseline: f32,
         wraps: bool,
+        /// A replaced element sized by a percentage: as wide as nothing
+        /// when the lines get no room (min-content, CSS Sizing 3 §5.2.2).
+        compressible: bool,
     },
     /// A forced line break (`<br>`).
     Break { node: NodeId },
@@ -129,8 +132,14 @@ fn style(styles: &[Option<Style>], node: NodeId) -> &Style {
         .unwrap_or_else(|| DEFAULT.with(|d| *d))
 }
 
-/// Splits items into pieces, applying `white-space` rules.
-fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Piece> {
+/// Splits items into pieces, applying `white-space` rules; `squeezed` when
+/// the lines get no room.
+fn pieces(
+    content: &Content,
+    styles: &[Option<Style>],
+    fonts: &Fonts,
+    squeezed: bool,
+) -> Vec<Piece> {
     let mut out = Vec::new();
     // At the start of a block, leading collapsible spaces are dropped.
     let mut after_space = true;
@@ -147,10 +156,15 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                 height,
                 baseline,
                 wraps,
+                compressible,
             } => {
                 out.push(Piece::Atomic {
                     index: *index,
-                    width: *width,
+                    width: if *compressible && squeezed {
+                        0.0
+                    } else {
+                        *width
+                    },
                     height: *height,
                     baseline: *baseline,
                     wraps: *wraps,
@@ -323,7 +337,8 @@ pub fn layout(
 
     // Lines may only break where there is a space (or around atomics).
     let mut breakable = false;
-    let mut queue: std::collections::VecDeque<Piece> = pieces(content, styles, fonts).into();
+    let mut queue: std::collections::VecDeque<Piece> =
+        pieces(content, styles, fonts, max_width <= 0.0).into();
     while let Some(piece) = queue.pop_front() {
         match piece {
             Piece::Break => {
@@ -878,6 +893,7 @@ mod tests {
             height: 40.0,
             baseline: 40.0,
             wraps: true,
+            compressible: false,
         });
         let l = layout(&c, f32::INFINITY, &s, &f);
         assert_eq!(texts(&l), vec!["a []"]);

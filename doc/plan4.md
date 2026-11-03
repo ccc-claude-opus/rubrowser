@@ -100,6 +100,7 @@
 | 23 | 第五次網站調查（CNN、Ars Technica、W3C、MDN、Medium、Wikipedia 入口、YouTube、Reddit、NYT）後的修正，並以內建的 Chromium 量測同一頁當參考：堆疊上下文——正 `z-index` 的定位元素交給所屬的堆疊上下文（根元素、有 `z-index` 的定位元素、fixed / sticky、opacity、transform、filter、clip-path），在其他內容之後依 z-index 繪製（含行內的 inline-block）；`order`（flex / grid 項目依 order 排列與繪製）；`text-indent`；文字顏色的透明度（透明文字不再畫成黑色）；`display: inline` 的 `<button>` 當作 inline-block；收縮至內容寬度時不再把放不下的長字壓到可用寬度；行內百分比寬度在容器寬度改變時重新計算；JS：`NodeFilter`、`TreeWalker`、`NodeIterator`（DOM 規格的走訪演算法），`UIEvent`、`MouseEvent`、`PointerEvent`、`WheelEvent`、`KeyboardEvent`、`FocusEvent`、`InputEvent` 等事件介面與其初始化字典，瀏覽器送出的事件使用對應的介面 |
 | 24 | 第六次網站調查（Wikipedia 條目、GitHub、Stripe、rust-lang.org）後的修正：負 `z-index` 的定位元素交給所屬的堆疊上下文，在它的背景之後、其他內容之前繪製（先用不畫圖的一趟找出它們與當時的裁切），所以會被同一個上下文裡較早元素的背景蓋住（CSS 2.1 附錄 E）；自訂屬性在宣告的元素上計算（`var()` 代入後再繼承），自我參照或循環的自訂屬性無效，`var()` 改用預設值（CSS Variables）；SVG 文字：resvg 使用內附的 DejaVu 字型與系統已安裝的字型，內嵌 `<svg>` 的文字繼承 CSS 字型；內嵌 `<svg>` 的視窗是 CSS 給它的方框（不再以 300×150 縮放）；實線邊框與不同顏色的相鄰邊在角落沿對角線接合（CSS 三角形） |
 | 25 | 以「最常被看的網站的主要內容要看得清楚」為目標的第七次調查（新聞、百科、字典、文件、台灣常用網站）後的修正：選擇器裡接在另一個偽元素後的偽元素（`::part(x)::after`）不再被當成元素自己的 `::after`；浮動元素緊接在只有一行的行內內容之後、且放得下時，放到那一行的頂端（CSS 2.1 §9.5.1），文字在旁邊排（多輪排版：上一輪量到行數與寬度）；清除浮動（`clear`）的區塊裡只有浮動元素時，不再被自己裡面的浮動強制產生 clearance 而往上移（修改 taffy，見 `vendor/taffy/PATCHED.md`）；使用者的語言偏好（`LANG` 等環境變數，macOS 上為系統偏好語言）用於 `Accept-Language`、`navigator.language` 與 `navigator.languages`（新的主機函式 `languages`） |
+| 26 | 第八次調查（AP、CNBC、自由時報、ETtoday、巴哈姆特、Mobile01、日文維基、GeeksforGeeks、w3schools、Python 文件、Rust Book、Platformer、wikiHow、weather.gov、NHK、Naver）後的修正：缺字時的系統字型改為依序嘗試的一串（中文、日文、韓文、泛 Unicode、泰文、天城文、符號；各平台各自的路徑，沒裝的略過），韓文與日文「・」不再顯示成方框；備用字型只用它的 Unicode 字元對照表選字與取字形（STHeiti 另有 Big5 對照表，它的碼位與韓文重疊，原本把「뉴」畫成「猓」）；以百分比設定 `width` / `max-width` 的替換元素（圖片等）不計入 min-content 大小（CSS Sizing 3 §5.2.2 的 compressible），區塊或行內皆然，flex 項目不再被圖片的原始寬度撐開；`grid-row` / `grid-column` 的值可用數學函式（`span min(12, 3)`、`calc()`）；`async` 腳本排在一般與 `defer` 腳本之後，同來源的在前 |
 
 ### 第二批調查
 
@@ -144,6 +145,19 @@
 | python.org | 「Donate」按鈕仍在搜尋列上方（收縮至內容寬度的浮動容器沒有把同一行的浮動算進寬度） |
 | IMDb、ESPN（AWS WAF）、Britannica、Merriam-Webster、Fandom（Cloudflare）、Allrecipes、Investopedia | 機器人檢查頁，不處理 |
 | PTT 部分看板 | 需先同意滿十八歲的條款，不代替使用者同意 |
+
+### 第八批調查（2026-11-03）
+
+| 網站 | 狀況 |
+|---|---|
+| 自由時報、ETtoday、日文維基、w3schools、Python 文件、Rust Book、Platformer、wikiHow、weather.gov | 主要內容清楚 |
+| Naver 新聞 | 韓文原本全是方框或錯字，已修正 |
+| NHK | 一張圖片撐滿整頁、一排項目被擠成一字一行（`span min()`），已修正；日文標題的漢字與假名來自不同字型 |
+| 中央社 | 頭條圖片原本 800px 寬（應為一半 640px），已修正 |
+| GeeksforGeeks | 整頁先以 `visibility:hidden` 隱藏，等腳本顯示；前面同步載入的 Google Tag Manager 在這裡要跑超過時間預算（效能問題） |
+| 巴哈姆特 | 主要區塊由腳本載入，只顯示骨架 |
+| CNBC | 「最新消息」欄與另一欄重疊；Chrome 這邊被機器人防護擋下，無法比對 |
+| AP News（Cloudflare）、Mobile01（Akamai） | 機器人檢查頁，不處理 |
 
 ## 5. 不做的事
 

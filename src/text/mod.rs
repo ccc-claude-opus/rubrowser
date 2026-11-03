@@ -155,8 +155,14 @@ pub struct Fonts {
     faces: [OnceCell<Font>; 12],
     /// DejaVu faces when `faces` holds system fonts (for symbols they lack).
     bundled: [OnceCell<Font>; 12],
-    /// A system font for characters DejaVu lacks (CJK…), loaded on first use.
-    fallback: OnceCell<Option<Font>>,
+    /// System fonts for characters DejaVu lacks (Chinese, Japanese,
+    /// Korean, …), tried in order of [`FALLBACK_FONTS`], each loaded on
+    /// first use.
+    fallbacks: [OnceCell<Option<Font>>; FALLBACK_SLOTS],
+    /// Glyph ids in the fallback fonts by (glyph-cache face, char), from
+    /// their Unicode character maps only (fontdue also reads legacy ones,
+    /// such as a Big5 map whose codes collide with Hangul).
+    fallback_gids: RefCell<HashMap<(usize, char), u16>>,
     /// (face, char, physical size in 1/4 px) → rasterized glyph.
     glyphs: RefCell<HashMap<(usize, char, u32), Glyph>>,
     /// Prefer installed Arial / Georgia (or metric-compatible Liberation
@@ -360,8 +366,8 @@ impl Fonts {
         if index >= Self::WEB_BASE {
             return self.web[index - Self::WEB_BASE].get();
         }
-        if index == Self::FALLBACK {
-            return self.fallback();
+        if (Self::FALLBACK_BASE..Self::FALLBACK_BASE + FALLBACK_SLOTS).contains(&index) {
+            return self.fallback(index - Self::FALLBACK_BASE);
         }
         if index > Self::FALLBACK {
             return self.bundled[index - Self::FALLBACK - 1].get();
@@ -369,8 +375,8 @@ impl Fonts {
         self.faces[index].get()
     }
 
-    /// Index used for the fallback face in the glyph cache; bundled faces
-    /// standing in for system ones come after it.
+    /// Bundled faces standing in for system ones have glyph-cache indexes
+    /// after this one.
     const FALLBACK: usize = 12;
 
     fn bundled(&self, key: FontKey) -> &Font {
@@ -383,8 +389,43 @@ impl Fonts {
         })
     }
 
-    fn fallback(&self) -> Option<&Font> {
-        self.fallback.get_or_init(load_fallback).as_ref()
+    /// The glyph for `c` in `font`, glyph-cache face `index`.
+    fn glyph_id(&self, index: usize, font: &Font, c: char) -> u16 {
+        if !(Self::FALLBACK_BASE..Self::FALLBACK_BASE + FALLBACK_SLOTS).contains(&index) {
+            return font.lookup_glyph_index(c);
+        }
+        if let Some(&g) = self.fallback_gids.borrow().get(&(index, c)) {
+            return g;
+        }
+        let g = self
+            .face_bytes
+            .borrow()
+            .get(&index)
+            .and_then(|b| {
+                rustybuzz::ttf_parser::Face::parse(b, 0)
+                    .ok()?
+                    .glyph_index(c)
+            })
+            .map_or(0, |g| g.0);
+        self.fallback_gids.borrow_mut().insert((index, c), g);
+        g
+    }
+
+    /// Glyph-cache indexes of the fallback fonts.
+    const FALLBACK_BASE: usize = 500;
+
+    /// Fallback font `i` (see [`FALLBACK_FONTS`]), if installed.
+    fn fallback(&self, i: usize) -> Option<&Font> {
+        self.fallbacks[i]
+            .get_or_init(|| {
+                let bytes = fallback_bytes(i)?;
+                let font = Font::from_bytes(&bytes[..], FontSettings::default()).ok()?;
+                self.face_bytes
+                    .borrow_mut()
+                    .insert(Self::FALLBACK_BASE + i, bytes.into());
+                Some(font)
+            })
+            .as_ref()
     }
 
     /// The face that draws `c`: the requested one, else regular DejaVu Sans
@@ -411,10 +452,13 @@ impl Fonts {
                 return (offset + k.index(), f);
             }
         }
-        match self.fallback().filter(|f| f.lookup_glyph_index(c) != 0) {
-            Some(f) => (Self::FALLBACK, f),
-            None => (key.index(), font),
+        for i in 0..FALLBACK_SLOTS {
+            let index = Self::FALLBACK_BASE + i;
+            if let Some(f) = self.fallback(i).filter(|f| self.glyph_id(index, f, c) != 0) {
+                return (index, f);
+            }
         }
+        (key.index(), font)
     }
 
     pub fn line_metrics(&self, key: FontKey, size: f32) -> LineMetrics {
@@ -464,13 +508,14 @@ impl Fonts {
         for c in text.chars() {
             let (face, font) = self.face_for(key, c);
             let kern = prev
-                .filter(|&(_, f)| f == face)
+                .filter(|&(_, f)| f == face && face < Self::FALLBACK_BASE)
                 .and_then(|(p, _)| font.horizontal_kern(p, c, size))
                 .unwrap_or(0.0);
             if let Some(last) = out.last_mut() {
                 *last += kern;
             }
-            out.push(font.metrics(c, size).advance_width);
+            let gid = self.glyph_id(face, font, c);
+            out.push(font.metrics_indexed(gid, size).advance_width);
             prev = Some((c, face));
         }
         out
@@ -560,8 +605,9 @@ impl Fonts {
         for (c, adv) in text.chars().zip(advances) {
             if !c.is_whitespace() {
                 let (face, font) = self.face_for(key, c);
+                let gid = self.glyph_id(face, font, c);
                 let g = cache.entry((face, c, size_q)).or_insert_with(|| {
-                    let (m, coverage) = font.rasterize(c, size);
+                    let (m, coverage) = font.rasterize_indexed(gid, size);
                     Glyph {
                         xmin: m.xmin,
                         ymin: m.ymin,
@@ -653,33 +699,75 @@ fn system_face(key: FontKey) -> Option<(Font, Vec<u8>)> {
     None
 }
 
-/// Loads the first available system font with wide Unicode (CJK)
-/// coverage; `RUBROWSER_FALLBACK_FONT` names one explicitly.
-fn load_fallback() -> Option<Font> {
+/// System fonts for characters the bundled ones lack, most likely first:
+/// Chinese, Japanese and Korean faces, then wide-coverage ones, for macOS,
+/// Linux and Windows (those not installed are skipped).
+/// `RUBROWSER_FALLBACK_FONT` names one to try before them.
+const FALLBACK_FONTS: [&[&str]; 7] = [
+    &[
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
+        "C:\\Windows\\Fonts\\msjh.ttc",
+        "C:\\Windows\\Fonts\\msyh.ttc",
+    ],
+    &[
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "C:\\Windows\\Fonts\\meiryo.ttc",
+        "C:\\Windows\\Fonts\\YuGothM.ttc",
+    ],
+    &[
+        "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+        "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+        "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+        "C:\\Windows\\Fonts\\malgun.ttf",
+    ],
+    &[
+        "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        "C:\\Windows\\Fonts\\simsun.ttc",
+    ],
+    &[
+        "/System/Library/Fonts/ThonburiUI.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansThai-Regular.ttf",
+        "C:\\Windows\\Fonts\\tahoma.ttf",
+    ],
+    &[
+        "/System/Library/Fonts/Kohinoor.ttc",
+        "/usr/share/fonts/truetype/noto/NotoSansDevanagari-Regular.ttf",
+        "C:\\Windows\\Fonts\\Nirmala.ttc",
+    ],
+    &[
+        "/System/Library/Fonts/Apple Symbols.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf",
+        "C:\\Windows\\Fonts\\seguisym.ttf",
+    ],
+];
+
+const FALLBACK_SLOTS: usize = FALLBACK_FONTS.len();
+
+/// The data of fallback font `i`: the first installed file of that slot.
+fn fallback_bytes(i: usize) -> Option<Vec<u8>> {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let custom = std::env::var("RUBROWSER_FALLBACK_FONT").ok();
-        let paths = [
-            "/System/Library/Fonts/STHeiti Medium.ttc",
-            "/System/Library/Fonts/Hiragino Sans GB.ttc",
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-            "C:\\Windows\\Fonts\\msyh.ttc",
-            "C:\\Windows\\Fonts\\simsun.ttc",
-        ];
-        for path in custom.iter().map(String::as_str).chain(paths) {
-            if let Ok(bytes) = std::fs::read(path)
-                && let Ok(font) = Font::from_bytes(bytes, FontSettings::default())
-            {
-                return Some(font);
-            }
+        // A custom font takes the first slot.
+        if i == 0
+            && let Some(bytes) = std::env::var("RUBROWSER_FALLBACK_FONT")
+                .ok()
+                .and_then(|p| std::fs::read(p).ok())
+        {
+            return Some(bytes);
         }
+        return FALLBACK_FONTS[i].iter().find_map(|p| std::fs::read(p).ok());
     }
-    None
+    #[allow(unreachable_code)]
+    {
+        let _ = i;
+        None
+    }
 }
 
 #[cfg(test)]
@@ -691,6 +779,22 @@ mod tests {
         bold: false,
         italic: false,
     };
+
+    #[test]
+    fn fallback_fonts_are_chosen_by_their_unicode_maps() {
+        // STHeiti also has a Big5 character map whose codes collide with
+        // Hangul: Korean goes to the Korean font, not STHeiti's 猓.
+        let f = Fonts::new();
+        let korean = std::path::Path::new(FALLBACK_FONTS[2][0]).exists();
+        if korean && std::path::Path::new(FALLBACK_FONTS[0][0]).exists() {
+            let (face, _) = f.face_for(SANS, '\u{B274}');
+            assert_eq!(face, Fonts::FALLBACK_BASE + 2);
+        }
+        let (face, font) = f.face_for(SANS, '\u{B274}');
+        if face >= Fonts::FALLBACK_BASE {
+            assert_ne!(f.glyph_id(face, font, '\u{B274}'), 0);
+        }
+    }
 
     #[test]
     fn measuring_scales_with_size_and_is_proportional() {

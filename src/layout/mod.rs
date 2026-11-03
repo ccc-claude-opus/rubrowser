@@ -576,6 +576,22 @@ impl Builder<'_> {
                     |_, _| 0.0,
                     |known, avail| {
                         if let Some((w, h)) = ctx.as_ref().and_then(|c| c.intrinsic) {
+                            // A replaced element sized by a percentage gives
+                            // nothing to the min-content size of what holds
+                            // it (CSS Sizing 3 §5.2.2: it is compressible).
+                            let compressible = ctx
+                                .as_ref()
+                                .and_then(|c| styles.get(c.style_node)?.as_ref())
+                                .is_some_and(|s| has_percent(s.width) || has_percent(s.max_width));
+                            if compressible
+                                && known.width.is_none()
+                                && avail.width == AvailableSpace::MinContent
+                            {
+                                return Size {
+                                    width: 0.0,
+                                    height: known.height.unwrap_or(0.0),
+                                };
+                            }
                             // Keep the natural aspect ratio when one side is set.
                             let keeps = ctx.as_ref().is_some_and(|c| c.keeps_ratio);
                             let ratio = (keeps && w > 0.0 && h > 0.0).then(|| h / w);
@@ -980,6 +996,8 @@ impl Builder<'_> {
             } else {
                 // inline-block / inline-flex: an atomic inline box.
                 let wraps = self.style(parent).is_none_or(|p| p.white_space.wraps());
+                let compressible = self.replaced.contains_key(&c)
+                    && (has_percent(css.width) || has_percent(css.max_width));
                 let (index, width, height, baseline) = self.atomic(c);
                 push_inline(
                     parts,
@@ -989,6 +1007,7 @@ impl Builder<'_> {
                         height,
                         baseline,
                         wraps,
+                        compressible,
                     },
                 );
             }
@@ -1421,8 +1440,50 @@ impl Builder<'_> {
 
 /// A grid line placement (`2`, `-1`, `span 2`, `main`, `auto`).
 fn placement(v: Option<&str>) -> GridPlacement {
-    v.and_then(|v| v.trim().parse::<GridPlacement>().ok())
-        .unwrap_or(GridPlacement::Auto)
+    v.and_then(|v| {
+        // Math functions (`span min(12, 3)`) give integers.
+        let words: Vec<String> = top_tokens(v.trim())
+            .into_iter()
+            .map(|t| integer_math(t).map_or_else(|| t.to_string(), |n| n.to_string()))
+            .collect();
+        words.join(" ").parse::<GridPlacement>().ok()
+    })
+    .unwrap_or(GridPlacement::Auto)
+}
+
+/// The integer value of a math function of plain numbers (`min(12, 3)`,
+/// `calc(2 * 3)`), rounded to the nearest; `None` for anything else.
+fn integer_math(t: &str) -> Option<i32> {
+    let name = t.split('(').next()?;
+    if !t.ends_with(')') || !matches!(name, "calc" | "min" | "max" | "clamp") {
+        return None;
+    }
+    // Evaluated as lengths: each bare number becomes pixels.
+    let mut px = String::with_capacity(t.len() + 8);
+    let mut num = String::new();
+    let flush = |num: &mut String, px: &mut String| {
+        if !num.is_empty() {
+            px.push_str(num);
+            px.push_str("px");
+            num.clear();
+        }
+    };
+    for c in t.chars() {
+        if c.is_ascii_digit() || (c == '.' && !num.is_empty()) {
+            num.push(c);
+        } else {
+            flush(&mut num, &mut px);
+            px.push(c);
+        }
+    }
+    flush(&mut num, &mut px);
+    let fc = crate::css::values::FontContext {
+        em: 16.0,
+        rem: 16.0,
+        vw: 0.0,
+        vh: 0.0,
+    };
+    crate::css::values::px(&px, fc).map(|v| v.round() as i32)
 }
 
 /// Splits a value on whitespace at the top level (not inside parentheses,
@@ -1466,6 +1527,15 @@ fn track(tok: &str) -> Option<TrackSizingFunction> {
     };
     let lp = lp(crate::css::values::dim(tok, fc)?);
     Some(minmax(lp.into(), lp.into()))
+}
+
+/// Whether a size depends on the containing block (a percentage).
+fn has_percent(d: Dim) -> bool {
+    match d {
+        Dim::Percent(_) | Dim::Expr(_) => true,
+        Dim::Calc(_, p) => p != 0.0,
+        Dim::Auto | Dim::Px(_) => false,
+    }
 }
 
 /// Layout-only `overflow: hidden` so an inline-content box establishes a
@@ -1882,11 +1952,20 @@ mod tests {
     }
 
     fn lay(html: &str, w: f32, h: f32) -> Laid {
+        lay_images(html, w, h, &[])
+    }
+
+    /// Like [`lay`], with natural sizes for the images with these ids.
+    fn lay_images(html: &str, w: f32, h: f32, images: &[(&str, (f32, f32))]) -> Laid {
         let dom = parse_html(html);
         let sheets = author_sheets(&dom, &[]);
         let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
         let styles = compute_styles(&dom, &refs, &ElementState::default());
-        let tree = layout(&dom, &styles, &[], &Fonts::new(), w, h, &Replaced::new());
+        let replaced: Replaced = images
+            .iter()
+            .map(|&(id, size)| (dom.element_by_id(id).unwrap(), size))
+            .collect();
+        let tree = layout(&dom, &styles, &[], &Fonts::new(), w, h, &replaced);
         Laid { dom, tree }
     }
 
@@ -2188,6 +2267,39 @@ mod tests {
         assert_eq!((a.x, a.y), (250.0, 0.0));
         assert_eq!((b.x, b.y), (200.0, 0.0));
         assert!(c.y > 40.0, "below the run of several lines: {c:?}");
+    }
+
+    #[test]
+    fn percentage_sized_images_do_not_widen_flex_items() {
+        // Images sized by a percentage add nothing to min-content sizes
+        // (CSS Sizing 3 §5.2.2), as blocks or inline.
+        let l = lay_images(
+            r#"<style>body{margin:0}</style>
+            <div style="display:flex;width:600px"><div id=a style="flex:1 1 0%"><img id=i style="display:block;width:100%"></div><div style="flex:1 1 0%">x</div></div>
+            <div style="display:flex;width:600px"><div id=b style="flex:1 1 50%"><img id=j style="width:100%"></div><div style="flex:1 1 50%">x</div></div>"#,
+            800.0,
+            600.0,
+            &[("i", (1280.0, 720.0)), ("j", (1280.0, 720.0))],
+        );
+        assert_eq!(l.rect("a").w, 300.0);
+        assert_eq!(l.rect("i").h, 300.0 * 720.0 / 1280.0);
+        assert_eq!(l.rect("b").w, 300.0);
+    }
+
+    #[test]
+    fn grid_lines_take_math_functions() {
+        let l = lay(
+            r#"<style>body{margin:0}</style>
+            <div style="display:grid;width:600px;grid-template-columns:repeat(12,1fr);--n:12">
+              <div id=a style="--k:6;grid-column:span min(var(--n), var(--k))"></div>
+              <div id=b style="grid-column:calc(1 + 1) / span 3"></div>
+            </div>"#,
+            800.0,
+            600.0,
+        );
+        assert_eq!(l.rect("a").w, 300.0);
+        let b = l.rect("b");
+        assert_eq!((b.x, b.w), (50.0, 150.0));
     }
 
     #[test]
