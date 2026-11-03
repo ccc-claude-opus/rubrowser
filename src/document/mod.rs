@@ -898,6 +898,10 @@ impl Document {
                 continue;
             }
             let size = match self.images.get(n) {
+                // Only a ratio: negative (see `layout::Replaced`).
+                Some(ImageState::Ready(_, b)) if b.ratio_only && self.dom.tag(n) == Some("img") => {
+                    (-(b.width.max(1) as f32), -(b.height.max(1) as f32))
+                }
                 Some(ImageState::Ready(_, b)) => {
                     let d = self.images.density.get(&n).copied().unwrap_or(1.0);
                     (b.width as f32 / d, b.height as f32 / d)
@@ -2194,5 +2198,39 @@ mod tests {
         let mut c = Canvas::new(400, 800);
         d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
         let _ = fonts;
+    }
+
+    #[test]
+    fn inline_svg_uses_symbols_from_a_sprite() {
+        let (d, fonts) = doc(
+            r##"<body style="margin:0;background:#fff">
+              <svg style="display:none"><symbol id="sq" viewBox="0 0 10 10"><rect width="10" height="10" fill="#00ff00"/></symbol></svg>
+              <svg width="20" height="20" style="display:block"><use href="#sq"/></svg>"##,
+            100.0,
+            100.0,
+        );
+        let mut c = Canvas::new(100, 100);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        assert_eq!(c.pixels()[10 * 100 + 10], 0x00ff00);
+    }
+
+    #[test]
+    fn cyclic_calc_percentages_do_not_inflate_their_container() {
+        let (d, _) = doc(
+            r#"<body style="margin:0">
+              <div style="display:flex"><div><button id=b style="display:flex;width:100%;padding:0;border:0"><span id=s style="width:calc(100% - 12px)">Explore</span></button></div></div>
+              <div id=fixed style="width:200px"><div id=f style="width:calc(100% - 20px);height:5px"></div></div>"#,
+            1000.0,
+            400.0,
+        );
+        let w = |id: &str| d.content_box(d.dom.element_by_id(id).unwrap()).unwrap().w;
+        assert!(w("b") < 120.0, "sized by its text: {}", w("b"));
+        assert!(
+            (w("s") - (w("b") - 12.0)).abs() < 0.5,
+            "then resolved: {} {}",
+            w("s"),
+            w("b")
+        );
+        assert_eq!(w("f"), 180.0);
     }
 }

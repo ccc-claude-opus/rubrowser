@@ -185,6 +185,55 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// Requests to one host at a time, as browsers limit their connections
+/// per host (HTTP/1.1); more wait for a free slot.
+const PER_HOST: usize = 6;
+
+/// Requests in flight per host, and a signal when one ends.
+fn host_slots() -> &'static (
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    std::sync::Condvar,
+) {
+    static SLOTS: std::sync::OnceLock<(
+        std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        std::sync::Condvar,
+    )> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(Default::default)
+}
+
+/// A request slot for one host, released when dropped.
+struct HostSlot(String);
+
+impl HostSlot {
+    fn take(url: &str) -> HostSlot {
+        let host = url
+            .split_once("://")
+            .map_or(url, |(_, rest)| rest)
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let (busy, freed) = host_slots();
+        let mut busy = busy.lock().unwrap_or_else(|e| e.into_inner());
+        while busy.get(&host).copied().unwrap_or(0) >= PER_HOST {
+            busy = freed.wait(busy).unwrap_or_else(|e| e.into_inner());
+        }
+        *busy.entry(host.clone()).or_default() += 1;
+        HostSlot(host)
+    }
+}
+
+impl Drop for HostSlot {
+    fn drop(&mut self) {
+        let (busy, freed) = host_slots();
+        let mut busy = busy.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = busy.get_mut(&self.0) {
+            *n = n.saturating_sub(1);
+        }
+        freed.notify_all();
+    }
+}
+
 /// Loads `url` over HTTP(S) or from the file system. Returns the bytes and,
 /// if redirects led elsewhere, the final URL.
 pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
@@ -196,11 +245,45 @@ pub fn load_with(
     url: &str,
     request: Option<&HttpRequest>,
 ) -> Result<(Vec<u8>, Option<String>), String> {
-    use ureq::ResponseExt;
     // The fragment is for the browser, not the server.
     let url = url.split('#').next().unwrap_or(url);
     match url::scheme(url) {
         Some("http") | Some("https") => {
+            let _slot = HostSlot::take(url);
+            let get = request.is_none_or(|r| r.method == "GET");
+            match http(url, request) {
+                // A dropped connection (a server closing one it kept open,
+                // say): a GET is safe to try once more, as browsers do.
+                Err(e) if get && is_transport_error(&e) => http(url, request),
+                r => r,
+            }
+        }
+        Some("file") => {
+            let path = url.trim_start_matches("file://");
+            let path = path.split('?').next().unwrap_or(path);
+            let path = String::from_utf8_lossy(&url::percent_decode(path)).into_owned();
+            std::fs::read(&path)
+                .map(|b| (b, None))
+                .map_err(|e| format!("{path}: {e}"))
+        }
+        Some(other) => Err(format!("unsupported scheme `{other}:`")),
+        None => std::fs::read(url)
+            .map(|b| (b, None))
+            .map_err(|e| format!("{url}: {e}")),
+    }
+}
+
+/// Whether a load failed on the connection itself (not a timeout or an
+/// HTTP status).
+fn is_transport_error(e: &str) -> bool {
+    e.starts_with("io:") || e.contains("onnection")
+}
+
+/// One HTTP(S) request.
+fn http(url: &str, request: Option<&HttpRequest>) -> Result<(Vec<u8>, Option<String>), String> {
+    use ureq::ResponseExt;
+    {
+        {
             let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
             let mut resp = match request.filter(|r| r.method != "GET") {
                 Some(r) => {
@@ -239,18 +322,6 @@ pub fn load_with(
             }
             Ok((body, (final_url != url).then_some(final_url)))
         }
-        Some("file") => {
-            let path = url.trim_start_matches("file://");
-            let path = path.split('?').next().unwrap_or(path);
-            let path = String::from_utf8_lossy(&url::percent_decode(path)).into_owned();
-            std::fs::read(&path)
-                .map(|b| (b, None))
-                .map_err(|e| format!("{path}: {e}"))
-        }
-        Some(other) => Err(format!("unsupported scheme `{other}:`")),
-        None => std::fs::read(url)
-            .map(|b| (b, None))
-            .map_err(|e| format!("{url}: {e}")),
     }
 }
 

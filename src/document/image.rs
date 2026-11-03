@@ -41,6 +41,9 @@ pub struct Bitmap {
     /// When the animation was first painted (document clock, ms): it plays
     /// from there, looping.
     pub start: Cell<Option<f64>>,
+    /// Only the aspect ratio is natural (an SVG without `width` and
+    /// `height`): `width × height` is just that ratio.
+    pub ratio_only: bool,
 }
 
 /// A parsed SVG document.
@@ -58,6 +61,25 @@ impl std::fmt::Debug for Svg {
         let s = self.0.size();
         write!(f, "Svg({}x{})", s.width(), s.height())
     }
+}
+
+/// Whether an SVG document's root element sets both `width` and `height`
+/// (else it has no natural size, only the `viewBox`'s ratio).
+fn svg_has_size(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(8192)]);
+    let Some(start) = text.find("<svg") else {
+        return true;
+    };
+    let tag = &text[start..];
+    let tag = &tag[..tag.find('>').unwrap_or(tag.len())];
+    let has = |name: &str| {
+        tag.match_indices(name).any(|(i, _)| {
+            let before = tag[..i].chars().last();
+            let after = tag[i + name.len()..].trim_start();
+            before.is_some_and(char::is_whitespace) && after.starts_with('=')
+        })
+    };
+    has("width") && has("height") || !has("viewBox")
 }
 
 /// Whether `bytes` look like an SVG document.
@@ -81,6 +103,7 @@ impl Bitmap {
             svg: Some(Svg(Rc::new(tree))),
             frames: Vec::new(),
             start: Cell::new(None),
+            ratio_only: !svg_has_size(bytes),
         })
     }
 
@@ -188,6 +211,7 @@ impl Bitmap {
             svg: None,
             frames: out,
             start: Cell::new(None),
+            ratio_only: false,
         })
     }
 
@@ -241,6 +265,7 @@ impl Bitmap {
             svg: None,
             frames: Vec::new(),
             start: Cell::new(None),
+            ratio_only: false,
         }
     }
 
@@ -667,6 +692,59 @@ pub fn svg_markup(
     }
     let mut out = String::new();
     write(dom, styles, id, &mut out, true, color);
+    // Elements it refers to elsewhere in the page (a sprite of `<symbol>`s
+    // used as `<use href="#icon">`, a shared gradient) are copied in.
+    let inside = |n: NodeId| {
+        let mut at = Some(n);
+        while let Some(a) = at {
+            if a == id {
+                return true;
+            }
+            at = dom.parent(a);
+        }
+        false
+    };
+    let mut defs = String::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut wanted = svg_refs(dom, id);
+    while let Some(r) = wanted.pop() {
+        if seen.len() >= 64 || !seen.insert(r.clone()) {
+            continue;
+        }
+        let Some(target) = dom.element_by_id(&r).filter(|&t| !inside(t)) else {
+            continue;
+        };
+        write(dom, styles, target, &mut defs, false, color);
+        wanted.extend(svg_refs(dom, target));
+    }
+    if !defs.is_empty()
+        && let Some(end) = out.rfind("</")
+    {
+        out.insert_str(end, &format!("<defs>{defs}</defs>"));
+    }
+    out
+}
+
+/// The ids that element `id` and its descendants refer to: `href="#x"` and
+/// `url(#x)`.
+fn svg_refs(dom: &Dom, id: NodeId) -> Vec<String> {
+    let mut out = Vec::new();
+    for n in dom.descendants(id) {
+        let Some(e) = dom.element(n) else { continue };
+        for (name, v) in &e.attrs {
+            if (name == "href" || name == "xlink:href")
+                && let Some(r) = v.trim().strip_prefix('#')
+            {
+                out.push(r.to_string());
+            }
+            let mut rest = v.as_str();
+            while let Some(i) = rest.find("url(#") {
+                rest = &rest[i + 5..];
+                let end = rest.find(')').unwrap_or(rest.len());
+                out.push(rest[..end].trim_matches(['"', '\'', ' ']).to_string());
+            }
+        }
+    }
     out
 }
 

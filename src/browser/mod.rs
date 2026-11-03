@@ -4352,6 +4352,36 @@ mod tests {
     }
 
     #[test]
+    fn replaced_sizes_keep_their_ratio() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://img.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let wide = png_data_url(400, 200, [0, 128, 0, 255]);
+        // A `viewBox` but no width or height: only a 3:1 ratio.
+        let svg = format!(
+            "data:image/svg+xml;base64,{}",
+            base64(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 100"><rect width="300" height="100" fill="red"/></svg>"#)
+        );
+        let page = format!(
+            r#"<body style="margin:0">
+            <div style="width:150px"><img id=a src="{svg}" style="display:block"></div>
+            <div style="width:100px"><img id=b src="{wide}" style="max-width:100%"></div>
+            <img id=c src="{wide}" style="max-height:50px"></body>"#
+        );
+        b.fetch_done(id, Ok(page.into_bytes()), &mut h);
+        b.render(0.0, &mut h);
+        b.render(0.0, &mut h);
+        let doc = &b.tabs[b.active].doc;
+        let size = |id: &str| {
+            let r = doc.content_box(doc.dom.element_by_id(id).unwrap()).unwrap();
+            (r.w, r.h)
+        };
+        assert_eq!(size("a"), (150.0, 50.0), "as wide as its container");
+        assert_eq!(size("b"), (100.0, 50.0), "max-width keeps the ratio");
+        assert_eq!(size("c"), (100.0, 50.0), "max-height keeps the ratio");
+    }
+
+    #[test]
     fn iframes_load_render_and_follow_links() {
         let (mut b, mut h) = browser();
         b.navigate("https://host.test/", &mut h);

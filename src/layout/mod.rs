@@ -137,6 +137,9 @@ struct Ctx {
     intrinsic: Option<(f32, f32)>,
     /// Whether that size has a fixed aspect ratio (images, not controls).
     keeps_ratio: bool,
+    /// The image has an aspect ratio but no natural size (an SVG with
+    /// only a `viewBox`): it is as wide as there is room for.
+    ratio_only: bool,
 }
 
 impl Ctx {
@@ -186,7 +189,41 @@ struct Builder<'a> {
 /// Containing block sizes (width, height) by element.
 type Bases = HashMap<NodeId, (f32, f32)>;
 
-/// Natural sizes of replaced elements (`<img>`), by node.
+/// The size of a replaced element with both sides `auto`, `width` wide
+/// before its min / max sizes and `ratio` (height / width) tall, after
+/// them as CSS 2.1 §10.4 orders: width limits first, then height limits,
+/// the other side following the ratio.
+fn keep_ratio(width: f32, ratio: f32, style: &Style, parent: Size<Option<f32>>) -> Size<f32> {
+    use taffy::util::MaybeResolve;
+    let resolve = |d: LengthPercentageAuto, base: Option<f32>| d.maybe_resolve(base, |_, _| 0.0);
+    let mut w = width;
+    if let Some(max) = resolve(style.max_size.width, parent.width) {
+        w = w.min(max);
+    }
+    if let Some(min) = resolve(style.min_size.width, parent.width) {
+        w = w.max(min);
+    }
+    let mut h = w * ratio;
+    if let Some(max) = resolve(style.max_size.height, parent.height)
+        && h > max
+    {
+        h = max;
+        w = h / ratio;
+    }
+    if let Some(min) = resolve(style.min_size.height, parent.height)
+        && h < min
+    {
+        h = min;
+        w = h / ratio;
+    }
+    Size {
+        width: w,
+        height: h,
+    }
+}
+
+/// Natural sizes of replaced elements (`<img>`), by node. A negative size
+/// gives only an aspect ratio (no natural size).
 pub type Replaced = std::collections::HashMap<NodeId, (f32, f32)>;
 
 /// Lays out the document in a viewport of `width × height` logical pixels.
@@ -369,7 +406,11 @@ impl Builder<'_> {
                             - b.border[cs::TOP]
                             - b.border[cs::BOTTOM],
                     );
-                    if (size.0 - assumed.0).abs() > 0.5 || (size.1 - assumed.1).abs() > 0.5 {
+                    let unknown = assumed.0.is_nan() || assumed.1.is_nan();
+                    if unknown
+                        || (size.0 - assumed.0).abs() > 0.5
+                        || (size.1 - assumed.1).abs() > 0.5
+                    {
                         out.insert(id, size);
                     }
                     break;
@@ -510,6 +551,7 @@ impl Builder<'_> {
                 height: h,
             },
             |input: LayoutInput, _id, ctx: Option<&mut Ctx>, style: &Style| -> LayoutOutput {
+                let parent = input.parent_size;
                 compute_leaf_layout(
                     input,
                     style,
@@ -519,6 +561,21 @@ impl Builder<'_> {
                             // Keep the natural aspect ratio when one side is set.
                             let keeps = ctx.as_ref().is_some_and(|c| c.keeps_ratio);
                             let ratio = (keeps && w > 0.0 && h > 0.0).then(|| h / w);
+                            if let (None, None, Some(r)) = (known.width, known.height, ratio) {
+                                // Both sides auto: the natural width (or, with
+                                // only a ratio, the room there is), then the
+                                // min / max sizes with the ratio kept.
+                                let width = if ctx.as_ref().is_some_and(|c| c.ratio_only) {
+                                    match avail.width {
+                                        AvailableSpace::Definite(a) => a,
+                                        AvailableSpace::MinContent => 0.0,
+                                        AvailableSpace::MaxContent => 300.0f32.min(150.0 / r),
+                                    }
+                                } else {
+                                    w
+                                };
+                                return keep_ratio(width, r, style, parent);
+                            }
                             return match (known.width, known.height, ratio) {
                                 (Some(kw), None, Some(r)) => Size {
                                     width: kw,
@@ -617,7 +674,11 @@ impl Builder<'_> {
         let css = self.style(id).cloned().unwrap_or_default();
         let is_flex = matches!(css.display, CDisplay::Flex | CDisplay::InlineFlex);
         let is_grid = matches!(css.display, CDisplay::Grid | CDisplay::InlineGrid);
-        let base = self.bases.get(&id).copied().unwrap_or(self.viewport);
+        // Until a pass has found the containing block's size, mixed
+        // `calc()` sizes count as `auto`: their containing block may itself
+        // be sized by its content, which they must not inflate (CSS Sizing
+        // 3, cyclic percentages). The next pass gives the real size.
+        let base = self.bases.get(&id).copied().unwrap_or((f32::NAN, f32::NAN));
         CALC_BASE.with(|b| b.set(base));
         if has_calc(&css) {
             self.calc_nodes.push((id, base));
@@ -670,6 +731,7 @@ impl Builder<'_> {
                 inline: None,
                 intrinsic: Some(size),
                 keeps_ratio: false,
+                ratio_only: false,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -678,6 +740,9 @@ impl Builder<'_> {
             Some("img" | "svg" | "canvas" | "video" | "audio")
         ) {
             let size = self.replaced.get(&id).copied().unwrap_or((0.0, 0.0));
+            // Negative: only the aspect ratio is known (see `Replaced`).
+            let ratio_only = size.0 < 0.0;
+            let size = (size.0.abs(), size.1.abs());
             if size.0 > 0.0 && size.1 > 0.0 {
                 tstyle.aspect_ratio = Some(size.0 / size.1);
             }
@@ -687,6 +752,7 @@ impl Builder<'_> {
                 inline: None,
                 intrinsic: Some(size),
                 keeps_ratio: true,
+                ratio_only,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -718,6 +784,7 @@ impl Builder<'_> {
                 inline: Some(Content { owner: id, items }),
                 intrinsic: None,
                 keeps_ratio: false,
+                ratio_only: false,
             };
             return tree.new_leaf_with_context(tstyle, ctx).unwrap();
         }
@@ -751,6 +818,7 @@ impl Builder<'_> {
                         inline: Some(content),
                         intrinsic: None,
                         keeps_ratio: false,
+                        ratio_only: false,
                     };
                     kids.push(tree.new_leaf_with_context(anon, ctx).unwrap());
                 }
@@ -765,6 +833,7 @@ impl Builder<'_> {
                 inline: None,
                 intrinsic: None,
                 keeps_ratio: false,
+                ratio_only: false,
             }),
         )
         .unwrap();
@@ -1195,6 +1264,7 @@ impl Builder<'_> {
                     inline: None,
                     intrinsic: None,
                     keeps_ratio: false,
+                    ratio_only: false,
                 };
                 kids.push(tree.new_leaf_with_context(st, ctx).unwrap());
             }
@@ -1263,6 +1333,7 @@ impl Builder<'_> {
                 inline: None,
                 intrinsic: None,
                 keeps_ratio: false,
+                ratio_only: false,
             }),
         )
         .unwrap();
@@ -1505,14 +1576,22 @@ thread_local! {
     static VIEWPORT: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1280.0, 800.0)) };
 }
 
-/// Pixels of a mixed `calc()` value: percentages of the containing
-/// block's height for `vertical` properties, else of its width.
-fn calc_px(d: Dim, vertical: bool) -> f32 {
+/// A mixed `calc()` value as a fraction of the containing block's height
+/// for `vertical` properties, else of its width: `Some(fraction)` when that
+/// size is known (a percentage, which taffy treats as `auto` while sizing
+/// content-sized boxes, as CSS does), `Err(px)` for a zero base, `None`
+/// while unknown.
+fn calc_fraction(d: Dim, vertical: bool) -> Option<Result<f32, f32>> {
     let (w, h) = CALC_BASE.with(|b| b.get());
-    d.px_or_zero(if vertical { h } else { w })
+    let base = if vertical { h } else { w };
+    if base.is_nan() {
+        return None;
+    }
+    let px = d.px_or_zero(base);
+    Some(if base > 0.0 { Ok(px / base) } else { Err(px) })
 }
 
-/// Whether a style has mixed `calc()` values (see [`calc_px`]).
+/// Whether a style has mixed `calc()` values (see [`calc_fraction`]).
 fn has_calc(s: &Css) -> bool {
     let mixed = |d: &Dim| matches!(d, Dim::Calc(..) | Dim::Expr(_));
     [
@@ -1536,7 +1615,11 @@ fn dim_on(d: Dim, vertical: bool) -> Dimension {
         Dim::Auto => Dimension::auto(),
         Dim::Px(v) => Dimension::length(v),
         Dim::Percent(p) => Dimension::percent(p / 100.0),
-        Dim::Calc(..) | Dim::Expr(_) => Dimension::length(calc_px(d, vertical)),
+        Dim::Calc(..) | Dim::Expr(_) => match calc_fraction(d, vertical) {
+            None => Dimension::auto(),
+            Some(Ok(f)) => Dimension::percent(f),
+            Some(Err(px)) => Dimension::length(px),
+        },
     }
 }
 
@@ -1549,7 +1632,11 @@ fn lpa_on(d: Dim, vertical: bool) -> LengthPercentageAuto {
         Dim::Auto => LengthPercentageAuto::auto(),
         Dim::Px(v) => LengthPercentageAuto::length(v),
         Dim::Percent(p) => LengthPercentageAuto::percent(p / 100.0),
-        Dim::Calc(..) | Dim::Expr(_) => LengthPercentageAuto::length(calc_px(d, vertical)),
+        Dim::Calc(..) | Dim::Expr(_) => match calc_fraction(d, vertical) {
+            None => LengthPercentageAuto::auto(),
+            Some(Ok(f)) => LengthPercentageAuto::percent(f),
+            Some(Err(px)) => LengthPercentageAuto::length(px),
+        },
     }
 }
 
@@ -1562,7 +1649,11 @@ fn lp(d: Dim) -> LengthPercentage {
         Dim::Auto => LengthPercentage::length(0.0),
         Dim::Px(v) => LengthPercentage::length(v),
         Dim::Percent(p) => LengthPercentage::percent(p / 100.0),
-        Dim::Calc(..) | Dim::Expr(_) => LengthPercentage::length(calc_px(d, false)),
+        Dim::Calc(..) | Dim::Expr(_) => match calc_fraction(d, false) {
+            None => LengthPercentage::length(0.0),
+            Some(Ok(f)) => LengthPercentage::percent(f),
+            Some(Err(px)) => LengthPercentage::length(px),
+        },
     }
 }
 
@@ -1655,7 +1746,14 @@ fn convert(s: &Css) -> Style {
             width: lpa(s.max_width),
             height: lpa_on(s.max_height, true),
         },
-        margin: rect4(s.margin.map(lpa)),
+        // A mixed `calc()` margin with an unknown base is 0 for now (not
+        // `auto`, which would take free space).
+        margin: rect4(s.margin.map(|m| match m {
+            Dim::Calc(..) | Dim::Expr(_) if calc_fraction(m, false).is_none() => {
+                LengthPercentageAuto::length(0.0)
+            }
+            m => lpa(m),
+        })),
         padding: rect4(s.padding.map(lp)),
         border: rect4(border),
         flex_direction: match s.flex_direction {
