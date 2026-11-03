@@ -6,6 +6,16 @@ use std::rc::Rc;
 use super::values::{self, Dim, FontContext, Rgba, four, tokens};
 use crate::text::{Family, FontKey};
 
+thread_local! {
+    static NO_VARS: Rc<BTreeMap<String, String>> = Rc::default();
+}
+
+/// The empty custom property table, shared (so tables computed from it
+/// can be cached by their parent's address).
+pub(super) fn no_vars() -> Rc<BTreeMap<String, String>> {
+    NO_VARS.with(Rc::clone)
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Display {
     None,
@@ -548,7 +558,7 @@ impl Default for Style {
             svg_fill: None,
             svg_stroke: None,
             visible: true,
-            vars: Rc::default(),
+            vars: no_vars(),
             has_rules: false,
             content: None,
             counter_reset: None,

@@ -1425,9 +1425,13 @@ impl Browser {
                     .tab_index(tab)
                     .filter(|&i| self.tabs[i].serial == serial)
                     && let Ok(bytes) = result
-                    && self
-                        .fonts
-                        .add_web_font(&font.family, font.weight, font.italic, &bytes)
+                    && self.fonts.add_web_font(
+                        &font.family,
+                        font.weight,
+                        font.italic,
+                        &font.ranges,
+                        &bytes,
+                    )
                     && let Some(doc) = self.tabs[i].doc_at(frame)
                 {
                     doc.fonts_changed();

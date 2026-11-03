@@ -17,6 +17,7 @@ pub mod syntax;
 pub mod transform;
 pub mod values;
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
@@ -222,7 +223,7 @@ pub struct Cascade {
     /// Layer names (dotted paths) in order of first appearance.
     layers: HashMap<String, u16>,
     /// Initial values of custom properties registered with `@property`.
-    initial_vars: BTreeMap<String, String>,
+    initial_vars: Rc<BTreeMap<String, String>>,
     buckets: HashMap<Key, Vec<u32>>,
     /// The state-dependent compounds of all rules (see
     /// [`Selector::dynamic_parts`]).
@@ -247,7 +248,7 @@ impl Cascade {
         let mut c = Cascade {
             rules: Vec::new(),
             layers: HashMap::new(),
-            initial_vars: BTreeMap::new(),
+            initial_vars: style::no_vars(),
             buckets: HashMap::new(),
             dynamic: Vec::new(),
             within: Vec::new(),
@@ -317,7 +318,7 @@ impl Cascade {
                     }
                 }
                 Rule::Property(name, value) => {
-                    self.initial_vars.insert(name.clone(), value.clone());
+                    Rc::make_mut(&mut self.initial_vars).insert(name.clone(), value.clone());
                 }
                 Rule::Container(query, inner) => {
                     self.has_container_rules = true;
@@ -423,7 +424,7 @@ pub fn compute(dom: &Dom, cascade: &Cascade, cx: &Matcher, env: &MediaEnv) -> St
     };
     let mut w = Walker::new(dom, cascade, cx, env, 16.0);
     let root_style = Style {
-        vars: Rc::new(cascade.initial_vars.clone()),
+        vars: cascade.initial_vars.clone(),
         ..Style::default()
     };
     let mut gens = Vec::new();
@@ -951,7 +952,16 @@ fn cascade_element(
         for d in decls.iter().filter(|d| d.name.starts_with("--")) {
             own.insert(d.name, d.value);
         }
-        style.vars = Rc::new(compute_vars(&parent.vars, &own));
+        // Declaring what is already inherited (as `* { --x: 0 }` does on
+        // every element) keeps sharing the parent's table.
+        let unchanged = own.iter().all(|(name, raw)| {
+            !raw.contains("var(")
+                && !matches!(raw.trim(), "initial" | "inherit" | "unset")
+                && parent.vars.get(*name).is_some_and(|v| v == raw)
+        });
+        if !unchanged {
+            style.vars = shared_vars(&parent.vars, &own);
+        }
     }
     let apply = |style: &mut Style, d: &Matched| {
         if d.name.starts_with("--") {
@@ -986,6 +996,41 @@ fn cascade_element(
         style.display = style::Display::InlineBlock;
     }
     style
+}
+
+type VarsKey = (usize, Vec<(String, String)>);
+
+thread_local! {
+    /// Computed custom property tables by (parent table, own declarations),
+    /// kept across restyles: elements declaring the same variables under
+    /// the same parent share one table, so comparing an element's old and
+    /// new style is a pointer check. Each entry holds its parent table, so
+    /// the address in its key is not reused while it lives.
+    static VARS: RefCell<HashMap<VarsKey, (VarsTable, VarsTable)>> = RefCell::default();
+}
+
+type VarsTable = Rc<BTreeMap<String, String>>;
+
+/// [`compute_vars`], shared through the `VARS` cache.
+fn shared_vars(parent: &VarsTable, own: &BTreeMap<&str, &str>) -> VarsTable {
+    let key = (
+        Rc::as_ptr(parent) as usize,
+        own.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    );
+    VARS.with(|cache| {
+        if let Some((_, vars)) = cache.borrow().get(&key) {
+            return vars.clone();
+        }
+        let vars = Rc::new(compute_vars(parent, own));
+        let mut cache = cache.borrow_mut();
+        if cache.len() >= 8192 {
+            cache.clear();
+        }
+        cache.insert(key, (parent.clone(), vars.clone()));
+        vars
+    })
 }
 
 /// The computed custom properties of an element: those it declares
@@ -1500,6 +1545,25 @@ mod tests {
             selector::PseudoElement::Before,
         ));
         assert_eq!(before.map(|s| s.color), Some(BLUE));
+
+        // Variable tables are shared: by elements declaring what they
+        // inherit, and between restyles of the same element.
+        let again = compute(&dom, &cascade, &cx, &env);
+        let c_id = dom.element_by_id("c").unwrap();
+        assert!(Rc::ptr_eq(
+            &st.nodes[c_id].as_ref().unwrap().vars,
+            &again.nodes[c_id].as_ref().unwrap().vars
+        ));
+        let n = dom.element_by_id("n").unwrap();
+        let alt = dom.parent(n).unwrap();
+        assert!(Rc::ptr_eq(
+            &st.nodes[alt].as_ref().unwrap().vars,
+            &again.nodes[alt].as_ref().unwrap().vars
+        ));
+        assert!(Rc::ptr_eq(
+            &st.nodes[alt].as_ref().unwrap().vars,
+            &st.nodes[n].as_ref().unwrap().vars
+        ));
     }
 
     #[test]

@@ -394,7 +394,26 @@ impl Document {
                 walk(&sheet.rules, &env, &mut all);
             }
         }
+        // Only faces whose `unicode-range` has a character of the page
+        // (Latin-1 counts as present: text often comes later from scripts).
+        let mut page: Option<std::collections::BTreeSet<u32>> = None;
         all.into_iter()
+            .filter(|f| {
+                f.covers_any(0x20..=0xFF)
+                    || f.covers_any(
+                        page.get_or_insert_with(|| {
+                            let root = self.dom.html().unwrap_or(Dom::ROOT);
+                            self.dom
+                                .text_content(root)
+                                .chars()
+                                .map(|c| c as u32)
+                                .filter(|&c| c > 0xFF)
+                                .collect()
+                        })
+                        .iter()
+                        .copied(),
+                    )
+            })
             .filter(|f| {
                 self.requested_fonts
                     .insert(format!("{}|{}", f.family, f.url))
@@ -1018,7 +1037,7 @@ impl Document {
                 .style(n)
                 .map(|s| {
                     format!(
-                        "{:?} {:?} w={:?} m={:?} p={:?} vis={} op={} color=#{:06x}{}",
+                        "{:?} {:?} w={:?} m={:?} p={:?} vis={} op={} color=#{:06x}{}{}",
                         s.display,
                         s.position,
                         s.width,
@@ -1027,7 +1046,12 @@ impl Document {
                         s.visible,
                         s.opacity,
                         s.color.rgb(),
-                        if s.clipped_away { " clipped" } else { "" }
+                        if s.clipped_away { " clipped" } else { "" },
+                        if s.transform.is_empty() && s.translate == (Dim::Px(0.0), Dim::Px(0.0)) {
+                            String::new()
+                        } else {
+                            format!(" transform={:?} translate={:?}", s.transform, s.translate)
+                        }
                     )
                 })
                 .unwrap_or_else(|| "none".into());
@@ -1803,11 +1827,19 @@ pub struct FontRequest {
     /// `font-weight` (the low end of a range).
     pub weight: u16,
     pub italic: bool,
+    /// `unicode-range` as inclusive code point ranges (empty: all).
+    pub ranges: Vec<(u32, u32)>,
 }
 
 impl FontRequest {
+    /// Whether the face may draw any character in `chars`.
+    fn covers_any(&self, mut chars: impl Iterator<Item = u32>) -> bool {
+        self.ranges.is_empty()
+            || chars.any(|c| self.ranges.iter().any(|&(lo, hi)| (lo..=hi).contains(&c)))
+    }
+
     /// The face described by `@font-face` descriptors, if it has a usable
-    /// source and covers Latin text (subsets for other scripts are skipped).
+    /// source.
     fn from_decls(decls: &[crate::css::syntax::Decl]) -> Option<FontRequest> {
         let get = |name: &str| {
             decls
@@ -1817,23 +1849,29 @@ impl FontRequest {
                 .map(|d| d.value.trim().to_string())
         };
         let family = get("font-family")?.trim_matches(['"', '\'']).to_string();
-        if let Some(range) = get("unicode-range") {
-            let covers_latin = range.split(',').any(|r| {
-                let r = r
-                    .trim()
-                    .trim_start_matches(['U', 'u'])
-                    .trim_start_matches('+');
-                let (lo, hi) = match r.split_once('-') {
-                    Some((a, b)) => (a.to_string(), b.to_string()),
-                    None if r.contains('?') => (r.replace('?', "0"), r.replace('?', "F")),
-                    None => (r.to_string(), r.to_string()),
-                };
-                let parse = |h: &str| u32::from_str_radix(h, 16).unwrap_or(0);
-                (parse(&lo)..=parse(&hi)).contains(&0x61)
-            });
-            if !covers_latin {
-                return None;
-            }
+        let ranges = get("unicode-range")
+            .map(|range| {
+                range
+                    .split(',')
+                    .filter_map(|r| {
+                        let r = r
+                            .trim()
+                            .trim_start_matches(['U', 'u'])
+                            .trim_start_matches('+');
+                        let (lo, hi) = match r.split_once('-') {
+                            Some((a, b)) => (a.to_string(), b.to_string()),
+                            None if r.contains('?') => (r.replace('?', "0"), r.replace('?', "F")),
+                            None => (r.to_string(), r.to_string()),
+                        };
+                        let lo = u32::from_str_radix(&lo, 16).ok()?;
+                        let hi = u32::from_str_radix(&hi, 16).ok()?;
+                        (lo <= hi).then_some((lo, hi.min(0x10FFFF)))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if get("unicode-range").is_some() && ranges.is_empty() {
+            return None;
         }
         // The first source in a supported format.
         let url = crate::css::gradient::split_commas(&get("src")?)
@@ -1866,6 +1904,7 @@ impl FontRequest {
             url,
             weight,
             italic,
+            ranges,
         })
     }
 }

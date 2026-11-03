@@ -45,12 +45,24 @@ impl std::ops::Index<usize> for WebSlots {
 }
 
 /// One loaded `@font-face` face: its style and slot in [`Fonts`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct WebFace {
     /// `font-weight` (100–900).
     weight: u16,
     italic: bool,
+    /// `unicode-range` as inclusive code point ranges (empty: all).
+    ranges: Vec<(u32, u32)>,
     slot: usize,
+}
+
+impl WebFace {
+    fn covers(&self, c: char) -> bool {
+        self.ranges.is_empty()
+            || self
+                .ranges
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&(c as u32)))
+    }
 }
 
 thread_local! {
@@ -69,13 +81,15 @@ pub fn web_family(name: &str) -> Option<Family> {
     })
 }
 
-/// The slot of the face of web family `g` closest to `bold` / `italic`.
-fn web_slot(g: u16, bold: bool, italic: bool) -> Option<usize> {
+/// The slot of the face of web family `g` whose `unicode-range` has `c`,
+/// closest to `bold` / `italic`.
+fn web_slot(g: u16, bold: bool, italic: bool, c: char) -> Option<usize> {
     WEB_FAMILIES.with(|w| {
         let w = w.borrow();
         let faces = &w.get(g as usize)?.1;
         faces
             .iter()
+            .filter(|f| f.covers(c))
             .min_by_key(|f| {
                 let want: i32 = if bold { 700 } else { 400 };
                 ((f.italic != italic) as i32 * 1000) + (f.weight as i32 - want).abs()
@@ -215,8 +229,16 @@ impl Fonts {
     }
 
     /// Registers a downloaded font (TTF, OTF, WOFF or WOFF2 bytes) as a
-    /// face of `family`. Returns false if it cannot be used.
-    pub fn add_web_font(&self, family: &str, weight: u16, italic: bool, bytes: &[u8]) -> bool {
+    /// face of `family` for the characters in `ranges` (empty: all).
+    /// Returns false if it cannot be used.
+    pub fn add_web_font(
+        &self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        ranges: &[(u32, u32)],
+        bytes: &[u8],
+    ) -> bool {
         let slot = self.web_count.get();
         if slot >= MAX_WEB_FACES {
             return false;
@@ -235,6 +257,7 @@ impl Fonts {
             let face = WebFace {
                 weight,
                 italic,
+                ranges: ranges.to_vec(),
                 slot,
             };
             match w.iter_mut().find(|(n, _)| *n == name) {
@@ -245,12 +268,13 @@ impl Fonts {
         true
     }
 
-    /// The web font face for `key`, if it is a loaded web family.
-    fn web_face(&self, key: FontKey) -> Option<(usize, &Font)> {
+    /// The web font face for `c` in `key`, if it is a loaded web family
+    /// with a face whose `unicode-range` has `c`.
+    fn web_face(&self, key: FontKey, c: char) -> Option<(usize, &Font)> {
         let Family::Web(g) = key.family else {
             return None;
         };
-        let slot = web_slot(g, key.bold, key.italic)?;
+        let slot = web_slot(g, key.bold, key.italic, c)?;
         Some((Self::WEB_BASE + slot, self.web[slot].get()?))
     }
 
@@ -258,7 +282,8 @@ impl Fonts {
     const WEB_BASE: usize = 1000;
 
     fn face(&self, key: FontKey) -> &Font {
-        if let Some((_, f)) = self.web_face(key) {
+        // The first available font is the one whose range has a space.
+        if let Some((_, f)) = self.web_face(key, ' ') {
             return f;
         }
         let key = key.bundled_key();
@@ -306,12 +331,16 @@ impl Fonts {
         if has_rtl(text) {
             return true;
         }
-        matches!(key.family, Family::Web(_))
-            && text.chars().any(|c| c.is_ascii_alphabetic())
-            && self.web_face(key).is_some_and(|(_, f)| {
-                text.chars()
-                    .all(|c| c.is_whitespace() || f.lookup_glyph_index(c) != 0)
+        let Some(first) = text.chars().find(|c| c.is_ascii_alphabetic()) else {
+            return false;
+        };
+        self.web_face(key, first).is_some_and(|(index, f)| {
+            text.chars().all(|c| {
+                c.is_control()
+                    || (self.web_face(key, c).is_some_and(|(i, _)| i == index)
+                        && f.lookup_glyph_index(c) != 0)
             })
+        })
     }
 
     /// Shapes a run with the face that draws its first right-to-left (or
@@ -431,8 +460,8 @@ impl Fonts {
     /// The face that draws `c`: the requested one, else regular DejaVu Sans
     /// (same weight/style), else the system fallback font.
     fn face_for(&self, key: FontKey, c: char) -> (usize, &Font) {
-        if let Some((index, font)) = self.web_face(key)
-            && (c.is_whitespace() || c.is_control() || font.lookup_glyph_index(c) != 0)
+        if let Some((index, font)) = self.web_face(key, c)
+            && (c.is_control() || font.lookup_glyph_index(c) != 0)
         {
             return (index, font);
         }
@@ -794,6 +823,32 @@ mod tests {
         if face >= Fonts::FALLBACK_BASE {
             assert_ne!(f.glyph_id(face, font, '\u{B274}'), 0);
         }
+    }
+
+    #[test]
+    fn unicode_range_picks_the_face_per_character() {
+        // Letters from one file, spaces and digits from another (the mono
+        // face here, so the widths tell them apart).
+        let f = Fonts::new();
+        let family = "Split Range Test";
+        let letters = [(0x41, 0x5A), (0x61, 0x7A)];
+        let symbols = [(0x20, 0x40)];
+        assert!(f.add_web_font(family, 400, false, &letters, dejavu::sans::regular()));
+        assert!(f.add_web_font(family, 400, false, &symbols, dejavu::sans_mono::regular()));
+        let web = FontKey {
+            family: web_family(family).unwrap(),
+            ..SANS
+        };
+        let mono = FontKey {
+            family: Family::Mono,
+            ..SANS
+        };
+        assert_eq!(f.measure(web, 16.0, " "), f.measure(mono, 16.0, " "));
+        assert_eq!(f.measure(web, 16.0, "1"), f.measure(mono, 16.0, "1"));
+        assert_eq!(f.measure(web, 16.0, "i"), f.measure(SANS, 16.0, "i"));
+        let (a, _) = f.face_for(web, 'a');
+        let (space, _) = f.face_for(web, ' ');
+        assert_ne!(a, space);
     }
 
     #[test]

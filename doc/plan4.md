@@ -101,6 +101,7 @@
 | 24 | 第六次網站調查（Wikipedia 條目、GitHub、Stripe、rust-lang.org）後的修正：負 `z-index` 的定位元素交給所屬的堆疊上下文，在它的背景之後、其他內容之前繪製（先用不畫圖的一趟找出它們與當時的裁切），所以會被同一個上下文裡較早元素的背景蓋住（CSS 2.1 附錄 E）；自訂屬性在宣告的元素上計算（`var()` 代入後再繼承），自我參照或循環的自訂屬性無效，`var()` 改用預設值（CSS Variables）；SVG 文字：resvg 使用內附的 DejaVu 字型與系統已安裝的字型，內嵌 `<svg>` 的文字繼承 CSS 字型；內嵌 `<svg>` 的視窗是 CSS 給它的方框（不再以 300×150 縮放）；實線邊框與不同顏色的相鄰邊在角落沿對角線接合（CSS 三角形） |
 | 25 | 以「最常被看的網站的主要內容要看得清楚」為目標的第七次調查（新聞、百科、字典、文件、台灣常用網站）後的修正：選擇器裡接在另一個偽元素後的偽元素（`::part(x)::after`）不再被當成元素自己的 `::after`；浮動元素緊接在只有一行的行內內容之後、且放得下時，放到那一行的頂端（CSS 2.1 §9.5.1），文字在旁邊排（多輪排版：上一輪量到行數與寬度）；清除浮動（`clear`）的區塊裡只有浮動元素時，不再被自己裡面的浮動強制產生 clearance 而往上移（修改 taffy，見 `vendor/taffy/PATCHED.md`）；使用者的語言偏好（`LANG` 等環境變數，macOS 上為系統偏好語言）用於 `Accept-Language`、`navigator.language` 與 `navigator.languages`（新的主機函式 `languages`） |
 | 26 | 第八次調查（AP、CNBC、自由時報、ETtoday、巴哈姆特、Mobile01、日文維基、GeeksforGeeks、w3schools、Python 文件、Rust Book、Platformer、wikiHow、weather.gov、NHK、Naver）後的修正：缺字時的系統字型改為依序嘗試的一串（中文、日文、韓文、泛 Unicode、泰文、天城文、符號；各平台各自的路徑，沒裝的略過），韓文與日文「・」不再顯示成方框；備用字型只用它的 Unicode 字元對照表選字與取字形（STHeiti 另有 Big5 對照表，它的碼位與韓文重疊，原本把「뉴」畫成「猓」）；以百分比設定 `width` / `max-width` 的替換元素（圖片等）不計入 min-content 大小（CSS Sizing 3 §5.2.2 的 compressible），區塊或行內皆然，flex 項目不再被圖片的原始寬度撐開；`grid-row` / `grid-column` 的值可用數學函式（`span min(12, 3)`、`calc()`）；`async` 腳本排在一般與 `defer` 腳本之後，同來源的在前 |
+| 27 | 第九次調查（Guardian、NPR、The Verge、Al Jazeera、DW、Le Monde、Spiegel、Hacker News、Stack Overflow、中文維基、新浪、網易、TechCrunch、Wired、USA Today、Nature）後的修正與效能：`@font-face` 的 `unicode-range` 逐字選擇字型檔（CSS Fonts 4 §4.5），同一字族拆成多個檔（字母一檔、空白與數字一檔）時不再把空白畫成方框；只下載範圍含 Latin-1 或頁面文字的字型檔；自訂屬性表在元素之間與重算之間共用（相同的父表加上相同的宣告得到同一份），樣式計算在大量使用 `--變數` 的頁面快了約 5 倍（The Verge 平均每次 88 → 17 ms，最慢一次 1585 → 38 ms） |
 
 ### 第二批調查
 
@@ -159,10 +160,28 @@
 | CNBC | 「最新消息」欄與另一欄重疊；Chrome 這邊被機器人防護擋下，無法比對 |
 | AP News（Cloudflare）、Mobile01（Akamai） | 機器人檢查頁，不處理 |
 
+### 第九批調查（2026-11-04）
+
+| 網站 | 狀況 |
+|---|---|
+| Hacker News、NPR、Nature、Guardian、Le Monde、中文維基、新浪、網易、TechCrunch、Al Jazeera | 主要內容清楚 |
+| DW | 標題的空白原本是方框（`unicode-range` 拆檔），已修正；選單面板（`transform: translateY(-100%)`）仍蓋住頁首的標誌，待查 |
+| Wired | 整頁內容往左偏移，左邊被切掉，待查 |
+| USA Today | 「Top Headlines」與訂閱連結重疊，待查 |
+| Spiegel | 以瀏覽器偵測導向「不支援的系統」頁；不假冒其他瀏覽器，不處理 |
+| Stack Overflow（Cloudflare） | 機器人檢查頁，不處理 |
+
+### 效能量測（2026-11-04）
+
+用 macOS `sample` 取樣 The Verge、GitHub 等腳本多的頁面：
+
+- 樣式計算佔最多：每個宣告了自訂屬性的元素都複製整張繼承來的變數表，比較新舊樣式時又逐字串比對。已改為共用（見第 27 項）。
+- JS 約佔兩成。同一段 JS 測試（物件、字串、Map、JSON、遞迴、正規表示式）：原生 boa 約 10 ms，boa 編成 wasm 在 wasmi 裡約 210 ms，約慢 20 倍。
+
 ## 5. 不做的事
 
 - 不做任何可能違法的事。
-- 不繞過機器人檢查或 CAPTCHA（Cloudflare、Akamai 等）。
+- 不繞過機器人檢查或 CAPTCHA（Cloudflare、Akamai 等），也不假冒其他瀏覽器的 User-Agent。
 - 不在專案裡附帶有版權的字型或素材；SVG 文字只用內附的自由字型與使用者系統已安裝的字型。
 - 跨來源的 `fetch` 要等 CORS 檢查做好才開放。
 - DRM、WebGL、影片播放留到之後。
