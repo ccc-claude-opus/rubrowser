@@ -493,20 +493,104 @@
 
   class Event {
     constructor(type, init) {
-      this.type = type;
+      if (arguments.length === 0) throw new TypeError("Failed to construct 'Event': 1 argument required");
+      this.type = String(type);
       this.bubbles = !!(init && init.bubbles);
       this.cancelable = !!(init && init.cancelable);
+      this.composed = !!(init && init.composed);
       this.defaultPrevented = false;
+      this.isTrusted = false;
+      this.target = null;
+      this.currentTarget = null;
+      this.eventPhase = 0;
       this.timeStamp = rb.now();
     }
-    preventDefault() { this.defaultPrevented = true; rb.preventDefault(); }
-    initEvent(type, bubbles, cancelable) { this.type = type; this.bubbles = !!bubbles; this.cancelable = !!cancelable; }
-    stopPropagation() { rb.stopPropagation(); }
-    stopImmediatePropagation() { rb.stopPropagation(); }
+    get srcElement() { return this.target; }
+    get returnValue() { return !this.defaultPrevented; }
+    set returnValue(v) { if (!v) this.preventDefault(); }
+    get cancelBubble() { return !!this._stopped; }
+    set cancelBubble(v) { if (v) this.stopPropagation(); }
+    preventDefault() { if (this.cancelable !== false) this.defaultPrevented = true; rb.preventDefault(); }
+    initEvent(type, bubbles, cancelable) { this.type = String(type); this.bubbles = !!bubbles; this.cancelable = !!cancelable; }
+    stopPropagation() { this._stopped = true; rb.stopPropagation(); }
+    stopImmediatePropagation() { this._stopped = true; rb.stopPropagation(); }
+    composedPath() {
+      const path = [];
+      for (let n = this.target; n; n = n.parentNode) path.push(n);
+      if (path.length) path.push(global);
+      return path;
+    }
+  }
+  Object.assign(Event, { NONE: 0, CAPTURING_PHASE: 1, AT_TARGET: 2, BUBBLING_PHASE: 3 });
+
+  // Event interfaces with their init dictionaries (UI Events, HTML):
+  // [name, parent, { member: default }].
+  const eventInterfaces = {};
+  const keyMods = { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false };
+  for (const [name, parent, fields] of [
+    ['UIEvent', 'Event', { view: null, detail: 0, which: 0 }],
+    ['FocusEvent', 'UIEvent', { relatedTarget: null }],
+    ['MouseEvent', 'UIEvent', { screenX: 0, screenY: 0, clientX: 0, clientY: 0, movementX: 0, movementY: 0, button: 0, buttons: 0, relatedTarget: null, ...keyMods }],
+    ['PointerEvent', 'MouseEvent', { pointerId: 0, width: 1, height: 1, pressure: 0, tangentialPressure: 0, tiltX: 0, tiltY: 0, twist: 0, pointerType: '', isPrimary: false }],
+    ['WheelEvent', 'MouseEvent', { deltaX: 0, deltaY: 0, deltaZ: 0, deltaMode: 0 }],
+    ['DragEvent', 'MouseEvent', { dataTransfer: null }],
+    ['KeyboardEvent', 'UIEvent', { key: '', code: '', location: 0, repeat: false, isComposing: false, charCode: 0, keyCode: 0, ...keyMods }],
+    ['InputEvent', 'UIEvent', { data: null, inputType: '', isComposing: false, dataTransfer: null }],
+    ['CompositionEvent', 'UIEvent', { data: '' }],
+    ['ProgressEvent', 'Event', { lengthComputable: false, loaded: 0, total: 0 }],
+    ['ErrorEvent', 'Event', { message: '', filename: '', lineno: 0, colno: 0, error: undefined }],
+    ['PopStateEvent', 'Event', { state: null }],
+    ['HashChangeEvent', 'Event', { oldURL: '', newURL: '' }],
+    ['MessageEvent', 'Event', { data: null, origin: '', lastEventId: '', source: null, ports: [] }],
+    ['StorageEvent', 'Event', { key: null, oldValue: null, newValue: null, url: '', storageArea: null }],
+    ['SubmitEvent', 'Event', { submitter: null }],
+    ['AnimationEvent', 'Event', { animationName: '', elapsedTime: 0, pseudoElement: '' }],
+    ['TransitionEvent', 'Event', { propertyName: '', elapsedTime: 0, pseudoElement: '' }],
+    ['PageTransitionEvent', 'Event', { persisted: false }],
+    ['ClipboardEvent', 'Event', { clipboardData: null }],
+    ['BeforeUnloadEvent', 'Event', {}],
+  ]) {
+    const Base = parent === 'Event' ? Event : eventInterfaces[parent];
+    const cls = { [name]: class extends Base {
+      constructor(type, init) {
+        super(type, init);
+        for (const [k, v] of Object.entries(fields)) this[k] = init && init[k] !== undefined ? init[k] : v;
+      }
+    } }[name];
+    eventInterfaces[name] = cls;
+  }
+  Object.assign(eventInterfaces.MouseEvent.prototype, {
+    get pageX() { return this.clientX + (global.scrollX || 0); },
+    get pageY() { return this.clientY + (global.scrollY || 0); },
+    get x() { return this.clientX; },
+    get y() { return this.clientY; },
+    get offsetX() { return this.clientX - (this.target && this.target.getBoundingClientRect ? this.target.getBoundingClientRect().left : 0); },
+    get offsetY() { return this.clientY - (this.target && this.target.getBoundingClientRect ? this.target.getBoundingClientRect().top : 0); },
+  });
+  for (const name of ['MouseEvent', 'KeyboardEvent']) {
+    eventInterfaces[name].prototype.getModifierState = function (k) {
+      return { Control: this.ctrlKey, Shift: this.shiftKey, Alt: this.altKey, Meta: this.metaKey }[k] || false;
+    };
+  }
+  Object.assign(eventInterfaces.KeyboardEvent, { DOM_KEY_LOCATION_STANDARD: 0, DOM_KEY_LOCATION_LEFT: 1, DOM_KEY_LOCATION_RIGHT: 2, DOM_KEY_LOCATION_NUMPAD: 3 });
+  Object.assign(eventInterfaces.WheelEvent, { DOM_DELTA_PIXEL: 0, DOM_DELTA_LINE: 1, DOM_DELTA_PAGE: 2 });
+  // The interface of an event the browser dispatches, by type.
+  function eventClass(type) {
+    if (/^(click|dblclick|auxclick|contextmenu|mouse)/.test(type)) return eventInterfaces.MouseEvent;
+    if (/^pointer/.test(type)) return eventInterfaces.PointerEvent;
+    if (/^key/.test(type)) return eventInterfaces.KeyboardEvent;
+    if (/^(focus|blur)/.test(type)) return eventInterfaces.FocusEvent;
+    if (type === 'wheel') return eventInterfaces.WheelEvent;
+    if (type === 'input' || type === 'beforeinput') return eventInterfaces.InputEvent;
+    if (type === 'submit') return eventInterfaces.SubmitEvent;
+    return Event;
   }
 
   function currentEvent() {
-    const e = new Event(rb.eventString(0));
+    const type = rb.eventString(0);
+    // UI events from the browser bubble and can be canceled.
+    const e = new (eventClass(type))(type, { bubbles: true, cancelable: true });
+    e.isTrusted = true;
     const mods = rb.eventInt(3);
     Object.assign(e, {
       target: wrap(rb.eventInt(0)),
@@ -522,8 +606,10 @@
       clientY: rb.eventPos(1),
       button: rb.eventInt(4),
     });
-    e.pageX = e.clientX;
-    e.pageY = e.clientY;
+    if (!(e instanceof eventInterfaces.MouseEvent)) {
+      e.pageX = e.clientX;
+      e.pageY = e.clientY;
+    }
     return e;
   }
 
@@ -2018,6 +2104,187 @@
     sendBeacon: () => true,
   };
 
+  // DOM traversal (DOM standard §6): NodeFilter, TreeWalker, NodeIterator.
+  const NodeFilter = {
+    FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3,
+    SHOW_ALL: 0xFFFFFFFF, SHOW_ELEMENT: 0x1, SHOW_ATTRIBUTE: 0x2, SHOW_TEXT: 0x4,
+    SHOW_CDATA_SECTION: 0x8, SHOW_ENTITY_REFERENCE: 0x10, SHOW_ENTITY: 0x20,
+    SHOW_PROCESSING_INSTRUCTION: 0x40, SHOW_COMMENT: 0x80, SHOW_DOCUMENT: 0x100,
+    SHOW_DOCUMENT_TYPE: 0x200, SHOW_DOCUMENT_FRAGMENT: 0x400, SHOW_NOTATION: 0x800,
+  };
+  // "Filter" a node: whatToShow, then the filter (a function or an object
+  // with acceptNode).
+  function traversalFilter(t, node) {
+    if (t._active) throw new DOMException('Filter is running', 'InvalidStateError');
+    if (!((1 << (node.nodeType - 1)) & t.whatToShow)) return NodeFilter.FILTER_SKIP;
+    const f = t.filter;
+    if (f == null) return NodeFilter.FILTER_ACCEPT;
+    t._active = true;
+    try {
+      const r = typeof f === 'function' ? f.call(undefined, node) : f.acceptNode(node);
+      return Number(r);
+    } finally {
+      t._active = false;
+    }
+  }
+  class TreeWalker {
+    constructor(root, whatToShow, filter) {
+      this.root = root;
+      this.whatToShow = whatToShow === undefined ? NodeFilter.SHOW_ALL : whatToShow >>> 0;
+      this.filter = filter == null ? null : filter;
+      this.currentNode = root;
+      this._active = false;
+    }
+    parentNode() {
+      let node = this.currentNode;
+      while (node && node !== this.root) {
+        node = node.parentNode;
+        if (node && traversalFilter(this, node) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+      }
+      return null;
+    }
+    _children(first) {
+      let node = first ? this.currentNode.firstChild : this.currentNode.lastChild;
+      while (node) {
+        const r = traversalFilter(this, node);
+        if (r === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+        if (r === NodeFilter.FILTER_SKIP) {
+          const child = first ? node.firstChild : node.lastChild;
+          if (child) { node = child; continue; }
+        }
+        while (node) {
+          const sibling = first ? node.nextSibling : node.previousSibling;
+          if (sibling) { node = sibling; break; }
+          const parent = node.parentNode;
+          if (!parent || parent === this.root || parent === this.currentNode) return null;
+          node = parent;
+        }
+      }
+      return null;
+    }
+    firstChild() { return this._children(true); }
+    lastChild() { return this._children(false); }
+    _siblings(next) {
+      let node = this.currentNode;
+      if (node === this.root) return null;
+      for (;;) {
+        let sibling = next ? node.nextSibling : node.previousSibling;
+        while (sibling) {
+          node = sibling;
+          const r = traversalFilter(this, node);
+          if (r === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+          sibling = next ? node.firstChild : node.lastChild;
+          if (r === NodeFilter.FILTER_REJECT || !sibling) sibling = next ? node.nextSibling : node.previousSibling;
+        }
+        node = node.parentNode;
+        if (!node || node === this.root) return null;
+        if (traversalFilter(this, node) === NodeFilter.FILTER_ACCEPT) return null;
+      }
+    }
+    nextSibling() { return this._siblings(true); }
+    previousSibling() { return this._siblings(false); }
+    previousNode() {
+      let node = this.currentNode;
+      while (node !== this.root) {
+        let sibling = node.previousSibling;
+        while (sibling) {
+          node = sibling;
+          let r = traversalFilter(this, node);
+          while (r !== NodeFilter.FILTER_REJECT && node.lastChild) {
+            node = node.lastChild;
+            r = traversalFilter(this, node);
+          }
+          if (r === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+          sibling = node.previousSibling;
+        }
+        if (node === this.root || !node.parentNode) return null;
+        node = node.parentNode;
+        if (traversalFilter(this, node) === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+      }
+      return null;
+    }
+    nextNode() {
+      let node = this.currentNode;
+      let r = NodeFilter.FILTER_ACCEPT;
+      for (;;) {
+        while (r !== NodeFilter.FILTER_REJECT && node.firstChild) {
+          node = node.firstChild;
+          r = traversalFilter(this, node);
+          if (r === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+        }
+        let sibling = null;
+        let temp = node;
+        while (temp) {
+          if (temp === this.root) return null;
+          sibling = temp.nextSibling;
+          if (sibling) { node = sibling; break; }
+          temp = temp.parentNode;
+        }
+        if (!temp) return null;
+        r = traversalFilter(this, node);
+        if (r === NodeFilter.FILTER_ACCEPT) return (this.currentNode = node);
+      }
+    }
+  }
+  class NodeIterator {
+    constructor(root, whatToShow, filter) {
+      this.root = root;
+      this.whatToShow = whatToShow === undefined ? NodeFilter.SHOW_ALL : whatToShow >>> 0;
+      this.filter = filter == null ? null : filter;
+      this.referenceNode = root;
+      this.pointerBeforeReferenceNode = true;
+      this._active = false;
+    }
+    // The node after / before `node` in tree order, within the root.
+    _following(node) {
+      if (node.firstChild) return node.firstChild;
+      while (node && node !== this.root) {
+        if (node.nextSibling) return node.nextSibling;
+        node = node.parentNode;
+      }
+      return null;
+    }
+    _preceding(node) {
+      if (node === this.root) return null;
+      let prev = node.previousSibling;
+      if (!prev) return node.parentNode;
+      while (prev.lastChild) prev = prev.lastChild;
+      return prev;
+    }
+    _traverse(next) {
+      let node = this.referenceNode;
+      let before = this.pointerBeforeReferenceNode;
+      for (;;) {
+        if (next) {
+          if (!before) {
+            node = this._following(node);
+            if (!node) return null;
+          } else before = false;
+        } else if (before) {
+          node = this._preceding(node);
+          if (!node) return null;
+        } else before = true;
+        if (traversalFilter(this, node) === NodeFilter.FILTER_ACCEPT) break;
+      }
+      this.referenceNode = node;
+      this.pointerBeforeReferenceNode = before;
+      return node;
+    }
+    nextNode() { return this._traverse(true); }
+    previousNode() { return this._traverse(false); }
+    detach() {}
+  }
+  Object.assign(Document.prototype, {
+    createTreeWalker(root, whatToShow, filter) {
+      if (!(root instanceof Node)) throw new TypeError('createTreeWalker: root is not a Node');
+      return new TreeWalker(root, whatToShow, filter);
+    },
+    createNodeIterator(root, whatToShow, filter) {
+      if (!(root instanceof Node)) throw new TypeError('createNodeIterator: root is not a Node');
+      return new NodeIterator(root, whatToShow, filter);
+    },
+  });
+
   const document = wrap(0);
   wrappers.set(0, document);
   Object.defineProperty(document, 'defaultView', { configurable: true, get: () => global });
@@ -2199,6 +2466,7 @@
     HTMLElement: Element,
     Document,
     Event,
+    ...eventInterfaces,
     EventTarget,
     URLSearchParams,
     URL,
@@ -2214,6 +2482,9 @@
     Worker,
     SharedWorker,
     MessageChannel,
+    NodeFilter,
+    TreeWalker,
+    NodeIterator,
     DOMException,
     MessagePort,
     BroadcastChannel,

@@ -980,6 +980,11 @@ fn cascade_element(
     {
         apply(&mut style, d);
     }
+    // HTML rendering: a `<button>` displayed `inline` is an inline-block
+    // (it lays out its content in a box of its own).
+    if pe.is_none() && style.display == style::Display::Inline && dom.tag(id) == Some("button") {
+        style.display = style::Display::InlineBlock;
+    }
     style
 }
 

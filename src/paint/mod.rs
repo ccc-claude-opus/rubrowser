@@ -45,6 +45,10 @@ pub struct Painter<'a> {
     /// Same for the box whose `filter` / `clip-path` layer is being
     /// painted.
     pub flat_fx: std::cell::Cell<Option<usize>>,
+    /// Positioned boxes with a positive `z-index`, deferred to the
+    /// stacking context they belong to (one list per context being
+    /// painted): painted after its other content, by z-index.
+    pub raised: std::cell::RefCell<Vec<Vec<Raised>>>,
     /// Documents of `<iframe>` elements.
     pub frames: &'a HashMap<NodeId, crate::document::Frame>,
     /// Animated styles, in place of `styles`.
@@ -113,17 +117,35 @@ impl Painter<'_> {
         c.fill_rect(clip.x, clip.y, clip.w, clip.h, bg.rgb());
         let sy = self.scroll.get(&None).copied().unwrap_or(0.0);
         self.view_top.set(origin.1);
-        // The page, then fixed boxes (which do not scroll) by z-index.
-        let mut kids = vp.children.clone();
-        kids.sort_by_key(|&k| (self.tree.boxes[k].fixed, self.tree.boxes[k].z));
-        for child in kids {
-            let dy = if self.tree.boxes[child].fixed {
-                0.0
-            } else {
-                sy
-            };
-            self.paint_box(c, child, origin.0, origin.1 - dy);
+        // The root stacking context: the page, then (by z-index) its
+        // positive z-index boxes and the fixed boxes, which do not scroll.
+        self.raised.borrow_mut().push(Vec::new());
+        let (fixed, page): (Vec<usize>, Vec<usize>) =
+            vp.children.iter().partition(|&&k| self.tree.boxes[k].fixed);
+        for child in page {
+            self.paint_box(c, child, origin.0, origin.1 - sy);
         }
+        let mut raised = self.raised.borrow_mut().pop().unwrap_or_default();
+        let (clip, round_clip, alpha) = (c.clip(), c.round_clip(), c.global_alpha());
+        raised.extend(fixed.into_iter().map(|index| Raised {
+            index,
+            x: origin.0,
+            y: origin.1,
+            z: self.tree.boxes[index].z,
+            clip,
+            round_clip,
+            alpha,
+        }));
+        raised.sort_by_key(|r| r.z);
+        for r in raised {
+            c.set_clip(r.clip);
+            c.set_round_clip(r.round_clip);
+            c.set_global_alpha(r.alpha);
+            self.paint_box(c, r.index, r.x, r.y);
+        }
+        c.set_clip(clip);
+        c.set_round_clip(round_clip);
+        c.set_global_alpha(alpha);
         self.scrollbar(
             c,
             RectF {
@@ -149,7 +171,75 @@ impl Painter<'_> {
         (Rgba::TRANSPARENT, None)
     }
 
+    /// Paints box `index` placed at `ox, oy`; a box that makes a stacking
+    /// context then paints the positive z-index boxes raised inside it.
     fn paint_box(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32) {
+        let context = self.stacking_context(index);
+        if context {
+            self.raised.borrow_mut().push(Vec::new());
+        }
+        self.paint_box_content(c, index, ox, oy);
+        if context {
+            let mut raised = self.raised.borrow_mut().pop().unwrap_or_default();
+            raised.sort_by_key(|r| r.z);
+            let saved = (c.clip(), c.round_clip(), c.global_alpha());
+            for r in raised {
+                c.set_clip(r.clip);
+                c.set_round_clip(r.round_clip);
+                c.set_global_alpha(r.alpha);
+                self.paint_box(c, r.index, r.x, r.y);
+            }
+            c.set_clip(saved.0);
+            c.set_round_clip(saved.1);
+            c.set_global_alpha(saved.2);
+        }
+    }
+
+    /// Paints box `index` at `x, y`, or, if it is positioned with a
+    /// positive z-index, leaves it to the stacking context being painted.
+    fn paint_or_raise(&self, c: &mut Canvas, index: usize, x: f32, y: f32) {
+        let z = self.tree.boxes[index].z;
+        if z > 0 && self.is_positioned(index) {
+            let entry = Raised {
+                index,
+                x,
+                y,
+                z,
+                clip: c.clip(),
+                round_clip: c.round_clip(),
+                alpha: c.global_alpha(),
+            };
+            if let Some(list) = self.raised.borrow_mut().last_mut() {
+                list.push(entry);
+                return;
+            }
+        }
+        self.paint_box(c, index, x, y);
+    }
+
+    /// Whether box `index` makes a stacking context (CSS 2.1 Appendix E
+    /// and its later additions): the root, a positioned box with a
+    /// z-index, fixed and sticky boxes, and opacity, transforms, filters
+    /// and clip paths.
+    fn stacking_context(&self, index: usize) -> bool {
+        if index == 0 {
+            return true;
+        }
+        let b = &self.tree.boxes[index];
+        if b.node != Some(b.style_node) {
+            return false;
+        }
+        let Some(s) = self.style(b.style_node) else {
+            return false;
+        };
+        (self.is_positioned(index) && s.z_index.is_some())
+            || matches!(s.position, cs::Position::Fixed | cs::Position::Sticky)
+            || s.opacity < 1.0
+            || s.is_transformed()
+            || s.has_effects()
+    }
+
+    fn paint_box_content(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32) {
         let b = &self.tree.boxes[index];
         let Some(style) = self.style(b.style_node) else {
             return;
@@ -283,9 +373,15 @@ impl Painter<'_> {
         positioned.sort_by_key(|&k| self.tree.boxes[k].z);
         let (below, above): (Vec<usize>, Vec<usize>) =
             positioned.iter().partition(|&&k| self.tree.boxes[k].z < 0);
-        for child in below.into_iter().chain(flow).chain(above) {
+        for child in below.into_iter().chain(flow) {
             let (x, y) = place(child);
             self.paint_box(c, child, x, y);
+        }
+        // Positive z-index boxes are painted by their stacking context,
+        // after everything else in it (here, if this box is one).
+        for child in above {
+            let (x, y) = place(child);
+            self.paint_or_raise(c, child, x, y);
         }
         if let Some(node) = b.node
             && self.dom.tag(node) != Some("button")
@@ -1885,7 +1981,7 @@ impl Painter<'_> {
                         y: ay,
                         ..
                     } => {
-                        self.paint_box(c, *index, x + ax, y + line.top + ay);
+                        self.paint_or_raise(c, *index, x + ax, y + line.top + ay);
                     }
                 }
             }
@@ -2090,6 +2186,15 @@ impl Painter<'_> {
         for sh in st.text_shadow.iter().rev() {
             self.text_shadow(c, st, x + sh.x, baseline + sh.y, text, sh);
         }
+        // A translucent color draws through the alpha (transparent text,
+        // an image-replacement technique, draws nothing).
+        if color.a == 0 {
+            return;
+        }
+        let alpha = c.global_alpha();
+        if color.a < 255 {
+            c.set_global_alpha((alpha as u32 * color.a as u32 / 255) as u8);
+        }
         self.fonts.draw(
             c,
             st.font(),
@@ -2099,6 +2204,7 @@ impl Painter<'_> {
             text,
             color.rgb(),
         );
+        c.set_global_alpha(alpha);
     }
 
     /// One `text-shadow` of `text` with its baseline at `(x, baseline)`:
@@ -2273,6 +2379,18 @@ pub fn select_popup(
             style.color.rgb(),
         );
     }
+}
+
+/// A positive z-index box waiting for its stacking context, with where it
+/// goes and the clip and opacity in effect where it was found.
+pub struct Raised {
+    index: usize,
+    x: f32,
+    y: f32,
+    z: i32,
+    clip: Rect,
+    round_clip: Option<[f32; 5]>,
+    alpha: u8,
 }
 
 /// The color of `canvas` at fractional pixel `(x, y)` (pixel centers at

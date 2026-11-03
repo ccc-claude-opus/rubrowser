@@ -611,12 +611,10 @@ impl Builder<'_> {
                             AvailableSpace::MaxContent => f32::INFINITY,
                         });
                         let l = inline::layout(content, max_w, styles, fonts);
-                        // Min-content probes with width 0; report the real
-                        // widest line (an unbreakable word or image).
-                        let fit = match avail.width {
-                            AvailableSpace::Definite(w) => l.width.min(w),
-                            _ => l.width,
-                        };
+                        // The widest line: shrink-to-fit width is at least
+                        // the min-content width (an unbreakable word or
+                        // image wider than the room there is overflows).
+                        let fit = l.width;
                         Size {
                             width: known.width.unwrap_or(fit),
                             height: known.height.unwrap_or(l.height),
@@ -760,6 +758,20 @@ impl Builder<'_> {
         // Split children into block-level boxes and runs of inline content.
         let mut parts: Vec<Part> = Vec::new();
         self.collect_children(tree, id, is_flex || is_grid, &mut parts);
+        if is_flex || is_grid {
+            // Items are laid out (and painted) in order-modified document
+            // order: by `order`, then as written.
+            let order = |p: &Part| match p {
+                Part::Block(n) => tree
+                    .get_node_context(*n)
+                    .and_then(|c| self.style(c.style_node))
+                    .map_or(0, |s| s.order),
+                Part::Inline(_) => 0,
+            };
+            if parts.iter().any(|p| order(p) != 0) {
+                parts.sort_by_key(order);
+            }
+        }
 
         let all_inline = parts.iter().all(|p| matches!(p, Part::Inline(_)));
         if !is_flex && !is_grid && all_inline {
@@ -1032,7 +1044,11 @@ impl Builder<'_> {
                         continue;
                     };
                     let wants = width > w + 0.5 || self.percent_width(n);
-                    if wants && !self.caps.contains_key(&n) {
+                    // A cap from an earlier pass is stale once the
+                    // container's width has changed (it was itself sized
+                    // by a percentage, say).
+                    let stale = self.caps.get(&n).is_none_or(|&c| (c - w).abs() > 0.5);
+                    if wants && stale {
                         self.overflow.insert(n, w);
                     }
                 }

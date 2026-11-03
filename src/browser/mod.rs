@@ -3590,6 +3590,22 @@ mod tests {
               console.log('frames ' + (window.frames === window) + ' ' + window.length);
               window.addEventListener('message', (e) => console.log('message ' + e.data.n));
               window.postMessage({ n: 7 }, '*');
+              const root = document.createElement('div');
+              root.innerHTML = '<p id=a>x<b id=b>y</b></p><i id=c><u id=d>z</u></i><s id=e></s>';
+              const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT, (n) =>
+                n.id === 'a' ? NodeFilter.FILTER_SKIP : n.id === 'c' ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT);
+              const seen = [];
+              while (tw.nextNode()) seen.push(tw.currentNode.id);
+              const back = [];
+              while (tw.previousNode()) back.push(tw.currentNode.localName);
+              const it = document.createNodeIterator(root, NodeFilter.SHOW_TEXT);
+              const texts = [];
+              let t;
+              while ((t = it.nextNode())) texts.push(t.data);
+              console.log('walk ' + seen.join() + ' ' + back.join() + ' ' + texts.join());
+              const me = new MouseEvent('click', { clientX: 5, button: 2, ctrlKey: true });
+              const ke = new KeyboardEvent('keydown', { key: 'a', code: 'KeyA' });
+              console.log('events ' + (me instanceof UIEvent) + ' ' + (me instanceof Event) + ' ' + me.clientX + ' ' + me.button + ' ' + me.getModifierState('Control') + ' ' + ke.code + ' ' + new PointerEvent('pointerdown', { pointerType: 'mouse' }).pointerType + ' ' + typeof WheelEvent.DOM_DELTA_LINE);
               const doc = document.implementation.createHTMLDocument('t');
               doc.body.innerHTML = '<form></form><form></form>';
               console.log('forms ' + doc.body.childNodes.length + ' ' + doc.title);
@@ -3608,6 +3624,8 @@ mod tests {
             "frames true 0",
             "message 7",
             "meta x",
+            "walk b,e b,div x,y,z",
+            "events true true 5 2 true KeyA mouse number",
         ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }

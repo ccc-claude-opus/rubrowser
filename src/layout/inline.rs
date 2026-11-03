@@ -285,7 +285,14 @@ pub fn layout(
     // Per-line vertical extents: (above baseline, below baseline).
     let strut = extents(owner, fonts);
     let mut ext = strut;
-    let mut x = 0.0f32;
+    // `text-indent` moves the first line (a percentage of the line width,
+    // which max-content probes do not have).
+    let width_base = if max_width.is_finite() {
+        max_width
+    } else {
+        0.0
+    };
+    let mut x = owner.text_indent.px_or_zero(width_base);
 
     // Width of the spaces ending the last word placed on the line.
     let mut trailing = 0.0f32;

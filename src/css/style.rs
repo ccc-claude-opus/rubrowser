@@ -372,6 +372,8 @@ pub struct Style {
     /// "visually hidden" pattern): the box and its contents are not drawn.
     pub clipped_away: bool,
     pub z_index: Option<i32>,
+    /// `order` of a flex or grid item.
+    pub order: i32,
     pub float: Float,
     /// `clear`: (left, right).
     pub clear: (bool, bool),
@@ -414,6 +416,8 @@ pub struct Style {
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
     pub word_break: WordBreak,
+    /// `text-indent` of the first line (inherited).
+    pub text_indent: Dim,
     pub overflow_wrap: OverflowWrap,
     /// `-webkit-line-clamp` / `line-clamp`: lines kept (the last ends in
     /// `…`).
@@ -530,7 +534,9 @@ impl Default for Style {
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
             word_break: WordBreak::Normal,
+            text_indent: Dim::Px(0.0),
             overflow_wrap: OverflowWrap::Normal,
+            order: 0,
             line_clamp: None,
             webkit_box: false,
             box_vertical: false,
@@ -602,6 +608,7 @@ impl Style {
             text_align: parent.text_align,
             white_space: parent.white_space,
             word_break: parent.word_break,
+            text_indent: parent.text_indent,
             overflow_wrap: parent.overflow_wrap,
             underline: parent.underline,
             line_through: parent.line_through,
@@ -994,6 +1001,17 @@ impl Style {
             }
             "rotate" => set(&mut self.rotate, super::transform::parse_rotate(v)),
             // One value, or `start end`: the end side is what gets cut.
+            "text-indent" => {
+                // A length or percentage (the `hanging` / `each-line`
+                // keywords are not supported).
+                if let Some(d) = tokens(v)
+                    .first()
+                    .and_then(|t| dim(t))
+                    .filter(|d| *d != Dim::Auto)
+                {
+                    self.text_indent = d;
+                }
+            }
             "-webkit-box-orient" | "box-orient" => {
                 self.box_vertical = matches!(v, "vertical" | "block-axis");
                 if self.webkit_box {
@@ -1004,6 +1022,11 @@ impl Style {
                         (_, false) => Display::InlineFlex,
                         (d, _) => d,
                     };
+                }
+            }
+            "order" => {
+                if let Ok(n) = v.parse::<i32>() {
+                    self.order = n;
                 }
             }
             "-webkit-line-clamp" | "line-clamp" => {
@@ -1584,6 +1607,7 @@ impl Style {
             "text-align" => self.text_align = from.text_align,
             "white-space" => self.white_space = from.white_space,
             "word-break" => self.word_break = from.word_break,
+            "text-indent" => self.text_indent = from.text_indent,
             "overflow-wrap" | "word-wrap" => self.overflow_wrap = from.overflow_wrap,
             "text-decoration" | "text-decoration-line" => {
                 self.underline = from.underline;
@@ -1673,6 +1697,7 @@ fn is_inherited(name: &str) -> bool {
                 | "text-align"
                 | "white-space"
                 | "word-break"
+                | "text-indent"
                 | "overflow-wrap"
                 | "word-wrap"
                 | "cursor"

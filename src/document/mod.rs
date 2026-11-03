@@ -750,6 +750,7 @@ impl Document {
             view_top: Default::default(),
             flat: Default::default(),
             flat_fx: Default::default(),
+            raised: Default::default(),
             frames: &self.frames,
             overlay: &self.anim.overlay,
             canvases: &self.canvases,
@@ -2166,6 +2167,9 @@ mod tests {
               <div id=all style="width:100px;word-break:break-all">ab {long}</div>
               <div id=wrap style="width:100px;overflow-wrap:break-word">{long}</div>
               <div style="width:1px;height:20px"><div id=any style="float:left;overflow-wrap:anywhere">{long}</div></div>
+              <div style="width:1px;height:20px"><div id=bw style="float:left">{long}</div></div>
+              <div style="width:100px;clear:both"><div id=wrap2 style="overflow-wrap:break-word">{long}</div></div>
+              <div style="width:1px;height:20px"><div id=bw style="float:left;overflow-wrap:break-word">{long}</div></div>
               <div id=keep style="width:40px;word-break:keep-all">中文中文中文</div>
               <div id=clamp style="width:100px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden">one two three four five six seven eight nine ten eleven twelve</div>
               <div id=row style="display:-webkit-box"><span>a</span><span>b</span></div>"#
@@ -2189,6 +2193,17 @@ mod tests {
             "anywhere: min-content is a letter wide: {}",
             w("any")
         );
+        assert!(
+            w("bw") > 200.0,
+            "a float is as wide as its unbreakable word: {}",
+            w("bw")
+        );
+        assert_eq!(
+            w("wrap2"),
+            100.0,
+            "an auto-width block still fills its container"
+        );
+        assert!(h("wrap2") >= 60.0, "and wraps the word: {}", h("wrap2"));
         assert_eq!(h("keep"), 20.0, "keep-all: CJK does not break");
         assert_eq!(h("clamp"), 40.0, "two lines are kept");
         assert_eq!(
@@ -2232,5 +2247,62 @@ mod tests {
             w("b")
         );
         assert_eq!(w("f"), 180.0);
+    }
+
+    #[test]
+    fn flex_items_follow_order() {
+        let (d, _) = doc(
+            r#"<body style="margin:0"><div style="display:flex;flex-direction:column">
+              <div id=a style="height:10px;order:1"></div><div id=b style="height:10px"></div><div id=c style="height:10px;order:-1"></div></div>"#,
+            200.0,
+            200.0,
+        );
+        let y = |id: &str| d.content_box(d.dom.element_by_id(id).unwrap()).unwrap().y;
+        assert_eq!((y("c"), y("b"), y("a")), (0.0, 10.0, 20.0));
+    }
+
+    #[test]
+    fn text_indent_moves_the_first_line() {
+        let (d, fonts) = doc(
+            r#"<body style="margin:0;background:#fff;font-size:20px;line-height:20px">
+              <div style="text-indent:50px;width:80px">XX XX</div>
+              <div style="text-indent:-9999px;color:#000">XXXX</div>
+              <div style="color:transparent">XXXX</div>"#,
+            200.0,
+            100.0,
+        );
+        let mut c = Canvas::new(200, 100);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let ink = |x0: usize, x1: usize, y0: usize, y1: usize| {
+            (y0..y1).any(|y| (x0..x1).any(|x| c.pixels()[y * 200 + x] != 0xffffff))
+        };
+        assert!(
+            !ink(0, 48, 0, 20) && ink(50, 80, 0, 20),
+            "first line starts at 50px"
+        );
+        assert!(ink(0, 30, 20, 40), "the second line is not indented");
+        assert!(
+            !ink(0, 200, 40, 80),
+            "far-off and transparent text draw nothing"
+        );
+    }
+
+    #[test]
+    fn positive_z_index_paints_above_later_content() {
+        // The red box is deep in the first div with z-index 1; the blue one
+        // comes later, positioned without a z-index: red is on top.
+        let (d, fonts) = doc(
+            r#"<body style="margin:0;background:#fff">
+              <div><div><div style="position:relative;z-index:1;width:40px;height:40px;background:#f00"></div></div></div>
+              <div style="position:relative;margin-top:-20px;width:40px;height:40px;background:#00f"></div>
+              <div style="position:relative;z-index:2;opacity:0.99"><div style="position:relative;z-index:5;width:10px;height:10px;background:#0f0"></div></div>"#,
+            100.0,
+            100.0,
+        );
+        let mut c = Canvas::new(100, 100);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let px = |x: usize, y: usize| c.pixels()[y * 100 + x];
+        assert_eq!(px(10, 30), 0xff0000, "z-index 1 is above the later box");
+        assert_eq!(px(10, 50), 0x0000ff);
     }
 }
