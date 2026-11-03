@@ -2151,4 +2151,48 @@ mod tests {
         // The shadow is drawn 40 px to the right of the (invisible) glyph.
         assert!((130..160).any(|y| (40..80).any(|x| px(x, y) == 0xff00ff)));
     }
+
+    #[test]
+    fn word_breaking_and_line_clamp() {
+        let long = "x".repeat(60);
+        let (d, fonts) = doc(
+            &format!(
+                r#"<body style="margin:0;font-size:16px;line-height:20px">
+              <div id=normal style="width:100px">{long}</div>
+              <div id=all style="width:100px;word-break:break-all">ab {long}</div>
+              <div id=wrap style="width:100px;overflow-wrap:break-word">{long}</div>
+              <div style="width:1px;height:20px"><div id=any style="float:left;overflow-wrap:anywhere">{long}</div></div>
+              <div id=keep style="width:40px;word-break:keep-all">中文中文中文</div>
+              <div id=clamp style="width:100px;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden">one two three four five six seven eight nine ten eleven twelve</div>
+              <div id=row style="display:-webkit-box"><span>a</span><span>b</span></div>"#
+            ),
+            400.0,
+            800.0,
+        );
+        let id = |s: &str| d.dom.element_by_id(s).unwrap();
+        let h = |s: &str| d.content_box(id(s)).unwrap().h;
+        let w = |s: &str| d.content_box(id(s)).unwrap().w;
+        assert_eq!(h("normal"), 20.0, "an unbreakable word overflows");
+        assert!(h("all") >= 60.0, "break-all fills lines: {}", h("all"));
+        // "ab" stays on the first line with the start of the long word.
+        assert!(
+            h("wrap") >= 60.0,
+            "break-word wraps the long word: {}",
+            h("wrap")
+        );
+        assert!(
+            w("any") < 20.0,
+            "anywhere: min-content is a letter wide: {}",
+            w("any")
+        );
+        assert_eq!(h("keep"), 20.0, "keep-all: CJK does not break");
+        assert_eq!(h("clamp"), 40.0, "two lines are kept");
+        assert_eq!(
+            d.styles[id("row")].as_ref().unwrap().display,
+            crate::css::style::Display::Flex
+        );
+        let mut c = Canvas::new(400, 800);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let _ = fonts;
+    }
 }

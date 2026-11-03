@@ -176,6 +176,29 @@ pub enum TextAlign {
     WebkitCenter,
 }
 
+/// `word-break`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WordBreak {
+    #[default]
+    Normal,
+    /// Lines may break between any two letters.
+    BreakAll,
+    /// CJK text breaks only where other text would (at spaces).
+    KeepAll,
+}
+
+/// `overflow-wrap` (`word-wrap`): whether a word too long for its line may
+/// be broken anywhere.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OverflowWrap {
+    #[default]
+    Normal,
+    /// Breaks only words that do not fit (min-content sizes are kept).
+    BreakWord,
+    /// Like `break-word`, and min-content sizes count the breaks.
+    Anywhere,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WhiteSpace {
     #[default]
@@ -390,6 +413,16 @@ pub struct Style {
     pub line_height: LineHeight,
     pub text_align: TextAlign,
     pub white_space: WhiteSpace,
+    pub word_break: WordBreak,
+    pub overflow_wrap: OverflowWrap,
+    /// `-webkit-line-clamp` / `line-clamp`: lines kept (the last ends in
+    /// `…`).
+    pub line_clamp: Option<u32>,
+    /// `display: -webkit-box` (legacy flexbox) and whether
+    /// `-webkit-box-orient` is vertical: a vertical one lays out as block
+    /// flow (where line clamping applies), a horizontal one as flex.
+    pub webkit_box: bool,
+    pub box_vertical: bool,
     pub underline: bool,
     pub line_through: bool,
     pub cursor: Cursor,
@@ -496,6 +529,11 @@ impl Default for Style {
             line_height: LineHeight::Normal,
             text_align: TextAlign::Start,
             white_space: WhiteSpace::Normal,
+            word_break: WordBreak::Normal,
+            overflow_wrap: OverflowWrap::Normal,
+            line_clamp: None,
+            webkit_box: false,
+            box_vertical: false,
             underline: false,
             line_through: false,
             cursor: Cursor::Auto,
@@ -563,6 +601,8 @@ impl Style {
             line_height: parent.line_height,
             text_align: parent.text_align,
             white_space: parent.white_space,
+            word_break: parent.word_break,
+            overflow_wrap: parent.overflow_wrap,
             underline: parent.underline,
             line_through: parent.line_through,
             cursor: parent.cursor,
@@ -656,7 +696,12 @@ impl Style {
         let px = |s: &str| values::px(s, fc);
         match name {
             "display" => {
+                self.webkit_box = matches!(v, "-webkit-box" | "-webkit-inline-box");
                 self.display = match v {
+                    "-webkit-box" if self.box_vertical => Display::Block,
+                    "-webkit-box" => Display::Flex,
+                    "-webkit-inline-box" if self.box_vertical => Display::InlineBlock,
+                    "-webkit-inline-box" => Display::InlineFlex,
                     "none" => Display::None,
                     "block" | "flow-root" => Display::Block,
                     "table" | "inline-table" => Display::Table,
@@ -949,6 +994,41 @@ impl Style {
             }
             "rotate" => set(&mut self.rotate, super::transform::parse_rotate(v)),
             // One value, or `start end`: the end side is what gets cut.
+            "-webkit-box-orient" | "box-orient" => {
+                self.box_vertical = matches!(v, "vertical" | "block-axis");
+                if self.webkit_box {
+                    self.display = match (self.display, self.box_vertical) {
+                        (Display::Flex | Display::Block, true) => Display::Block,
+                        (Display::Flex | Display::Block, false) => Display::Flex,
+                        (Display::InlineFlex | Display::InlineBlock, true) => Display::InlineBlock,
+                        (_, false) => Display::InlineFlex,
+                        (d, _) => d,
+                    };
+                }
+            }
+            "-webkit-line-clamp" | "line-clamp" => {
+                self.line_clamp = v.parse::<u32>().ok().filter(|n| *n > 0);
+            }
+            "word-break" => {
+                self.word_break = match v {
+                    "break-all" => WordBreak::BreakAll,
+                    "keep-all" => WordBreak::KeepAll,
+                    "normal" | "break-word" => WordBreak::Normal,
+                    _ => return,
+                };
+                // The legacy `break-word` acts as `overflow-wrap: anywhere`.
+                if v == "break-word" {
+                    self.overflow_wrap = OverflowWrap::Anywhere;
+                }
+            }
+            "overflow-wrap" | "word-wrap" => {
+                self.overflow_wrap = match v {
+                    "normal" => OverflowWrap::Normal,
+                    "break-word" => OverflowWrap::BreakWord,
+                    "anywhere" => OverflowWrap::Anywhere,
+                    _ => return,
+                };
+            }
             "text-overflow" => match tokens(v).last().copied() {
                 Some("ellipsis") => self.ellipsis = true,
                 Some("clip") => self.ellipsis = false,
@@ -1503,6 +1583,8 @@ impl Style {
             "line-height" => self.line_height = from.line_height,
             "text-align" => self.text_align = from.text_align,
             "white-space" => self.white_space = from.white_space,
+            "word-break" => self.word_break = from.word_break,
+            "overflow-wrap" | "word-wrap" => self.overflow_wrap = from.overflow_wrap,
             "text-decoration" | "text-decoration-line" => {
                 self.underline = from.underline;
                 self.line_through = from.line_through;
@@ -1590,6 +1672,9 @@ fn is_inherited(name: &str) -> bool {
                 | "line-height"
                 | "text-align"
                 | "white-space"
+                | "word-break"
+                | "overflow-wrap"
+                | "word-wrap"
                 | "cursor"
                 | "list-style"
                 | "list-style-type"

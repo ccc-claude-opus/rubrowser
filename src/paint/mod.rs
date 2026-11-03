@@ -254,15 +254,15 @@ impl Painter<'_> {
             );
         } else if let Some(il) = &b.inline {
             let (cx, cy) = b.content_offset();
-            // `text-overflow: ellipsis` cuts lines at the content box's end.
-            let end = (clips && style.ellipsis && !style.rtl).then(|| {
-                let content_w = b.rect.w
-                    - b.padding[cs::LEFT]
-                    - b.padding[cs::RIGHT]
-                    - b.border[cs::LEFT]
-                    - b.border[cs::RIGHT];
-                (r.x + cx + content_w, style)
-            });
+            // `text-overflow: ellipsis` cuts lines at the content box's end;
+            // a clamped block's last line ends in `…` too.
+            let content_w = b.rect.w
+                - b.padding[cs::LEFT]
+                - b.padding[cs::RIGHT]
+                - b.border[cs::LEFT]
+                - b.border[cs::RIGHT];
+            let end = ((clips && style.ellipsis || il.clamped) && !style.rtl)
+                .then_some((r.x + cx + content_w, style));
             self.inline(c, il, r.x + cx, r.y + cy - sy, end);
         }
         // Children in CSS 2.1 Appendix E order (within this box): positioned
@@ -1799,11 +1799,26 @@ impl Painter<'_> {
         y: f32,
         ellipsis: Option<(f32, &Style)>,
     ) {
-        for line in &il.lines {
+        let last = il.lines.len().saturating_sub(1);
+        for (i, line) in il.lines.iter().enumerate() {
             let baseline = y + line.top + line.baseline;
             let cut;
+            // The last line of a clamped block ends in `…` (cut to fit).
+            let clamp_mark = il.clamped && i == last;
             let items = match ellipsis {
-                Some((end, block)) if x + line.width > end + 0.5 => {
+                Some((end, block)) if clamp_mark => {
+                    let mark = self.fonts.measure(block.font(), block.font_size, "…");
+                    if x + line.width + mark > end + 0.5 {
+                        cut = self.cut_line(&line.items, x, end, block);
+                        let (items, at) = &cut;
+                        self.text(c, block, *at, baseline, "…", block.color);
+                        items
+                    } else {
+                        self.text(c, block, x + line.width, baseline, "…", block.color);
+                        &line.items
+                    }
+                }
+                Some((end, block)) if block.ellipsis && x + line.width > end + 0.5 => {
                     cut = self.cut_line(&line.items, x, end, block);
                     let (items, at) = &cut;
                     self.text(c, block, *at, baseline, "…", block.color);

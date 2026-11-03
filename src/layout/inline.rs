@@ -6,7 +6,7 @@
 //! that owns the context.
 
 use crate::css::Style;
-use crate::css::style::{TextAlign, WhiteSpace};
+use crate::css::style::{OverflowWrap, TextAlign, WhiteSpace, WordBreak};
 use crate::dom::NodeId;
 use crate::text::Fonts;
 
@@ -90,6 +90,8 @@ pub struct InlineLayout {
     /// Widest line.
     pub width: f32,
     pub height: f32,
+    /// Lines were dropped by `line-clamp`: the last one ends in `…`.
+    pub clamped: bool,
 }
 
 /// A breakable unit: a word with its trailing spaces, an atomic box, or a break.
@@ -101,6 +103,10 @@ enum Piece {
         /// Width of trailing spaces, which hang at a line end.
         space: f32,
         wraps: bool,
+        /// A line may break before it although no space precedes it (it
+        /// continues a word split by `word-break: break-all`, or by
+        /// `overflow-wrap`).
+        split: bool,
     },
     Atomic {
         index: usize,
@@ -159,7 +165,7 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                 let font = st.font();
                 let measure = |s: &str| fonts.measure(font, st.font_size, s);
                 let node = *node;
-                let push_word = |out: &mut Vec<Piece>, word: &str, spaces: &str| {
+                let push_word = |out: &mut Vec<Piece>, word: &str, spaces: &str, split: bool| {
                     if word.is_empty() && spaces.is_empty() {
                         return;
                     }
@@ -175,44 +181,56 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                         width: width + space,
                         space,
                         wraps: ws.wraps(),
+                        split,
                     });
                 };
+                let word_break = st.word_break;
                 if ws.collapses() {
                     let mut word = String::new();
                     let mut pending_space = false;
+                    // The next word continues one split by `break-all`.
+                    let mut split_next = false;
                     for c in text.chars() {
                         if c.is_whitespace() {
                             if !after_space && !word.is_empty() {
                                 pending_space = true;
                             } else if !after_space && word.is_empty() {
                                 // Space right after a previous item.
-                                push_word(&mut out, "", " ");
+                                push_word(&mut out, "", " ", false);
                                 after_space = true;
                             }
                         } else {
                             if pending_space {
-                                push_word(&mut out, &word, " ");
+                                push_word(&mut out, &word, " ", split_next);
+                                split_next = false;
                                 word.clear();
                                 pending_space = false;
                             }
                             // CJK text breaks between characters (but not
-                            // before closing punctuation).
-                            if (is_cjk(c) || word.chars().last().is_some_and(is_cjk))
-                                && !word.is_empty()
-                                && !no_break_before(c)
-                            {
-                                push_word(&mut out, &word, "");
+                            // before closing punctuation); `break-all` text
+                            // between any letters, `keep-all` never.
+                            let between = match word_break {
+                                WordBreak::BreakAll => true,
+                                WordBreak::KeepAll => false,
+                                WordBreak::Normal => {
+                                    is_cjk(c) || word.chars().last().is_some_and(is_cjk)
+                                }
+                            };
+                            if between && !word.is_empty() && !no_break_before(c) {
+                                push_word(&mut out, &word, "", split_next);
                                 word.clear();
+                                // The next piece may start a line.
+                                split_next = word_break == WordBreak::BreakAll;
                             }
                             word.push(c);
                             after_space = false;
                         }
                     }
                     if pending_space {
-                        push_word(&mut out, &word, " ");
+                        push_word(&mut out, &word, " ", split_next);
                         after_space = true;
                     } else if !word.is_empty() {
-                        push_word(&mut out, &word, "");
+                        push_word(&mut out, &word, "", split_next);
                     }
                 } else {
                     // Preserved whitespace: newlines force breaks; with
@@ -229,11 +247,16 @@ fn pieces(content: &Content, styles: &[Option<Style>], fonts: &Fonts) -> Vec<Pie
                                 let space_end = rest[word_end..]
                                     .find(|c| c != ' ')
                                     .map_or(rest.len(), |j| word_end + j);
-                                push_word(&mut out, &rest[..word_end], &rest[word_end..space_end]);
+                                push_word(
+                                    &mut out,
+                                    &rest[..word_end],
+                                    &rest[word_end..space_end],
+                                    false,
+                                );
                                 rest = &rest[space_end..];
                             }
                         } else {
-                            push_word(&mut out, line, "");
+                            push_word(&mut out, line, "", false);
                         }
                     }
                     after_space = text.ends_with([' ', '\n']);
@@ -293,7 +316,8 @@ pub fn layout(
 
     // Lines may only break where there is a space (or around atomics).
     let mut breakable = false;
-    for piece in pieces(content, styles, fonts) {
+    let mut queue: std::collections::VecDeque<Piece> = pieces(content, styles, fonts).into();
+    while let Some(piece) = queue.pop_front() {
         match piece {
             Piece::Break => {
                 finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
@@ -304,22 +328,26 @@ pub fn layout(
             }
             Piece::Word {
                 node,
-                text,
-                width,
-                space,
+                mut text,
+                mut width,
+                mut space,
                 wraps,
+                split,
             } => {
                 let at_line_start = line.items.is_empty();
                 if at_line_start && text.trim().is_empty() {
                     continue; // collapsible space at line start
                 }
-                let cjk_start = text
-                    .chars()
-                    .next()
-                    .is_some_and(|c| is_cjk(c) && !no_break_before(c));
+                let st = style(styles, node);
+                let keep_all = st.word_break == WordBreak::KeepAll;
+                let cjk_start = !keep_all
+                    && text
+                        .chars()
+                        .next()
+                        .is_some_and(|c| is_cjk(c) && !no_break_before(c));
                 if !at_line_start
                     && wraps
-                    && (breakable || cjk_start)
+                    && (breakable || cjk_start || split)
                     && x + width - space > max_width + 0.01
                 {
                     finish(&mut line, &mut ext, &mut x, &mut trailing, &mut lines);
@@ -327,7 +355,49 @@ pub fn layout(
                         continue;
                     }
                 }
-                let st = style(styles, node);
+                // `overflow-wrap`: a word too long for a line of its own
+                // breaks where it fills the line (`break-word` keeps
+                // min-content sizes, measured with no room at all).
+                let wrap_word = match st.overflow_wrap {
+                    OverflowWrap::Normal => false,
+                    OverflowWrap::BreakWord => max_width > 0.0,
+                    OverflowWrap::Anywhere => true,
+                };
+                if wrap_word
+                    && wraps
+                    && line.items.is_empty()
+                    && width - space > max_width + 0.01
+                    && text.trim_end().chars().count() > 1
+                {
+                    let measure = |t: &str| fonts.measure(st.font(), st.font_size, t);
+                    let word = text.trim_end();
+                    // The longest prefix that fits (at least one letter).
+                    let mut cut = word.char_indices().nth(1).map_or(word.len(), |(i, _)| i);
+                    for (i, _) in word.char_indices().skip(2) {
+                        if measure(&word[..i]) > max_width + 0.01 {
+                            break;
+                        }
+                        cut = i;
+                    }
+                    if measure(word) <= max_width + 0.01 {
+                        cut = word.len();
+                    }
+                    if cut < word.len() {
+                        let rest = text[cut..].to_string();
+                        let rest_space = space;
+                        text.truncate(cut);
+                        width = measure(&text);
+                        space = 0.0;
+                        queue.push_front(Piece::Word {
+                            node,
+                            width: measure(rest.trim_end()) + rest_space,
+                            text: rest,
+                            space: rest_space,
+                            wraps,
+                            split: true,
+                        });
+                    }
+                }
                 let shift = baseline_shift(st);
                 let e = extents(st, fonts);
                 ext = (ext.0.max(e.0 - shift), ext.1.max(e.1 + shift));
@@ -360,7 +430,7 @@ pub fn layout(
                 x += width;
                 trailing = space;
                 // After a space, or between CJK characters.
-                breakable = space > 0.0 || text_ends_cjk(line.items.last());
+                breakable = space > 0.0 || (!keep_all && text_ends_cjk(line.items.last()));
             }
             Piece::Atomic {
                 index,
@@ -397,12 +467,18 @@ pub fn layout(
             }
         }
     }
+    // `line-clamp`: only the first lines show.
+    let clamped = owner.line_clamp.is_some_and(|n| lines.len() > n as usize);
+    if let Some(n) = owner.line_clamp.filter(|_| clamped) {
+        lines.truncate(n as usize);
+    }
     let width = lines.iter().map(|l| l.width).fold(0.0, f32::max);
     let height = lines.last().map_or(0.0, |l| l.top + l.height);
     InlineLayout {
         lines,
         width,
         height,
+        clamped,
     }
 }
 

@@ -3753,6 +3753,15 @@ mod tests {
               x.beginPath(); x.arc(25, 25, 10, 0, Math.PI * 2);
               console.log('in ' + x.isPointInPath(75, 25) + ' ' + x.isPointInPath(5, 5));
               console.log('size ' + x.canvas.width + 'x' + x.canvas.height);
+              const y = document.createElement('canvas').getContext('2d');
+              y.canvas.width = 60; y.canvas.height = 20;
+              y.shadowColor = 'rgb(0, 255, 0)'; y.shadowOffsetX = 20;
+              y.fillStyle = '#ff0000'; y.fillRect(0, 0, 10, 10);
+              const p = (x0, y0) => [...y.getImageData(x0, y0, 1, 1).data].join(',');
+              console.log('shadow ' + p(5, 5) + ' ' + p(25, 5));
+              y.shadowColor = 'transparent'; y.filter = 'invert(1)';
+              y.fillRect(40, 0, 10, 10);
+              console.log('filter ' + p(45, 5));
             </script>"#;
         b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
         let vp = b.viewport_rect();
@@ -3762,7 +3771,13 @@ mod tests {
         };
         assert_eq!(at(10.0, 10.0), 0xff0000);
         assert_eq!(at(90.0, 10.0), 0x0000ff);
-        for want in ["px 0,0,255,255", "in true false", "size 100x50"] {
+        for want in [
+            "px 0,0,255,255",
+            "in true false",
+            "size 100x50",
+            "shadow 255,0,0,255 0,255,0,255",
+            "filter 0,255,255,255",
+        ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
     }

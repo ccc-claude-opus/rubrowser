@@ -48,6 +48,9 @@ struct State {
     align: String,
     baseline: String,
     clip: Option<Rc<Mask>>,
+    /// `shadowColor`, `shadowBlur`, `shadowOffsetX/Y`.
+    shadow: (Rgba, f32, f32, f32),
+    filter: Rc<[crate::css::effects::Filter]>,
 }
 
 impl Default for State {
@@ -68,6 +71,8 @@ impl Default for State {
             align: "start".into(),
             baseline: "alphabetic".into(),
             clip: None,
+            shadow: (Rgba::TRANSPARENT, 0.0, 0.0, 0.0),
+            filter: Rc::new([]),
         }
     }
 }
@@ -324,14 +329,125 @@ impl Canvas2D {
     }
 
     fn fill_path(&mut self, path: &tiny_skia::Path, rule: FillRule) {
+        let layer = self.begin_layer();
         let patterns = self.patterns.clone();
         let paint = self.paint(&self.state.fill.clone(), &patterns);
         let clip = self.state.clip.clone();
         self.pixmap
             .fill_path(path, &paint, rule, Transform::identity(), clip.as_deref());
+        self.end_layer(layer);
+    }
+
+    /// Whether drawing goes through a layer: a visible shadow or a filter.
+    fn has_effects(&self) -> bool {
+        let (color, blur, x, y) = self.state.shadow;
+        let shadow = color.a > 0 && (blur > 0.0 || x != 0.0 || y != 0.0);
+        shadow || !self.state.filter.is_empty()
+    }
+
+    /// With a shadow or filter, starts drawing into a transparent layer
+    /// (plain source-over, unclipped); returns what [`Canvas2D::end_layer`]
+    /// needs to put it on the canvas.
+    fn begin_layer(&mut self) -> Option<(Pixmap, BlendMode, Option<Rc<Mask>>)> {
+        if !self.has_effects() {
+            return None;
+        }
+        let layer = Pixmap::new(self.pixmap.width(), self.pixmap.height())?;
+        let canvas = std::mem::replace(&mut self.pixmap, layer);
+        let blend = std::mem::replace(&mut self.state.blend, BlendMode::SourceOver);
+        let clip = self.state.clip.take();
+        Some((canvas, blend, clip))
+    }
+
+    /// Filters the layer, draws its shadow and then the layer onto the
+    /// canvas (with the blend mode and clip), as the canvas spec orders.
+    fn end_layer(&mut self, saved: Option<(Pixmap, BlendMode, Option<Rc<Mask>>)>) {
+        use crate::css::effects::{self, Filter};
+        let Some((canvas, blend, clip)) = saved else {
+            return;
+        };
+        let mut layer = std::mem::replace(&mut self.pixmap, canvas);
+        self.state.blend = blend;
+        self.state.clip = clip;
+        let (w, h) = (layer.width() as usize, layer.height() as usize);
+        let s = self.scale();
+        let to_f = |p: &tiny_skia::PremultipliedColorU8| {
+            [p.red(), p.green(), p.blue(), p.alpha()].map(|v| v as f32 / 255.0)
+        };
+        let mut px: Vec<[f32; 4]> = layer.pixels().iter().map(to_f).collect();
+        for f in self.state.filter.iter() {
+            match *f {
+                Filter::Blur(r) => effects::blur(&mut px, w, h, r * s),
+                Filter::DropShadow { x, y, blur, color } => {
+                    let sh = shadow_of(&px, w, h, color, x * s, y * s, blur * s / 2.0);
+                    for (p, q) in px.iter_mut().zip(&sh) {
+                        let keep = 1.0 - p[3];
+                        for k in 0..4 {
+                            p[k] += q[k] * keep;
+                        }
+                    }
+                }
+                ref f => {
+                    let Some(m) = f.matrix() else { continue };
+                    for p in px.iter_mut().filter(|p| p[3] > 0.0) {
+                        let v = [p[0] / p[3], p[1] / p[3], p[2] / p[3], p[3]];
+                        let row = |r: &[f32; 5]| {
+                            (r[0] * v[0] + r[1] * v[1] + r[2] * v[2] + r[3] * v[3] + r[4])
+                                .clamp(0.0, 1.0)
+                        };
+                        let a = row(&m[3]);
+                        *p = [row(&m[0]) * a, row(&m[1]) * a, row(&m[2]) * a, a];
+                    }
+                }
+            }
+        }
+        let put = |dst: &mut Pixmap, src: &[[f32; 4]]| {
+            for (d, p) in dst.pixels_mut().iter_mut().zip(src) {
+                let v = p.map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8);
+                *d = tiny_skia::PremultipliedColorU8::from_rgba(
+                    v[0].min(v[3]),
+                    v[1].min(v[3]),
+                    v[2].min(v[3]),
+                    v[3],
+                )
+                .unwrap_or(tiny_skia::PremultipliedColorU8::TRANSPARENT);
+            }
+        };
+        let paint = PixmapPaint {
+            opacity: 1.0,
+            blend_mode: blend,
+            quality: tiny_skia::FilterQuality::Nearest,
+        };
+        let clip = self.state.clip.clone();
+        // Shadow offsets are in canvas units, unaffected by the transform.
+        let (color, blur, sx, sy) = self.state.shadow;
+        if color.a > 0 && (blur > 0.0 || sx != 0.0 || sy != 0.0) {
+            let sh = shadow_of(&px, w, h, color, sx * s, sy * s, blur * s / 2.0);
+            if let Some(mut shadow) = Pixmap::new(w as u32, h as u32) {
+                put(&mut shadow, &sh);
+                self.pixmap.draw_pixmap(
+                    0,
+                    0,
+                    shadow.as_ref(),
+                    &paint,
+                    Transform::identity(),
+                    clip.as_deref(),
+                );
+            }
+        }
+        put(&mut layer, &px);
+        self.pixmap.draw_pixmap(
+            0,
+            0,
+            layer.as_ref(),
+            &paint,
+            Transform::identity(),
+            clip.as_deref(),
+        );
     }
 
     fn stroke_path(&mut self, path: &tiny_skia::Path) {
+        let layer = self.begin_layer();
         let s = self.scale();
         let stroke = Stroke {
             width: self.state.line_width * s,
@@ -358,6 +474,7 @@ impl Canvas2D {
             Transform::identity(),
             clip.as_deref(),
         );
+        self.end_layer(layer);
     }
 
     /// The path of `x, y, w, h` in user space, transformed.
@@ -388,6 +505,36 @@ impl Canvas2D {
 
 /// Parses `fill` / `stroke` values sent by scripts: a CSS color, `g:<id>`
 /// or `p:<id>`.
+/// The shadow of premultiplied pixels `px` (`w × h`): their alpha in
+/// `color`, moved by `(dx, dy)` and blurred with standard deviation `sigma`
+/// (all in device pixels).
+fn shadow_of(
+    px: &[[f32; 4]],
+    w: usize,
+    h: usize,
+    color: Rgba,
+    dx: f32,
+    dy: f32,
+    sigma: f32,
+) -> Vec<[f32; 4]> {
+    let ca = color.a as f32 / 255.0;
+    let rgb = [color.r, color.g, color.b].map(|v| v as f32 / 255.0 * ca);
+    let (dx, dy) = (dx.round() as isize, dy.round() as isize);
+    let mut out = vec![[0.0f32; 4]; w * h];
+    for j in 0..h as isize {
+        for i in 0..w as isize {
+            let (si, sj) = (i - dx, j - dy);
+            if si < 0 || sj < 0 || si >= w as isize || sj >= h as isize {
+                continue;
+            }
+            let a = px[sj as usize * w + si as usize][3];
+            out[j as usize * w + i as usize] = [rgb[0] * a, rgb[1] * a, rgb[2] * a, ca * a];
+        }
+    }
+    crate::css::effects::blur(&mut out, w, h, sigma);
+    out
+}
+
 fn style(v: &str) -> Option<Style> {
     if let Some(id) = v.strip_prefix("g:") {
         return id.parse().ok().map(Style::Gradient);
@@ -625,6 +772,7 @@ impl Document {
                 if sw == 0.0 || sh == 0.0 {
                     return None;
                 }
+                let layer = c.begin_layer();
                 let t = c
                     .state
                     .transform
@@ -648,6 +796,7 @@ impl Document {
                 }
                 c.pixmap
                     .draw_pixmap(0, 0, pixmap.as_ref(), &paint, t, Some(&clip));
+                c.end_layer(layer);
                 c.version += 1;
                 return None;
             }
@@ -748,6 +897,34 @@ impl Document {
             }
             "lineDashOffset" => {
                 c.state.dash_offset = num(1);
+                changed = false;
+                None
+            }
+            "shadowColor" | "shadowBlur" | "shadowOffsetX" | "shadowOffsetY" | "filter" => {
+                let v = args.get(1).copied().unwrap_or("");
+                let sh = &mut c.state.shadow;
+                match name {
+                    "shadowColor" => {
+                        if let Some(col) = crate::css::values::color(v, Rgba::BLACK) {
+                            sh.0 = col;
+                        }
+                    }
+                    "shadowBlur" if num(1) >= 0.0 => sh.1 = num(1),
+                    "shadowOffsetX" if num(1).is_finite() => sh.2 = num(1),
+                    "shadowOffsetY" if num(1).is_finite() => sh.3 = num(1),
+                    "filter" => {
+                        let fc = crate::css::values::FontContext {
+                            em: 10.0,
+                            rem: 16.0,
+                            vw: 0.0,
+                            vh: 0.0,
+                        };
+                        if let Some(f) = crate::css::effects::parse_filter(v, fc, Rgba::BLACK) {
+                            c.state.filter = f.into();
+                        }
+                    }
+                    _ => {}
+                }
                 changed = false;
                 None
             }
@@ -1005,9 +1182,15 @@ impl Document {
             blend_mode: c.state.blend,
             quality: tiny_skia::FilterQuality::Bilinear,
         };
+        let layer = c.begin_layer();
+        let paint = PixmapPaint {
+            blend_mode: c.state.blend,
+            ..paint
+        };
         let clip = c.state.clip.clone();
         c.pixmap
             .draw_pixmap(0, 0, text_px.as_ref(), &paint, t, clip.as_deref());
+        c.end_layer(layer);
         c.version += 1;
         None
     }
