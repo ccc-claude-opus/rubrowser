@@ -62,6 +62,9 @@ pub struct Canvas {
     global_alpha: u8,
     /// Rounded rectangle (x, y, w, h, radius) that images are clipped to.
     round_clip: Option<[f32; 5]>,
+    /// Drawing does nothing (clips and opacity still change): a pass that
+    /// only finds out what would be painted.
+    muted: bool,
 }
 
 impl Canvas {
@@ -100,6 +103,7 @@ impl Canvas {
             clip: Rect::new(0, 0, width as i32, height as i32),
             global_alpha: 255,
             round_clip: None,
+            muted: false,
         }
     }
 
@@ -139,6 +143,24 @@ impl Canvas {
         self.clip = self.bounds();
     }
 
+    pub fn muted(&self) -> bool {
+        self.muted
+    }
+
+    /// Stops (or resumes) drawing, keeping track of clips and opacity.
+    pub fn set_muted(&mut self, muted: bool) {
+        self.muted = muted;
+    }
+
+    /// Where drawing goes: the clip, or nowhere while muted.
+    fn paint_clip(&self) -> Rect {
+        if self.muted {
+            Rect::new(0, 0, 0, 0)
+        } else {
+            self.clip
+        }
+    }
+
     pub fn global_alpha(&self) -> u8 {
         self.global_alpha
     }
@@ -154,12 +176,14 @@ impl Canvas {
     }
 
     pub fn clear(&mut self, color: Color) {
-        self.pixels.fill(color);
+        if !self.muted {
+            self.pixels.fill(color);
+        }
     }
 
     /// Fills a rectangle, clipped to the clip rectangle.
     pub fn fill_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color) {
-        let r = Rect::new(x, y, w.max(0), h.max(0)).intersect(&self.clip);
+        let r = Rect::new(x, y, w.max(0), h.max(0)).intersect(&self.paint_clip());
         if r.w == 0 || r.h == 0 {
             return;
         }
@@ -170,7 +194,7 @@ impl Canvas {
     }
 
     pub fn set_pixel(&mut self, x: i32, y: i32, color: Color) {
-        if self.clip.contains(x, y) {
+        if self.paint_clip().contains(x, y) {
             self.pixels[y as usize * self.width + x as usize] = color;
         }
     }
@@ -203,7 +227,7 @@ impl Canvas {
 
     /// Copies `src` (`w × h` pixels) to `(x, y)`, clipped.
     pub fn blit(&mut self, x: i32, y: i32, w: usize, h: usize, src: &[Color]) {
-        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
+        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.paint_clip());
         if r.w == 0 || r.h == 0 || src.len() < w * h {
             return;
         }
@@ -259,7 +283,7 @@ impl Canvas {
         if alpha == 255 {
             return self.fill_rect(x, y, w, h, color);
         }
-        let r = Rect::new(x, y, w.max(0), h.max(0)).intersect(&self.clip);
+        let r = Rect::new(x, y, w.max(0), h.max(0)).intersect(&self.paint_clip());
         for row in r.y..r.bottom() {
             let start = row as usize * self.width;
             for p in &mut self.pixels[start + r.x as usize..start + r.right() as usize] {
@@ -270,7 +294,7 @@ impl Canvas {
 
     /// Draws `color` through a `w × h` coverage mask at `(x, y)`, clipped.
     pub fn draw_mask(&mut self, x: i32, y: i32, w: usize, h: usize, mask: &[u8], color: Color) {
-        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
+        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.paint_clip());
         if r.w == 0 || r.h == 0 || mask.len() < w * h {
             return;
         }
@@ -309,7 +333,7 @@ impl Canvas {
             (x + w).ceil() as i32 - x.floor() as i32,
             (y + h).ceil() as i32 - y.floor() as i32,
         )
-        .intersect(&self.clip);
+        .intersect(&self.paint_clip());
         for row in bounds.y..bounds.bottom() {
             let line = row as usize * self.width;
             for col in bounds.x..bounds.right() {
@@ -345,7 +369,7 @@ impl Canvas {
             (x + w).ceil() as i32 - x.floor() as i32,
             (y + h).ceil() as i32 - y.floor() as i32,
         )
-        .intersect(&self.clip);
+        .intersect(&self.paint_clip());
         for row in bounds.y..bounds.bottom() {
             let line = row as usize * self.width;
             for col in bounds.x..bounds.right() {
@@ -370,7 +394,7 @@ impl Canvas {
     /// Composites a premultiplied pixel (`color` already scaled by `alpha`)
     /// at `(x, y)`, honoring the clip, rounded clip and global alpha.
     pub fn composite_premul(&mut self, x: i32, y: i32, color: Color, alpha: u8) {
-        if !self.clip.contains(x, y) || alpha == 0 {
+        if !self.paint_clip().contains(x, y) || alpha == 0 {
             return;
         }
         let mut g = self.global_alpha as u32;
@@ -390,7 +414,7 @@ impl Canvas {
     /// Draws `w × h` pixels in `0xAARRGGBB` at `(x, y)`, blending by their
     /// alpha, clipped.
     pub fn draw_argb(&mut self, x: i32, y: i32, w: usize, h: usize, src: &[u32]) {
-        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.clip);
+        let r = Rect::new(x, y, w as i32, h as i32).intersect(&self.paint_clip());
         if r.w == 0 || r.h == 0 || src.len() < w * h {
             return;
         }
@@ -417,7 +441,7 @@ impl Canvas {
         if dst.w <= 0 || dst.h <= 0 || w == 0 || h == 0 || src.len() < w * h {
             return;
         }
-        let r = dst.intersect(&self.clip);
+        let r = dst.intersect(&self.paint_clip());
         for row in r.y..r.bottom() {
             let sy = ((row - dst.y) as usize * h) / dst.h as usize;
             let line = row as usize * self.width;

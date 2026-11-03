@@ -98,6 +98,7 @@
 | 21 | 斷行：`word-break: break-all`（任兩字之間可斷）、`keep-all`（中日韓文字不在字間斷）、舊式 `word-break: break-word`；`overflow-wrap` / `word-wrap`：`break-word`（放不下一行的長字在填滿處斷開，不影響 min-content 寬度）、`anywhere`（min-content 也算這些斷點）。行數限制：`-webkit-line-clamp` / `line-clamp` 只留前 N 行，最後一行接 `…`（放不下時先截短）；`display: -webkit-box` 依 `-webkit-box-orient` 為 vertical 時當作區塊流、否則當作 flex。Canvas：`shadowColor` / `shadowBlur` / `shadowOffsetX/Y` 與 `filter`：有效果時先畫到透明圖層，套用濾鏡後先合成陰影再合成圖層（依目前的合成模式與裁切）|
 | 22 | 第四次網站調查（NPR、NASA、Stack Overflow、Hacker News、Mozilla、rust-lang.org、docs.rs、Apple、BBC、Guardian）後的修正：替換元素兩邊都是 `auto` 時，`min-width` / `max-width` / `min-height` / `max-height` 依 CSS 2.1 §10.4 保持比例；只有 `viewBox`（沒有 `width` 與 `height`）的 SVG 圖片沒有自然尺寸，只有比例，寬度取可用空間；內嵌 SVG 引用頁面其他地方的元素（`<use href="#icon">` 指向圖示 sprite 的 `<symbol>`、共用的漸層）時把它們複製進來；混合 `calc()`（百分比加長度）在包含區塊大小還不知道時當作 `auto`，知道後換算成該大小的百分比交給 taffy，所以內容決定大小的容器不會被循環百分比撐大（CSS Sizing 3）；載入時每個主機最多同時 6 個連線，GET 在連線被中斷時重試一次。iframe 內的腳本延後：需要把腳本執行從分頁拆成每個文件各自一份 |
 | 23 | 第五次網站調查（CNN、Ars Technica、W3C、MDN、Medium、Wikipedia 入口、YouTube、Reddit、NYT）後的修正，並以內建的 Chromium 量測同一頁當參考：堆疊上下文——正 `z-index` 的定位元素交給所屬的堆疊上下文（根元素、有 `z-index` 的定位元素、fixed / sticky、opacity、transform、filter、clip-path），在其他內容之後依 z-index 繪製（含行內的 inline-block）；`order`（flex / grid 項目依 order 排列與繪製）；`text-indent`；文字顏色的透明度（透明文字不再畫成黑色）；`display: inline` 的 `<button>` 當作 inline-block；收縮至內容寬度時不再把放不下的長字壓到可用寬度；行內百分比寬度在容器寬度改變時重新計算；JS：`NodeFilter`、`TreeWalker`、`NodeIterator`（DOM 規格的走訪演算法），`UIEvent`、`MouseEvent`、`PointerEvent`、`WheelEvent`、`KeyboardEvent`、`FocusEvent`、`InputEvent` 等事件介面與其初始化字典，瀏覽器送出的事件使用對應的介面 |
+| 24 | 第六次網站調查（Wikipedia 條目、GitHub、Stripe、rust-lang.org）後的修正：負 `z-index` 的定位元素交給所屬的堆疊上下文，在它的背景之後、其他內容之前繪製（先用不畫圖的一趟找出它們與當時的裁切），所以會被同一個上下文裡較早元素的背景蓋住（CSS 2.1 附錄 E）；自訂屬性在宣告的元素上計算（`var()` 代入後再繼承），自我參照或循環的自訂屬性無效，`var()` 改用預設值（CSS Variables）；SVG 文字：resvg 使用內附的 DejaVu 字型與系統已安裝的字型，內嵌 `<svg>` 的文字繼承 CSS 字型；內嵌 `<svg>` 的視窗是 CSS 給它的方框（不再以 300×150 縮放）；實線邊框與不同顏色的相鄰邊在角落沿對角線接合（CSS 三角形） |
 
 ### 第二批調查
 
@@ -121,8 +122,19 @@
 | NASA | 頁首文字重疊 |
 | microsoft.com | 以 User-Agent 判定為自動程式（保留 rubrowser 字樣，不處理） |
 
+### 第六批調查（2026-11-03）
+
+| 網站 | 狀況 |
+|---|---|
+| Wikipedia 條目 | 頁首與工具列圖示原本只有 10px（自我參照的 `--font-size-medium`），現在與 Chrome 相同 |
+| GitHub 專案頁 | 授權條目旁的下拉三角形原本畫成長條 |
+| Stripe | 「Sign in」按鈕用 SVG 遮罩文字鏤空，原本整顆空白 |
+| rust-lang.org | 與 Chrome 相近 |
+
 ## 5. 不做的事
 
+- 不做任何可能違法的事。
 - 不繞過機器人檢查或 CAPTCHA（Cloudflare、Akamai 等）。
+- 不在專案裡附帶有版權的字型或素材；SVG 文字只用內附的自由字型與使用者系統已安裝的字型。
 - 跨來源的 `fetch` 要等 CORS 檢查做好才開放。
 - DRM、WebGL、影片播放留到之後。

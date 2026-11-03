@@ -751,6 +751,7 @@ impl Document {
             flat: Default::default(),
             flat_fx: Default::default(),
             raised: Default::default(),
+            sunk: Default::default(),
             frames: &self.frames,
             overlay: &self.anim.overlay,
             canvases: &self.canvases,
@@ -815,15 +816,13 @@ impl Document {
         Some((i >= 0.0 && (i as usize) < items.len()).then_some(i as usize))
     }
 
-    /// Natural sizes of images: the bitmap's, or room for the `alt` text
-    /// when there is no image to show.
     /// Parses each rendered outermost `<svg>` whose markup changed.
     fn sync_inline_svgs(&mut self) {
         for n in self.dom.descendants(Dom::ROOT) {
             if self.dom.tag(n) != Some("svg") {
                 continue;
             }
-            let Some(color) = self.style(n).map(|s| s.color) else {
+            let Some((color, w, h)) = self.style(n).map(|s| (s.color, s.width, s.height)) else {
                 continue;
             };
             let mut up = self.dom.parent(n);
@@ -835,7 +834,14 @@ impl Document {
             if nested {
                 continue; // drawn as part of the outer <svg>
             }
-            let markup = image::svg_markup(&self.dom, &self.styles, n, color);
+            // Its viewport is the box CSS sizes it to (once laid out).
+            use crate::css::values::Dim;
+            let size = match (w, h) {
+                (Dim::Auto, _) | (_, Dim::Auto) => None,
+                (Dim::Px(w), Dim::Px(h)) => Some((w, h)),
+                _ => self.content_box(n).map(|r| (r.w, r.h)),
+            };
+            let markup = image::svg_markup(&self.dom, &self.styles, n, color, size);
             if self.images.get(n).is_some_and(|s| s.src() == markup) {
                 continue;
             }
@@ -2304,5 +2310,53 @@ mod tests {
         let px = |x: usize, y: usize| c.pixels()[y * 100 + x];
         assert_eq!(px(10, 30), 0xff0000, "z-index 1 is above the later box");
         assert_eq!(px(10, 50), 0x0000ff);
+    }
+
+    #[test]
+    fn negative_z_index_goes_below_its_stacking_context() {
+        // Red boxes with z-index -1 go under every background in the root
+        // stacking context (blue div, white body: the root's is gray);
+        // the green one stays above its parent, which makes a context.
+        let (d, fonts) = doc(
+            r#"<html style="background:#888"><body style="margin:0;padding-bottom:30px;background:#fff">
+              <div style="background:#00f;height:40px"><div><div style="position:relative;z-index:-1;width:20px;height:20px;background:#f00"></div></div></div>
+              <div style="position:absolute;z-index:-1;left:50px;top:65px;width:20px;height:20px;background:#f00"></div>
+              <div style="position:relative;z-index:0;height:20px;background:#00f"><div style="position:absolute;z-index:-1;width:10px;height:10px;background:#0f0"></div></div>"#,
+            100.0,
+            100.0,
+        );
+        let mut c = Canvas::new(100, 100);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let px = |x: usize, y: usize| c.pixels()[y * 100 + x];
+        assert_eq!(px(10, 10), 0x0000ff, "under the blue div");
+        assert_eq!(px(60, 75), 0xffffff, "under the body");
+        assert_eq!(px(60, 95), 0x888888, "the canvas");
+        assert_eq!(px(5, 45), 0x00ff00, "above its context's background");
+    }
+
+    #[test]
+    fn border_triangles_and_svg_text() {
+        // A CSS triangle; an inline SVG sized by CSS (its 100% rect fills
+        // 100×20, not 300×150 scaled down); SVG text drawn with fonts.
+        let (mut d, fonts) = doc(
+            r##"<body style="margin:0;background:#fff">
+              <div style="width:0;height:0;border-top:40px solid #000;border-left:40px solid transparent;border-right:40px solid transparent"></div>
+              <svg style="display:block;width:100px;height:20px"><rect width="100%" height="100%" fill="#00f"/></svg>
+              <svg width="100" height="30" style="display:block"><text x="0" y="25" font-size="24" fill="#f00">MMM</text></svg>"##,
+            120.0,
+            120.0,
+        );
+        d.update(&fonts);
+        let mut c = Canvas::new(120, 120);
+        d.paint(&mut c, (0.0, 0.0), 1.0, &fonts);
+        let px = |x: usize, y: usize| c.pixels()[y * 120 + x];
+        assert_eq!(px(40, 5), 0x000000, "inside the triangle");
+        assert_eq!(px(5, 30), 0xffffff, "cut off along the diagonal");
+        assert_eq!(px(95, 50), 0x0000ff, "the SVG viewport is its CSS box");
+        let red = (60..90)
+            .flat_map(|y| (0..100).map(move |x| (x, y)))
+            .filter(|&(x, y)| px(x, y) == 0xff0000)
+            .count();
+        assert!(red > 20, "SVG text is drawn ({red} red pixels)");
     }
 }

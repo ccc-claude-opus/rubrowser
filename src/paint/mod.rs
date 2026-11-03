@@ -49,6 +49,9 @@ pub struct Painter<'a> {
     /// stacking context they belong to (one list per context being
     /// painted): painted after its other content, by z-index.
     pub raised: std::cell::RefCell<Vec<Vec<Raised>>>,
+    /// Positioned boxes with a negative `z-index`, found by a muted pass
+    /// over each stacking context and painted right after its background.
+    pub sunk: std::cell::RefCell<Vec<Sunk>>,
     /// Documents of `<iframe>` elements.
     pub frames: &'a HashMap<NodeId, crate::document::Frame>,
     /// Animated styles, in place of `styles`.
@@ -117,14 +120,40 @@ impl Painter<'_> {
         c.fill_rect(clip.x, clip.y, clip.w, clip.h, bg.rgb());
         let sy = self.scroll.get(&None).copied().unwrap_or(0.0);
         self.view_top.set(origin.1);
-        // The root stacking context: the page, then (by z-index) its
-        // positive z-index boxes and the fixed boxes, which do not scroll.
-        self.raised.borrow_mut().push(Vec::new());
+        // The root stacking context: negative z-index boxes, the page,
+        // then (by z-index) its positive z-index boxes and the fixed
+        // boxes, which do not scroll.
         let (fixed, page): (Vec<usize>, Vec<usize>) =
             vp.children.iter().partition(|&&k| self.tree.boxes[k].fixed);
+        let (fixed_below, fixed): (Vec<usize>, Vec<usize>) =
+            fixed.into_iter().partition(|&k| self.tree.boxes[k].z < 0);
+        let mut below = self.find_sunk(c, 0, |c| {
+            for &child in &page {
+                self.paint_box(c, child, origin.0, origin.1 - sy);
+            }
+        });
+        let (clip, round_clip, alpha) = (c.clip(), c.round_clip(), c.global_alpha());
+        below.extend(fixed_below.into_iter().map(|index| Raised {
+            index,
+            x: origin.0,
+            y: origin.1,
+            z: self.tree.boxes[index].z,
+            clip,
+            round_clip,
+            alpha,
+        }));
+        below.sort_by_key(|r| r.z);
+        self.paint_raised(c, below);
+        self.raised.borrow_mut().push(Vec::new());
+        self.sunk.borrow_mut().push(Sunk {
+            context: 0,
+            ready: Some(Vec::new()),
+            found: Vec::new(),
+        });
         for child in page {
             self.paint_box(c, child, origin.0, origin.1 - sy);
         }
+        self.sunk.borrow_mut().pop();
         let mut raised = self.raised.borrow_mut().pop().unwrap_or_default();
         let (clip, round_clip, alpha) = (c.clip(), c.round_clip(), c.global_alpha());
         raised.extend(fixed.into_iter().map(|index| Raised {
@@ -137,15 +166,7 @@ impl Painter<'_> {
             alpha,
         }));
         raised.sort_by_key(|r| r.z);
-        for r in raised {
-            c.set_clip(r.clip);
-            c.set_round_clip(r.round_clip);
-            c.set_global_alpha(r.alpha);
-            self.paint_box(c, r.index, r.x, r.y);
-        }
-        c.set_clip(clip);
-        c.set_round_clip(round_clip);
-        c.set_global_alpha(alpha);
+        self.paint_raised(c, raised);
         self.scrollbar(
             c,
             RectF {
@@ -172,27 +193,128 @@ impl Painter<'_> {
     }
 
     /// Paints box `index` placed at `ox, oy`; a box that makes a stacking
-    /// context then paints the positive z-index boxes raised inside it.
+    /// context paints the negative z-index boxes inside it right after its
+    /// background and the positive z-index ones after everything else.
     fn paint_box(&self, c: &mut Canvas, index: usize, ox: f32, oy: f32) {
         let context = self.stacking_context(index);
         if context {
+            if c.muted() {
+                // Finding another context's negative z-index boxes: those
+                // inside this one are its own.
+                return;
+            }
+            let mut below = if self.diverts(index) {
+                Vec::new()
+            } else {
+                self.find_sunk(c, index, |c| self.paint_box_content(c, index, ox, oy))
+            };
+            below.sort_by_key(|r| r.z);
             self.raised.borrow_mut().push(Vec::new());
+            self.sunk.borrow_mut().push(Sunk {
+                context: index,
+                ready: Some(below),
+                found: Vec::new(),
+            });
         }
         self.paint_box_content(c, index, ox, oy);
         if context {
+            self.sunk.borrow_mut().pop();
             let mut raised = self.raised.borrow_mut().pop().unwrap_or_default();
             raised.sort_by_key(|r| r.z);
-            let saved = (c.clip(), c.round_clip(), c.global_alpha());
-            for r in raised {
-                c.set_clip(r.clip);
-                c.set_round_clip(r.round_clip);
-                c.set_global_alpha(r.alpha);
-                self.paint_box(c, r.index, r.x, r.y);
-            }
-            c.set_clip(saved.0);
-            c.set_round_clip(saved.1);
-            c.set_global_alpha(saved.2);
+            self.paint_raised(c, raised);
         }
+    }
+
+    /// The negative z-index boxes of stacking context `index`, found by
+    /// running `paint` without drawing (none if it has none).
+    fn find_sunk(
+        &self,
+        c: &mut Canvas,
+        index: usize,
+        paint: impl FnOnce(&mut Canvas),
+    ) -> Vec<Raised> {
+        if !self.has_sunk(index) {
+            return Vec::new();
+        }
+        self.raised.borrow_mut().push(Vec::new());
+        self.sunk.borrow_mut().push(Sunk {
+            context: index,
+            ready: None,
+            found: Vec::new(),
+        });
+        c.set_muted(true);
+        paint(c);
+        c.set_muted(false);
+        self.raised.borrow_mut().pop();
+        self.sunk
+            .borrow_mut()
+            .pop()
+            .map(|f| f.found)
+            .unwrap_or_default()
+    }
+
+    /// Whether stacking context `index` has positioned boxes with a
+    /// negative z-index in it (not inside a nested context).
+    fn has_sunk(&self, index: usize) -> bool {
+        self.tree.boxes[index].children.iter().any(|&k| {
+            if self.tree.boxes[k].z < 0 && self.is_positioned(k) {
+                true
+            } else if self.stacking_context(k) {
+                false
+            } else {
+                self.has_sunk(k)
+            }
+        })
+    }
+
+    /// Whether painting box `index` goes through a layer (its transform or
+    /// effects), where it is painted again.
+    fn diverts(&self, index: usize) -> bool {
+        let b = &self.tree.boxes[index];
+        let Some(style) = self.style(b.style_node) else {
+            return false;
+        };
+        b.node == Some(b.style_node)
+            && (style.is_transformed()
+                && self.flat.get() != Some(index)
+                && !style.transform_matrix(b.rect.w, b.rect.h).is_translation()
+                || style.has_effects() && self.flat_fx.get() != Some(index))
+    }
+
+    /// Paints deferred boxes in order, each with the clip and opacity it
+    /// was found under.
+    fn paint_raised(&self, c: &mut Canvas, list: Vec<Raised>) {
+        let saved = (c.clip(), c.round_clip(), c.global_alpha());
+        for r in list {
+            c.set_clip(r.clip);
+            c.set_round_clip(r.round_clip);
+            c.set_global_alpha(r.alpha);
+            self.paint_box(c, r.index, r.x, r.y);
+        }
+        c.set_clip(saved.0);
+        c.set_round_clip(saved.1);
+        c.set_global_alpha(saved.2);
+    }
+
+    /// Paints negative z-index box `index` at `x, y` if no stacking context
+    /// takes it: one being searched records it, one being painted already
+    /// has.
+    fn paint_or_sink(&self, c: &mut Canvas, index: usize, x: f32, y: f32) {
+        if let Some(frame) = self.sunk.borrow_mut().last_mut() {
+            if frame.ready.is_none() {
+                frame.found.push(Raised {
+                    index,
+                    x,
+                    y,
+                    z: self.tree.boxes[index].z,
+                    clip: c.clip(),
+                    round_clip: c.round_clip(),
+                    alpha: c.global_alpha(),
+                });
+            }
+            return;
+        }
+        self.paint_box(c, index, x, y);
     }
 
     /// Paints box `index` at `x, y`, or, if it is positioned with a
@@ -373,7 +495,22 @@ impl Painter<'_> {
         positioned.sort_by_key(|&k| self.tree.boxes[k].z);
         let (below, above): (Vec<usize>, Vec<usize>) =
             positioned.iter().partition(|&&k| self.tree.boxes[k].z < 0);
-        for child in below.into_iter().chain(flow) {
+        // Negative ones anywhere in this stacking context, if this box is
+        // one; others go to the context they belong to.
+        let ready = self
+            .sunk
+            .borrow_mut()
+            .last_mut()
+            .filter(|f| f.context == index)
+            .and_then(|f| f.ready.take());
+        if let Some(ready) = ready {
+            self.paint_raised(c, ready);
+        }
+        for child in below {
+            let (x, y) = place(child);
+            self.paint_or_sink(c, child, x, y);
+        }
+        for child in flow {
             let (x, y) = place(child);
             self.paint_box(c, child, x, y);
         }
@@ -1806,8 +1943,72 @@ impl Painter<'_> {
         for (i, side) in sides.into_iter().enumerate() {
             if bw[i] > 0.0 {
                 let ls = style.border_style[i];
-                self.line_side(c, side, i % 2 == 0, ls, style.border_color[i]);
+                let color = style.border_color[i];
+                // Where a solid side meets one of another color, they
+                // join along the diagonal (CSS triangles are made so).
+                let differs = [(i + 3) % 4, (i + 1) % 4]
+                    .iter()
+                    .any(|&k| bw[k] > 0.0 && style.border_color[k] != color);
+                if ls == cs::LineStyle::Solid && differs {
+                    self.mitered_side(c, r, bw, i, color);
+                } else {
+                    self.line_side(c, side, i % 2 == 0, ls, color);
+                }
             }
+        }
+    }
+
+    /// Fills border side `i` (top, right, bottom, left) of box `r` as the
+    /// trapezoid between the outer and inner edges, its ends cut along the
+    /// corner diagonals.
+    fn mitered_side(&self, c: &mut Canvas, r: RectF, bw: [f32; 4], i: usize, color: Rgba) {
+        if !color.is_visible() {
+            return;
+        }
+        let s = self.scale;
+        let [t, rt, b, l] = bw.map(|w| w * s);
+        let (x0, y0, x1, y1) = (r.x * s, r.y * s, (r.x + r.w) * s, (r.y + r.h) * s);
+        // The outer edge, the side's width, its extent along that edge
+        // and how far each end moves in at the inner edge.
+        let (outer, inward, w, a0, a1, d0, d1) = match i {
+            0 => (y0, 1.0, t, x0, x1, l, rt),
+            1 => (x1, -1.0, rt, y0, y1, t, b),
+            2 => (y1, -1.0, b, x0, x1, l, rt),
+            _ => (x0, 1.0, l, y0, y1, t, b),
+        };
+        let outer = outer.round() as i32;
+        for k in 0..w.ceil() as i32 {
+            let (u0, u1) = (k as f32, (k as f32 + 1.0).min(w));
+            let um = (u0 + u1) / 2.0;
+            let (lo, hi) = (a0 + d0 * um / w, a1 - d1 * um / w);
+            if hi <= lo {
+                continue;
+            }
+            let line = if inward > 0.0 {
+                outer + k
+            } else {
+                outer - 1 - k
+            };
+            let alpha = color.a as f32 * (u1 - u0);
+            // Whole pixels, then the partly covered one at each end.
+            let (from, to) = (lo.ceil() as i32, hi.floor() as i32);
+            let mut span = |p: i32, n: i32, a: f32| {
+                let a = a.round() as u8;
+                if n > 0 && a > 0 {
+                    if i % 2 == 0 {
+                        c.fill_rect_alpha(p, line, n, 1, color.rgb(), a);
+                    } else {
+                        c.fill_rect_alpha(line, p, 1, n, color.rgb(), a);
+                    }
+                }
+            };
+            if from > to {
+                span(lo.floor() as i32, 1, alpha * (hi - lo));
+                continue;
+            }
+            span(from, to - from, alpha);
+            span(from - 1, 1, alpha * (from as f32 - lo));
+            span(to, 1, alpha * (hi - to as f32));
         }
     }
 
@@ -2379,6 +2580,14 @@ pub fn select_popup(
             style.color.rgb(),
         );
     }
+}
+
+/// The negative z-index boxes of a stacking context being searched
+/// (`found`) or painted (`ready`, until they are).
+pub struct Sunk {
+    context: usize,
+    ready: Option<Vec<Raised>>,
+    found: Vec<Raised>,
 }
 
 /// A positive z-index box waiting for its stacking context, with where it

@@ -82,6 +82,55 @@ fn svg_has_size(bytes: &[u8]) -> bool {
     has("width") && has("height") || !has("viewBox")
 }
 
+thread_local! {
+    static SVG_FONTS: std::cell::OnceCell<std::sync::Arc<usvg::fontdb::Database>> =
+        const { std::cell::OnceCell::new() };
+}
+
+/// Fonts for SVG text: the bundled DejaVu faces and (natively) the
+/// installed ones, with the generic families mapped like page text
+/// (Arial or DejaVu Sans, Georgia or DejaVu Serif).
+fn svg_fonts() -> std::sync::Arc<usvg::fontdb::Database> {
+    SVG_FONTS.with(|cell| {
+        cell.get_or_init(|| {
+            let mut db = usvg::fontdb::Database::new();
+            use dejavu::{sans, sans_mono, serif};
+            for data in [
+                sans::regular(),
+                sans::bold(),
+                sans::oblique(),
+                sans::bold_oblique(),
+                sans_mono::regular(),
+                sans_mono::bold(),
+                serif::regular(),
+                serif::bold(),
+                serif::italic(),
+                serif::bold_italic(),
+            ] {
+                db.load_font_data(data.to_vec());
+            }
+            #[cfg(feature = "native")]
+            db.load_system_fonts();
+            let has = |name: &str| {
+                db.faces()
+                    .any(|f| f.families.iter().any(|(n, _)| n == name))
+            };
+            let pick =
+                |want: &str, bundled: &str| if has(want) { want } else { bundled }.to_string();
+            let (sans_name, serif_name, mono_name) = (
+                pick("Arial", "DejaVu Sans"),
+                pick("Georgia", "DejaVu Serif"),
+                "DejaVu Sans Mono".to_string(),
+            );
+            db.set_sans_serif_family(sans_name);
+            db.set_serif_family(serif_name);
+            db.set_monospace_family(mono_name);
+            std::sync::Arc::new(db)
+        })
+        .clone()
+    })
+}
+
 /// Whether `bytes` look like an SVG document.
 fn is_svg(bytes: &[u8]) -> bool {
     let head = &bytes[..bytes.len().min(1024)];
@@ -91,10 +140,14 @@ fn is_svg(bytes: &[u8]) -> bool {
 }
 
 impl Bitmap {
-    /// Parses an SVG document (text is not rendered: no fonts are loaded).
+    /// Parses an SVG document.
     pub fn svg(bytes: &[u8]) -> Result<Bitmap, String> {
-        let tree =
-            usvg::Tree::from_data(bytes, &usvg::Options::default()).map_err(|e| e.to_string())?;
+        let mut options = usvg::Options::default();
+        if bytes.windows(5).any(|w| w == b"<text") {
+            options.fontdb = svg_fonts();
+            options.font_family = "serif".to_string();
+        }
+        let tree = usvg::Tree::from_data(bytes, &options).map_err(|e| e.to_string())?;
         let size = tree.size();
         Ok(Bitmap {
             width: size.width().ceil() as u32,
@@ -599,12 +652,14 @@ const SVG_NAMES: &[&str] = &[
 ];
 
 /// Serializes inline `<svg>` element `id` as a standalone SVG document,
-/// with `currentColor` resolved to `color`.
+/// with `currentColor` resolved to `color` and the viewport `size` its CSS
+/// box gives it, if known.
 pub fn svg_markup(
     dom: &Dom,
     styles: &[Option<crate::css::style::Style>],
     id: NodeId,
     color: Rgba,
+    size: Option<(f32, f32)>,
 ) -> String {
     fn write(
         dom: &Dom,
@@ -613,6 +668,7 @@ pub fn svg_markup(
         out: &mut String,
         root: bool,
         color: Rgba,
+        size: Option<(f32, f32)>,
     ) {
         if let Some(t) = dom.text(id) {
             out.push_str(&crate::dom::escape(t, false));
@@ -640,13 +696,54 @@ pub fn svg_markup(
             ("fill", own(|s| &s.svg_fill)),
             ("stroke", own(|s| &s.svg_stroke)),
         ];
+        // The CSS font: the root's (text inherits it), and wherever CSS
+        // changes it, over presentation attributes.
+        let font_of = |st: &crate::css::style::Style| {
+            let family = match st.family {
+                crate::text::Family::Serif => "serif",
+                crate::text::Family::Mono => "monospace",
+                _ => "sans-serif",
+            };
+            [
+                ("font-family", family.to_string()),
+                ("font-size", format!("{}", st.font_size)),
+                (
+                    "font-weight",
+                    if st.bold { "bold" } else { "normal" }.to_string(),
+                ),
+                (
+                    "font-style",
+                    if st.italic { "italic" } else { "normal" }.to_string(),
+                ),
+            ]
+        };
+        let font: Vec<(&str, String)> = match (style, parent_style) {
+            (Some(st), _) if root => font_of(st)
+                .into_iter()
+                .filter(|(n, _)| !e.attrs.iter().any(|(a, _)| a == n))
+                .chain(
+                    size.into_iter()
+                        .flat_map(|(w, h)| [("width", format!("{w}")), ("height", format!("{h}"))]),
+                )
+                .collect(),
+            (Some(st), Some(p)) => {
+                let theirs = font_of(p);
+                font_of(st)
+                    .into_iter()
+                    .zip(theirs)
+                    .filter(|(mine, theirs)| mine.1 != theirs.1)
+                    .map(|(mine, _)| mine)
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
         out.push('<');
         out.push_str(name);
         for (n, v) in &e.attrs {
             if root && (n == "xmlns" || n == "color") {
                 continue;
             }
-            if css.iter().any(|(c, v)| c == n && v.is_some()) {
+            if css.iter().any(|(c, v)| c == n && v.is_some()) || font.iter().any(|(f, _)| f == n) {
                 continue;
             }
             // Presentation attributes may use CSS variables.
@@ -670,6 +767,9 @@ pub fn svg_markup(
                 color.rgb()
             ));
         }
+        for (n, v) in &font {
+            out.push_str(&format!(" {n}=\"{v}\""));
+        }
         if let Some(st) = style {
             let hex = |c: Rgba| format!("#{:06x}", c.rgb());
             for (name, v) in &css {
@@ -684,14 +784,14 @@ pub fn svg_markup(
         }
         out.push('>');
         for &c in dom.children(id) {
-            write(dom, styles, c, out, false, color);
+            write(dom, styles, c, out, false, color, None);
         }
         out.push_str("</");
         out.push_str(name);
         out.push('>');
     }
     let mut out = String::new();
-    write(dom, styles, id, &mut out, true, color);
+    write(dom, styles, id, &mut out, true, color, size);
     // Elements it refers to elsewhere in the page (a sprite of `<symbol>`s
     // used as `<use href="#icon">`, a shared gradient) are copied in.
     let inside = |n: NodeId| {
@@ -714,7 +814,7 @@ pub fn svg_markup(
         let Some(target) = dom.element_by_id(&r).filter(|&t| !inside(t)) else {
             continue;
         };
-        write(dom, styles, target, &mut defs, false, color);
+        write(dom, styles, target, &mut defs, false, color, None);
         wanted.extend(svg_refs(dom, target));
     }
     if !defs.is_empty()

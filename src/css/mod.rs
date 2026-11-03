@@ -947,11 +947,11 @@ fn cascade_element(
 
     // Custom properties first (later ones win), inherited from the parent.
     if decls.iter().any(|d| d.name.starts_with("--")) {
-        let mut vars: BTreeMap<String, String> = (*parent.vars).clone();
+        let mut own: BTreeMap<&str, &str> = BTreeMap::new();
         for d in decls.iter().filter(|d| d.name.starts_with("--")) {
-            vars.insert(d.name.to_string(), d.value.to_string());
+            own.insert(d.name, d.value);
         }
-        style.vars = Rc::new(vars);
+        style.vars = Rc::new(compute_vars(&parent.vars, &own));
     }
     let apply = |style: &mut Style, d: &Matched| {
         if d.name.starts_with("--") {
@@ -988,9 +988,79 @@ fn cascade_element(
     style
 }
 
+/// The computed custom properties of an element: those it declares
+/// (`own`, with `var()` in them replaced) over the ones it inherits. One
+/// that is part of a reference cycle, or refers to a missing variable
+/// without a fallback, is invalid (guaranteed-invalid: left out).
+fn compute_vars(
+    inherited: &BTreeMap<String, String>,
+    own: &BTreeMap<&str, &str>,
+) -> BTreeMap<String, String> {
+    struct Resolver<'a> {
+        inherited: &'a BTreeMap<String, String>,
+        own: &'a BTreeMap<&'a str, &'a str>,
+        done: BTreeMap<String, Option<String>>,
+        stack: Vec<String>,
+        cyclic: std::collections::BTreeSet<String>,
+    }
+    impl Resolver<'_> {
+        fn get(&mut self, name: &str) -> Option<String> {
+            if let Some(v) = self.done.get(name) {
+                return v.clone();
+            }
+            let Some(&raw) = self.own.get(name) else {
+                return self.inherited.get(name).cloned();
+            };
+            if let Some(at) = self.stack.iter().position(|n| n == name) {
+                // Everything from there on is in the cycle.
+                self.cyclic.extend(self.stack[at..].iter().cloned());
+                return None;
+            }
+            let value = match raw.trim() {
+                "initial" => None,
+                "inherit" | "unset" => self.inherited.get(name).cloned(),
+                _ if raw.contains("var(") => {
+                    self.stack.push(name.to_string());
+                    let v = substitute_with(raw, &mut |n| self.get(n), 0);
+                    self.stack.pop();
+                    v
+                }
+                _ => Some(raw.to_string()),
+            };
+            let value = value.filter(|_| !self.cyclic.contains(name));
+            self.done.insert(name.to_string(), value.clone());
+            value
+        }
+    }
+    let mut r = Resolver {
+        inherited,
+        own,
+        done: BTreeMap::new(),
+        stack: Vec::new(),
+        cyclic: Default::default(),
+    };
+    let mut vars = inherited.clone();
+    for &name in own.keys() {
+        match r.get(name) {
+            Some(v) => vars.insert(name.to_string(), v),
+            None => vars.remove(name),
+        };
+    }
+    vars
+}
+
 /// Replaces `var(--name[, fallback])` using `vars`; `None` if a variable
 /// is missing and has no fallback.
 pub fn substitute_vars(value: &str, vars: &BTreeMap<String, String>, depth: u32) -> Option<String> {
+    substitute_with(value, &mut |n| vars.get(n).cloned(), depth)
+}
+
+/// Replaces `var(--name[, fallback])`, looking names up with `get`.
+fn substitute_with(
+    value: &str,
+    get: &mut dyn FnMut(&str) -> Option<String>,
+    depth: u32,
+) -> Option<String> {
     if depth > 16 {
         return None;
     }
@@ -1021,11 +1091,11 @@ pub fn substitute_vars(value: &str, vars: &BTreeMap<String, String>, depth: u32)
             Some(c) => (inner[..c].trim(), Some(inner[c + 1..].trim())),
             None => (inner.trim(), None),
         };
-        let replacement = match vars.get(name) {
-            Some(v) if !v.trim().is_empty() || fallback.is_none() => Some(v.clone()),
+        let replacement = match get(name) {
+            Some(v) if !v.trim().is_empty() || fallback.is_none() => Some(v),
             _ => fallback.map(str::to_string),
         }?;
-        out.push_str(&substitute_vars(&replacement, vars, depth + 1)?);
+        out.push_str(&substitute_with(&replacement, get, depth + 1)?);
         rest = &after[end + 1..];
     }
     out.push_str(rest);
@@ -1377,12 +1447,13 @@ mod tests {
             .card { color: var(--brand); padding: var(--pad); margin: var(--missing, 3px) }
             .alt { --brand: blue }
             .bad { width: 10px; width: var(--nope) }
+            .cyc { --s: var(--s, 30px); --gap: 50px; width: var(--s, 7px); height: var(--pad) }
             @media (min-width: 2000px) { .card { color: green } }
             @media (max-width: 2000px) { .card { font-size: 20px } }
             .card::before { content: "x"; color: blue }
           </style>
           <div id=c class=card>a</div><div class=alt><p id=n class=card>b</p></div>
-          <div id=b class=bad></div>"#;
+          <div id=b class=bad></div><div id=y class=cyc></div>"#;
         let dom = parse_html(html);
         let sheets = author_sheets(&dom, &[]);
         let refs: Vec<&str> = sheets.iter().map(String::as_str).collect();
@@ -1421,6 +1492,9 @@ mod tests {
             Dim::Auto,
             "invalid var() makes the property unset"
         );
+        let y = get("y");
+        assert_eq!(y.width, Dim::Px(7.0), "a self-reference is invalid");
+        assert_eq!(y.height, Dim::Px(8.0), "inherited values are computed");
         let before = st.pseudo.get(&(
             dom.element_by_id("c").unwrap(),
             selector::PseudoElement::Before,
