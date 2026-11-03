@@ -102,6 +102,7 @@
 | 25 | 以「最常被看的網站的主要內容要看得清楚」為目標的第七次調查（新聞、百科、字典、文件、台灣常用網站）後的修正：選擇器裡接在另一個偽元素後的偽元素（`::part(x)::after`）不再被當成元素自己的 `::after`；浮動元素緊接在只有一行的行內內容之後、且放得下時，放到那一行的頂端（CSS 2.1 §9.5.1），文字在旁邊排（多輪排版：上一輪量到行數與寬度）；清除浮動（`clear`）的區塊裡只有浮動元素時，不再被自己裡面的浮動強制產生 clearance 而往上移（修改 taffy，見 `vendor/taffy/PATCHED.md`）；使用者的語言偏好（`LANG` 等環境變數，macOS 上為系統偏好語言）用於 `Accept-Language`、`navigator.language` 與 `navigator.languages`（新的主機函式 `languages`） |
 | 26 | 第八次調查（AP、CNBC、自由時報、ETtoday、巴哈姆特、Mobile01、日文維基、GeeksforGeeks、w3schools、Python 文件、Rust Book、Platformer、wikiHow、weather.gov、NHK、Naver）後的修正：缺字時的系統字型改為依序嘗試的一串（中文、日文、韓文、泛 Unicode、泰文、天城文、符號；各平台各自的路徑，沒裝的略過），韓文與日文「・」不再顯示成方框；備用字型只用它的 Unicode 字元對照表選字與取字形（STHeiti 另有 Big5 對照表，它的碼位與韓文重疊，原本把「뉴」畫成「猓」）；以百分比設定 `width` / `max-width` 的替換元素（圖片等）不計入 min-content 大小（CSS Sizing 3 §5.2.2 的 compressible），區塊或行內皆然，flex 項目不再被圖片的原始寬度撐開；`grid-row` / `grid-column` 的值可用數學函式（`span min(12, 3)`、`calc()`）；`async` 腳本排在一般與 `defer` 腳本之後，同來源的在前 |
 | 27 | 第九次調查（Guardian、NPR、The Verge、Al Jazeera、DW、Le Monde、Spiegel、Hacker News、Stack Overflow、中文維基、新浪、網易、TechCrunch、Wired、USA Today、Nature）後的修正與效能：`@font-face` 的 `unicode-range` 逐字選擇字型檔（CSS Fonts 4 §4.5），同一字族拆成多個檔（字母一檔、空白與數字一檔）時不再把空白畫成方框；只下載範圍含 Latin-1 或頁面文字的字型檔；自訂屬性表在元素之間與重算之間共用（相同的父表加上相同的宣告得到同一份），樣式計算在大量使用 `--變數` 的頁面快了約 5 倍（The Verge 平均每次 88 → 17 ms，最慢一次 1585 → 38 ms） |
+| 28 | 原生版的腳本引擎由 wasmi（直譯）換成 wasmtime（Cranelift 編成機器碼），網頁版仍用 wasmi；`js.wasm` 改用 `runtime` profile（`opt-level = 3`）編譯。同一段 JS 測試：小量 211 → 22 ms、大量約 2.6 → 0.67 秒（原生 boa 0.37 秒）。fuel 上限、頁面載入預算與腳本時鐘的「每毫秒 fuel」在原生版乘以 3（`script::SPEED`），代表的時間不變；wasmtime 不能在 fuel 用完後繼續，所以寬限的 fuel 在呼叫開始時就一起給，用超過自己的那份時 `interrupted()` 回 1。代價：執行檔 22 → 32 MB、第一次編譯 `js.wasm` 每個行程約 1 秒、完整 release 建置約 13 分鐘 |
 
 ### 第二批調查
 
@@ -176,7 +177,8 @@
 用 macOS `sample` 取樣 The Verge、GitHub 等腳本多的頁面：
 
 - 樣式計算佔最多：每個宣告了自訂屬性的元素都複製整張繼承來的變數表，比較新舊樣式時又逐字串比對。已改為共用（見第 27 項）。
-- JS 約佔兩成。同一段 JS 測試（物件、字串、Map、JSON、遞迴、正規表示式）：原生 boa 約 10 ms，boa 編成 wasm 在 wasmi 裡約 210 ms，約慢 20 倍。
+- JS 約佔兩成。同一段 JS 測試（物件、字串、Map、JSON、遞迴、正規表示式）：原生 boa 約 10 ms，boa 編成 wasm 在 wasmi 裡約 210 ms，約慢 20 倍。改用 wasmtime 後約 22 ms（見第 28 項）。
+- 換成 wasmtime 後，載入時能跑完的腳本：GeeksforGeeks 3 → 57 個（之後停在 Next.js 的 `TypeError`）、GitHub 70 → 134、The Verge 51 → 156。
 
 ## 5. 不做的事
 

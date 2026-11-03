@@ -8,7 +8,7 @@ rubrowser draws an entire web browser on a **blank canvas** — a native window'
 - Its own CSS engine (parser, selectors, `@media`/`@supports`/`@layer`, `var()`, `calc()`); block, flex and grid layout with [`taffy`](https://crates.io/crates/taffy); inline layout written from scratch
 - Text rendered with [`fontdue`](https://crates.io/crates/fontdue): the system's Arial/Georgia when installed (so text wraps like in other browsers), the bundled DejaVu fonts otherwise, and a system CJK font for Chinese/Japanese
 - SVG (`<img>`, inline `<svg>`, `mask-image` icons) rasterized with [`resvg`](https://crates.io/crates/resvg)
-- Page scripts are wasm modules run by [`wasmi`](https://crates.io/crates/wasmi), sandboxed with fuel and memory limits
+- Page scripts are wasm modules, compiled to machine code by [`wasmtime`](https://crates.io/crates/wasmtime) in the native build and interpreted by [`wasmi`](https://crates.io/crates/wasmi) in the web build, sandboxed with fuel and memory limits
 - `<script>` JavaScript, inline `onclick` handlers and a familiar DOM API, executed by `js.wasm` (see [doc/javascript.md](doc/javascript.md))
 
 ## Install and run

@@ -17,9 +17,9 @@ done
 
 # 2. Language runtimes: JavaScript is the boa engine compiled to wasm.
 #    (.cargo/config.toml selects getrandom's custom backend for wasm.)
-cargo build --profile page --target wasm32-unknown-unknown \
+cargo build --profile runtime --target wasm32-unknown-unknown \
   --no-default-features --features js-runtime --example js_runtime
-cp target/wasm32-unknown-unknown/page/examples/js_runtime.wasm src/browser/runtimes/js.wasm
+cp target/wasm32-unknown-unknown/runtime/examples/js_runtime.wasm src/browser/runtimes/js.wasm
 
 # 3. The browser itself as wasm, for the canvas version.
 cargo rustc --lib --release --target wasm32-unknown-unknown \

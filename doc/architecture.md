@@ -20,7 +20,7 @@ flowchart TB
     LAY["layout<br/>taffy + 行內排版"]
     PAINT["paint"]
   end
-  SCRIPT["script<br/>wasmi + DOM API"]
+  SCRIPT["script<br/>wasmtime / wasmi + DOM API"]
   TEXT["text<br/>fontdue + DejaVu"]
   GFX["gfx<br/>u32 像素畫布"]
 
@@ -42,7 +42,7 @@ flowchart TB
 | `layout` | box tree；block / flex / grid / float 交給 `taffy`，行內內容是自己算的葉節點；`::before` / `::after` 是 DOM 之後的合成節點 |
 | `paint` | 背景、邊框、圓角、文字、底線、清單符號、輸入框、捲軸 |
 | `document` | 把上面串成一份文件：重新計算、hit-test、hover / focus、捲動、輸入框狀態 |
-| `script` | 在 wasmi 中執行網頁的 wasm，提供 DOM API（見 [abi.md](abi.md)） |
+| `script` | 執行網頁的 wasm（原生版 wasmtime 編成機器碼，網頁版 wasmi 直譯），提供 DOM API（見 [abi.md](abi.md)） |
 | `lang` | 語言 runtime：`lang::js` 把 boa 編成 `js.wasm`（見 [javascript.md](javascript.md)、[languages.md](languages.md)） |
 | `document::forms` / `document::image` | 表單控制項狀態、圖片解碼與縮放快取；SVG 以 `resvg` 依繪製大小點陣化 |
 | `browser` | 外框文件、分頁、歷史、載入、事件分派、快捷鍵 |

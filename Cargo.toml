@@ -17,7 +17,6 @@ default = ["native"]
 sdk = []
 # Platform-independent browser core: graphics, UI, page runtime.
 core = [
-    "dep:wasmi",
     "dep:fontdue",
     "dep:dejavu",
     "dep:html5ever",
@@ -30,12 +29,12 @@ core = [
     "dep:rustybuzz",
 ]
 # Native window version (main).
-native = ["core", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2"]
+native = ["core", "dep:wasmtime", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2"]
 # Audio and video playback with FFmpeg (needs FFmpeg 8 installed, e.g.
 # `brew install ffmpeg`); without it, media elements report an error.
 media = ["native", "dep:ffmpeg-next", "dep:cpal", "image/avif-native"]
 # Canvas version running inside a web browser (extra).
-web = ["core"]
+web = ["core", "dep:wasmi"]
 # The JavaScript runtime (boa) built as js.wasm; see scripts/build.sh.
 js-runtime = ["sdk", "dep:boa_engine", "dep:getrandom"]
 
@@ -43,6 +42,8 @@ js-runtime = ["sdk", "dep:boa_engine", "dep:getrandom"]
 winit = { version = "0.30", optional = true }
 softbuffer = { version = "0.4", optional = true }
 wasmi = { version = "2", default-features = false, features = ["std", "stable", "validate", "auto-dispatch"], optional = true }
+# Native builds compile scripts to machine code (wasmi interprets them).
+wasmtime = { version = "50", default-features = false, features = ["std", "runtime", "cranelift", "parallel-compilation"], optional = true }
 ureq = { version = "3", optional = true, features = ["cookies", "brotli", "charset"] }
 arboard = { version = "3", default-features = false, optional = true }
 fontdue = { version = "0.9", optional = true }
@@ -61,7 +62,7 @@ ffmpeg-next = { version = "8", optional = true }
 cpal = { version = "0.16", optional = true }
 
 [dev-dependencies]
-wasmi = { version = "2", features = ["wat"] }
+wasmtime = { version = "50", default-features = false, features = ["wat"] }
 
 [[bin]]
 name = "rubrowser"
@@ -78,6 +79,12 @@ opt-level = "s"
 panic = "abort"
 strip = true
 codegen-units = 1
+
+# Language runtimes (js.wasm): optimized for speed, since the native build
+# compiles them to machine code.
+[profile.runtime]
+inherits = "page"
+opt-level = 3
 
 # Page scripts (built for wasm32 by scripts/build.sh).
 [[example]]

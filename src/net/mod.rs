@@ -13,6 +13,7 @@ pub fn languages() -> &'static [String] {
             .iter()
             .filter_map(|v| std::env::var(v).ok())
             .find(|v| !v.is_empty() && v != "C" && v != "POSIX");
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
         let mut found: Vec<String> = env.into_iter().collect();
         #[cfg(target_os = "macos")]
         if found.is_empty()

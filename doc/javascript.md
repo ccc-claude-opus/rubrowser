@@ -10,8 +10,8 @@ flowchart LR
 ```
 
 - **引擎**：[boa_engine](https://crates.io/crates/boa_engine)，純 Rust、支援 ES2023 以上的大部分語法與內建物件。
-- **runtime**：`src/lang/js.rs`（feature `js-runtime`），編譯成 `src/browser/runtimes/js.wasm`（約 4 MB），內嵌在瀏覽器裡。
-- **沙箱**：和其他 wasm 腳本相同，受 fuel（每次呼叫 20 億條 wasm 指令）與記憶體（512 MiB）限制；無法存取檔案或網路。
+- **runtime**：`src/lang/js.rs`（feature `js-runtime`），編譯成 `src/browser/runtimes/js.wasm`（約 6.6 MB，`runtime` profile 以 `opt-level = 3` 編譯），內嵌在瀏覽器裡。原生版用 wasmtime（Cranelift）把它編成機器碼，每個行程第一次載入時編譯一次（約 1 秒）；網頁版用 wasmi 直譯。
+- **沙箱**：和其他 wasm 腳本相同，受 fuel（每次呼叫 100 億條 wasm 指令，原生版 300 億）與記憶體（512 MiB）限制；無法存取檔案或網路。
 - 同一頁的所有 JS 共用一個 runtime instance，所以 `<script>` 之間共享全域變數，和一般瀏覽器相同。
 
 ## 1. 用法
@@ -72,7 +72,7 @@ flowchart LR
 
 ### 執行時間
 
-載入頁面時，HTML 裡的腳本合計最多約 80 億 fuel（約 3 秒）；用完後其餘的腳本會略過，讓頁面先顯示。腳本插入的腳本是非同步的，不算在這個預算內。載入完成後（以及每個插入的腳本），每次呼叫最多 100 億 fuel。
+載入頁面時，HTML 裡的腳本合計最多約 80 億 fuel（原生版 240 億；約 3 秒）；用完後其餘的腳本會略過，讓頁面先顯示。腳本插入的腳本是非同步的，不算在這個預算內。載入完成後（以及每個插入的腳本），每次呼叫最多 100 億 fuel（原生版 300 億）。
 
 ## 3. 錯誤
 
@@ -89,7 +89,7 @@ flowchart LR
 它會執行：
 
 ```bash
-cargo build --profile page --target wasm32-unknown-unknown --no-default-features --features js-runtime --example js_runtime
+cargo build --profile runtime --target wasm32-unknown-unknown --no-default-features --features js-runtime --example js_runtime
 ```
 
 在 `wasm32-unknown-unknown` 上沒有作業系統的時間與亂數，所以 runtime 自己提供：

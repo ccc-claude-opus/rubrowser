@@ -250,7 +250,7 @@ fn origin(u: &str) -> Option<String> {
 
 /// Fuel all of a page's language-runtime calls may use while it loads
 /// (roughly three seconds); after `load` only the per-call limit applies.
-const PAGE_LOAD_FUEL: u64 = 8_000_000_000;
+const PAGE_LOAD_FUEL: u64 = 8_000_000_000 * crate::script::SPEED;
 
 /// Most modules fetched for one module script.
 const MAX_MODULES: usize = 400;

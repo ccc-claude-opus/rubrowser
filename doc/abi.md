@@ -131,7 +131,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 
 | 限制 | 值 | 超過時 |
 |---|---|---|
-| 每次呼叫的指令數（fuel） | 30,000,000 | 呼叫中止，腳本被停止並記錄錯誤 |
+| 每次呼叫的指令數（fuel） | 30,000,000（原生版 ×3，見下） | 呼叫中止，腳本被停止並記錄錯誤 |
 | 線性記憶體 | 64 MiB | `memory.grow` 失敗 |
 | 單一字串 | 1 MiB | 截斷 |
 | listener 數 | 10,000 | 之後的登記被忽略 |
@@ -168,7 +168,9 @@ JavaScript 等直譯式語言以「runtime 模組」執行：一個額外匯出�
 | `rb_eval(src, src_len, name, name_len)` | 執行一段原始碼；例外自行回報到 `log` |
 | `rb_event` / `rb_timer` | 和一般模組相同，由 runtime 轉給語言內的處理函式 |
 
-瀏覽器每頁每種語言只建立一個 runtime instance，依文件順序對每個 `<script>` 呼叫一次 `rb_eval`。runtime 的 fuel 上限是每次呼叫 20 億條指令、記憶體 512 MiB。
+瀏覽器每頁每種語言只建立一個 runtime instance，依文件順序對每個 `<script>` 呼叫一次 `rb_eval`。runtime 的 fuel 上限是每次呼叫 100 億條指令、記憶體 512 MiB。
+
+原生版用 wasmtime 把 wasm 編成機器碼，同樣的時間能跑約 3 倍的指令，所以原生版的 fuel 上限、頁面載入預算與「每毫秒的 fuel」都乘以 3（`script::SPEED`），代表的時間和網頁版（wasmi 直譯）相同。
 
 網頁可以用 `<link rel="rubrowser-runtime" type="text/python" href="python.wasm">` 提供自己的 runtime；詳見 [languages.md](languages.md)。
 
