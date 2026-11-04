@@ -86,7 +86,7 @@ rubrowser::script!(init);
 Build the script with `crate-type = ["cdylib"]` and only the `sdk` feature (no dependencies):
 
 ```toml
-rubrowser = { version = "0.1", default-features = false, features = ["sdk"] }
+rubrowser = { version = "0.2", default-features = false, features = ["sdk"] }
 ```
 
 ```bash

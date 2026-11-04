@@ -20,7 +20,7 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-rubrowser = { version = "0.1", default-features = false, features = ["sdk"] }
+rubrowser = { version = "0.2", default-features = false, features = ["sdk"] }
 
 [profile.release]
 opt-level = "s"
