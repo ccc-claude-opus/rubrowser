@@ -103,6 +103,7 @@
 | 26 | 第八次調查（AP、CNBC、自由時報、ETtoday、巴哈姆特、Mobile01、日文維基、GeeksforGeeks、w3schools、Python 文件、Rust Book、Platformer、wikiHow、weather.gov、NHK、Naver）後的修正：缺字時的系統字型改為依序嘗試的一串（中文、日文、韓文、泛 Unicode、泰文、天城文、符號；各平台各自的路徑，沒裝的略過），韓文與日文「・」不再顯示成方框；備用字型只用它的 Unicode 字元對照表選字與取字形（STHeiti 另有 Big5 對照表，它的碼位與韓文重疊，原本把「뉴」畫成「猓」）；以百分比設定 `width` / `max-width` 的替換元素（圖片等）不計入 min-content 大小（CSS Sizing 3 §5.2.2 的 compressible），區塊或行內皆然，flex 項目不再被圖片的原始寬度撐開；`grid-row` / `grid-column` 的值可用數學函式（`span min(12, 3)`、`calc()`）；`async` 腳本排在一般與 `defer` 腳本之後，同來源的在前 |
 | 27 | 第九次調查（Guardian、NPR、The Verge、Al Jazeera、DW、Le Monde、Spiegel、Hacker News、Stack Overflow、中文維基、新浪、網易、TechCrunch、Wired、USA Today、Nature）後的修正與效能：`@font-face` 的 `unicode-range` 逐字選擇字型檔（CSS Fonts 4 §4.5），同一字族拆成多個檔（字母一檔、空白與數字一檔）時不再把空白畫成方框；只下載範圍含 Latin-1 或頁面文字的字型檔；自訂屬性表在元素之間與重算之間共用（相同的父表加上相同的宣告得到同一份），樣式計算在大量使用 `--變數` 的頁面快了約 5 倍（The Verge 平均每次 88 → 17 ms，最慢一次 1585 → 38 ms） |
 | 28 | 原生版的腳本引擎由 wasmi（直譯）換成 wasmtime（Cranelift 編成機器碼），網頁版仍用 wasmi；`js.wasm` 改用 `runtime` profile（`opt-level = 3`）編譯。同一段 JS 測試：小量 211 → 22 ms、大量約 2.6 → 0.67 秒（原生 boa 0.37 秒）。fuel 上限、頁面載入預算與腳本時鐘的「每毫秒 fuel」在原生版乘以 3（`script::SPEED`），代表的時間不變；wasmtime 不能在 fuel 用完後繼續，所以寬限的 fuel 在呼叫開始時就一起給，用超過自己的那份時 `interrupted()` 回 1。代價：執行檔 22 → 32 MB、第一次編譯 `js.wasm` 每個行程約 1 秒、完整 release 建置約 13 分鐘 |
+| 29 | 為了讓 GeeksforGeeks（Next.js）能跑：`<a>` / `<area>` 的網址屬性（`protocol`、`host`、`hostname`、`port`、`pathname`、`search`、`hash`、`origin`，可讀可寫；HTML 的 `HTMLHyperlinkElementUtils`）；CSSOM：`<style>` / `<link>` 的 `sheet`、`document.styleSheets`、`CSSStyleSheet`（`cssRules`、`insertRule`、`deleteRule`、`replaceSync`…）、`CSSStyleRule`（`selectorText`、`style`）、`CSSMediaRule` 等群組規則，修改經新的主機函式 `set_sheet` 生效（元素的文字不變；之後元素的文字被改掉時作廢），`sheet_text` 讀回目前的 CSS；跨來源的 `<link>` 讀 `cssRules` 丟 `SecurityError`；JS 的遞迴上限由 boa 預設的 512 層提高到 10,000 層，原生版在 wasmtime 的獨立堆疊（16 MiB，async 呼叫當場完成）上執行，`js.wasm` 的堆疊改為 16 MiB，經由內建函式的深層遞迴會停在上限而不是當掉；`console.error` 印出錯誤的 stack，腳本的檔名出現在 stack 裡 |
 
 ### 第二批調查
 
@@ -178,7 +179,8 @@
 
 - 樣式計算佔最多：每個宣告了自訂屬性的元素都複製整張繼承來的變數表，比較新舊樣式時又逐字串比對。已改為共用（見第 27 項）。
 - JS 約佔兩成。同一段 JS 測試（物件、字串、Map、JSON、遞迴、正規表示式）：原生 boa 約 10 ms，boa 編成 wasm 在 wasmi 裡約 210 ms，約慢 20 倍。改用 wasmtime 後約 22 ms（見第 28 項）。
-- 換成 wasmtime 後，載入時能跑完的腳本：GeeksforGeeks 3 → 57 個（之後停在 Next.js 的 `TypeError`）、GitHub 70 → 134、The Verge 51 → 156。
+- 換成 wasmtime 後，載入時能跑完的腳本：GeeksforGeeks 3 → 57 個、GitHub 70 → 134、The Verge 51 → 156。GeeksforGeeks 接著依序卡在 `<a>` 的 `pathname`、CSSOM（Stitches 用 `insertRule` 插入所有樣式）、遞迴上限，都已補上（第 29 項）；目前停在 React 裡 `instanceof` 右邊是 `undefined` 的 `TypeError`，待查。
+- boa 的 `RuntimeLimitError` 不能被 `try/catch` 捕捉（瀏覽器是可捕捉的 `RangeError`），要改得修改 boa。
 
 ## 5. 不做的事
 

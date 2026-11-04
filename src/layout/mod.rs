@@ -531,7 +531,7 @@ impl Builder<'_> {
         let base = self.dom.len();
         if id >= base {
             // A generated box holds its text node.
-            return if (id - base) % 2 == 0 {
+            return if (id - base).is_multiple_of(2) {
                 vec![id + 1]
             } else {
                 Vec::new()

@@ -24,6 +24,7 @@ use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::ObjectInitializer;
 use boa_engine::object::builtins::JsArray;
 use boa_engine::property::Attribute;
+use boa_engine::vm::RuntimeLimits;
 use boa_engine::{
     Context, JsArgs, JsError, JsResult, JsString, JsValue, Module, NativeFunction, Source,
     js_error, js_string,
@@ -269,6 +270,17 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             Ok(opt_string(read_string(|p, n| unsafe {
                 ffi::get_attr(h, name.as_ptr(), name.len(), p, n)
             })))
+        }),
+        ("sheetText", 1, |_, a, c| {
+            let h = int(a, 0, c)?;
+            Ok(opt_string(read_string(|p, n| unsafe {
+                ffi::sheet_text(h, p, n)
+            })))
+        }),
+        ("setSheet", 2, |_, a, c| {
+            let (h, s) = (int(a, 0, c)?, text(a, 1, c)?);
+            unsafe { ffi::set_sheet(h, s.as_ptr(), s.len()) };
+            Ok(JsValue::undefined())
         }),
         ("canvas", 2, |_, a, c| {
             let (h, cmd) = (int(a, 0, c)?, text(a, 1, c)?);
@@ -623,6 +635,12 @@ pub fn init() {
         .module_loader(MODULES.with(Rc::clone))
         .build()
         .expect("create JavaScript context");
+    // Recursion as deep as other browsers allow (about ten thousand calls);
+    // boa's defaults (512 calls) stop ordinary deep component trees.
+    let mut limits = RuntimeLimits::default();
+    limits.set_recursion_limit(10_000);
+    limits.set_stack_size_limit(1 << 20);
+    ctx.set_runtime_limits(limits);
     let mut rb = ObjectInitializer::new(&mut ctx);
     for (name, argc, f) in natives() {
         // Every call into the browser is a safe point to stop a script the
@@ -638,7 +656,7 @@ pub fn init() {
     let rb = rb.build();
     ctx.register_global_property(js_string!("__rb"), rb, Attribute::all())
         .expect("register __rb");
-    if let Err(e) = ctx.eval(Source::from_bytes(PRELUDE)) {
+    if let Err(e) = ctx.eval(Source::from_bytes(PRELUDE).with_path(Path::new("prelude.js"))) {
         log(&format!("prelude failed: {e}"));
     }
     CONTEXT.with(|c| *c.borrow_mut() = Some(Box::new(ctx)));
@@ -690,15 +708,10 @@ pub unsafe fn eval(src: *const u8, len: usize, name: *const u8, name_len: usize)
         return;
     }
     with_context(|ctx| {
-        if let Err(e) = ctx.eval(Source::from_bytes(&source)) {
-            if e.as_engine().is_some() {
-                if unsafe { ffi::interrupted() } == 0 {
-                    log(&format!("Uncaught {e} ({name})"));
-                }
-                return;
-            }
-            let value = e.into_opaque(ctx).unwrap_or_default();
-            log(&format!("Uncaught {} ({name})", value.display()));
+        // The name shows in stack traces.
+        let src = Source::from_bytes(&source).with_path(Path::new(&name));
+        if let Err(e) = ctx.eval(src) {
+            report(e, ctx);
         }
     });
 }

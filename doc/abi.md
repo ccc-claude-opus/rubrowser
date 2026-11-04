@@ -61,6 +61,8 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 |---|---|
 | `get_text(h, ptr, cap) -> i32` | 所有子孫文字 |
 | `set_text(h, ptr, len)` | 以一個文字節點取代所有子節點 |
+| `sheet_text(h, ptr, cap) -> i32` | `<style>` 或已載入的 `<link rel=stylesheet>` 的 CSS（含 `set_sheet` 的修改）；不是樣式表時回傳 -1 |
+| `set_sheet(h, ptr, len)` | 以 `ptr` 的 CSS 取代該樣式表的規則（CSSOM：元素的文字不變；之後元素的文字被改掉時，這份修改作廢） |
 | `get_attr(h, name_ptr, name_len, ptr, cap) -> i32` | 屬性值，不存在回傳 -1 |
 | `canvas(h, cmd_ptr, cmd_len, ptr, cap) -> i32` | `<canvas>` 的 2D 繪圖指令：名稱與參數以 U+0001 分隔（例如 `fillRect␁0␁0␁10␁10`）；查詢指令（`measureText`、`getImageData`、`toDataURL`、`isPointInPath`、建立漸層 / 圖樣）把結果字串寫到 `ptr`，否則回傳 -1 |
 | `media(h, cmd_ptr, cmd_len, ptr, cap) -> i32` | `<video>` / `<audio>`：`play`（結果 `ok` 或錯誤名稱）、`pause`、`seek␁秒`、`volume␁v`、`muted␁0/1`、`loop␁0/1`、`load`、`info`（以逗號分隔：paused、ended、currentTime、duration、readyState、volume、muted、videoWidth、videoHeight、錯誤碼、網址）、`canPlayType␁MIME`（`probably` / `maybe` / 空字串，不需元素） |

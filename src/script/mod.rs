@@ -48,6 +48,12 @@ const GRACE_FUEL: u64 = 500_000_000 * SPEED;
 pub const MAX_MEMORY: usize = 64 << 20;
 /// Longest string a script may pass to the browser.
 const MAX_STRING: usize = 1 << 20;
+/// Longest style sheet a script may set (see `set_sheet`).
+const MAX_SHEET: usize = 16 << 20;
+/// Stack wasm code may use (wasmtime). Calls run on a stack of their own
+/// (async calls, finished at once), not the thread's.
+#[cfg(feature = "native")]
+const MAX_WASM_STACK: usize = 16 << 20;
 
 /// Resource limits for one wasm module.
 #[derive(Clone, Copy, Debug)]
@@ -168,6 +174,8 @@ pub struct Script {
     fuel: u64,
     /// Fuel left for a bounded phase (page load), shared by all calls.
     budget: Option<u64>,
+    /// Keeps `Script` on its thread (see `impl Send for State`).
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl Script {
@@ -212,7 +220,8 @@ impl Script {
         store.set_fuel(fuel).map_err(|e| e.to_string())?;
         let linker = linker(&engine).map_err(|e| e.to_string())?;
         #[cfg(feature = "native")]
-        let instantiate = |store: &mut Store<State>| linker.instantiate(store, &module);
+        let instantiate =
+            |store: &mut Store<State>| block_on(linker.instantiate_async(store, &module));
         #[cfg(not(feature = "native"))]
         let instantiate = |store: &mut Store<State>| linker.instantiate_and_start(store, &module);
         let mut script = Script {
@@ -225,6 +234,7 @@ impl Script {
             memory: None,
             fuel,
             budget: None,
+            _not_send: std::marker::PhantomData,
         };
         script.with_doc(doc, now, |s| {
             let instance = instantiate(&mut s.store).map_err(describe)?;
@@ -416,6 +426,11 @@ fn compile(wasm: &[u8]) -> Result<(Engine, Module), String> {
         .get_or_init(|| {
             let mut config = Config::default();
             config.consume_fuel(true);
+            // Deep recursion in a language runtime (calls that re-enter it
+            // from its own built-ins) needs more than the 512 KiB default.
+            config.max_wasm_stack(MAX_WASM_STACK);
+            // The rest of a call's stack is for host functions.
+            config.async_stack_size(MAX_WASM_STACK + (2 << 20));
             Engine::new(&config).map_err(|e| e.to_string())
         })
         .clone()?;
@@ -453,12 +468,12 @@ fn compile(wasm: &[u8]) -> Result<(Engine, Module), String> {
 /// and running out of the grace fuel too stops it. A call that ends after
 /// being interrupted counts as stopped for running too long.
 #[cfg(feature = "native")]
-fn call<P: WasmParams, R: WasmResults>(
+fn call<P: WasmParams + Sync, R: WasmResults + Sync>(
     store: &mut Store<State>,
     f: &TypedFunc<P, R>,
     params: P,
 ) -> Result<R, String> {
-    let r = f.call(&mut *store, params).map_err(describe)?;
+    let r = block_on(f.call_async(&mut *store, params)).map_err(describe)?;
     if overdue(store.get_fuel().unwrap_or(0), store.data()) {
         store.data_mut().interrupted = true;
     }
@@ -467,6 +482,26 @@ fn call<P: WasmParams, R: WasmResults>(
     }
     Ok(r)
 }
+
+/// Runs a wasmtime call to completion. Host functions are synchronous and
+/// fuel never yields, so it finishes in the first poll.
+#[cfg(feature = "native")]
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    use std::task::{Context, Poll, Waker};
+    let mut f = std::pin::pin!(f);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
+
+// SAFETY: async calls need `Send` store data, but every call is driven to
+// completion on the thread that started it (`block_on`), and `Script`
+// itself is not `Send`, so the data never leaves its thread.
+#[cfg(feature = "native")]
+unsafe impl Send for State {}
 
 /// Whether a call with `left` fuel has used more than its own fuel.
 #[cfg(feature = "native")]
@@ -565,7 +600,12 @@ fn range(data: &[u8], ptr: i32, len: usize) -> Result<std::ops::Range<usize>, Er
 }
 
 fn read_str(caller: &Caller<'_, State>, ptr: i32, len: i32) -> Result<String, Error> {
-    let len = (len as u32 as usize).min(MAX_STRING);
+    read_text(caller, ptr, len, MAX_STRING)
+}
+
+/// Reads at most `max` bytes of text at `ptr`.
+fn read_text(caller: &Caller<'_, State>, ptr: i32, len: i32, max: usize) -> Result<String, Error> {
+    let len = (len as u32 as usize).min(max);
     let data = memory(caller)?.data(caller);
     let r = range(data, ptr, len)?;
     Ok(String::from_utf8_lossy(&data[r]).into_owned())
@@ -828,6 +868,29 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
                 Some(v) => write_str(&mut c, p, cap, &v),
                 None => Ok(-1),
             }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "sheet_text",
+        |mut c: C, h: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let doc = &c.data().doc;
+            match node(doc, h).and_then(|n| doc.sheet_text(n)) {
+                Some(css) => write_str(&mut c, p, cap, &css),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "set_sheet",
+        |mut c: C, h: i32, p: i32, n: i32| -> Result<(), Error> {
+            let css = read_text(&c, p, n, MAX_SHEET)?;
+            let doc = &mut c.data_mut().doc;
+            if let Some(node) = node(doc, h) {
+                doc.set_sheet(node, css);
+            }
+            Ok(())
         },
     )?;
     l.func_wrap(
@@ -1318,11 +1381,11 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
     })?;
     l.func_wrap("rb", "set_selected", |mut c: C, h: i32, i: i32| {
         let doc = &mut c.data_mut().doc;
-        if let (Some(e), Ok(i)) = (element(doc, h), usize::try_from(i)) {
-            if i < crate::document::options(&doc.dom, e).len() {
-                doc.forms.set_selected(e, i);
-                doc.dom_changed();
-            }
+        if let (Some(e), Ok(i)) = (element(doc, h), usize::try_from(i))
+            && i < crate::document::options(&doc.dom, e).len()
+        {
+            doc.forms.set_selected(e, i);
+            doc.dom_changed();
         }
     })?;
     l.func_wrap("rb", "form_action", |mut c: C, h: i32, op: i32| {

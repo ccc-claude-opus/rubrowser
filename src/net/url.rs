@@ -147,15 +147,15 @@ pub(crate) fn percent_decode(s: &str) -> Vec<u8> {
     let mut i = 0;
     while i < b.len() {
         let hex = |c: u8| (c as char).to_digit(16);
-        if b[i] == b'%' {
-            if let (Some(h), Some(l)) = (
+        if b[i] == b'%'
+            && let (Some(h), Some(l)) = (
                 b.get(i + 1).and_then(|&c| hex(c)),
                 b.get(i + 2).and_then(|&c| hex(c)),
-            ) {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-                continue;
-            }
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+            continue;
         }
         out.push(b[i]);
         i += 1;

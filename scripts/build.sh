@@ -17,8 +17,10 @@ done
 
 # 2. Language runtimes: JavaScript is the boa engine compiled to wasm.
 #    (.cargo/config.toml selects getrandom's custom backend for wasm.)
-cargo build --profile runtime --target wasm32-unknown-unknown \
-  --no-default-features --features js-runtime --example js_runtime
+#    A 16 MiB stack (instead of 1 MiB) for deeply recursive scripts.
+cargo rustc --profile runtime --target wasm32-unknown-unknown \
+  --no-default-features --features js-runtime --example js_runtime \
+  -- -C link-arg=-zstack-size=16777216
 cp target/wasm32-unknown-unknown/runtime/examples/js_runtime.wasm src/browser/runtimes/js.wasm
 
 # 3. The browser itself as wasm, for the canvas version.

@@ -97,6 +97,11 @@ pub struct Document {
     pub dom: Dom,
     /// Contents of loaded `<link rel=stylesheet>` elements.
     linked_css: HashMap<NodeId, Rc<Sheet>>,
+    /// The text of each `<link rel=stylesheet>`, for scripts (CSSOM).
+    linked_text: HashMap<NodeId, String>,
+    /// Sheets changed by scripts through the CSSOM: element → (the text
+    /// they replaced, their CSS). Changing the element's text drops it.
+    cssom: HashMap<NodeId, (String, String)>,
     /// Parsed `<style>` elements: node → (text, sheet).
     inline_css: HashMap<NodeId, (String, Rc<Sheet>)>,
     /// Sheets loaded through `@import`, by URL.
@@ -155,6 +160,8 @@ impl Document {
             url: url.to_string(),
             dom,
             linked_css: HashMap::new(),
+            linked_text: HashMap::new(),
+            cssom: HashMap::new(),
             inline_css: HashMap::new(),
             imported: HashMap::new(),
             requested_imports: Default::default(),
@@ -360,7 +367,36 @@ impl Document {
     pub fn add_stylesheet(&mut self, link: NodeId, css: String, url: &str) {
         self.linked_css
             .insert(link, Rc::new(parse_stylesheet(&css, Some(url))));
+        self.linked_text.insert(link, css);
         self.needs_style = true;
+    }
+
+    /// The own text of a `<style>`, or of a loaded `<link>` sheet.
+    fn own_sheet_text(&self, n: NodeId) -> Option<String> {
+        match self.dom.tag(n) {
+            Some("style") => Some(self.dom.text_content(n)),
+            Some("link") => self.linked_text.get(&n).cloned(),
+            _ => None,
+        }
+    }
+
+    /// The CSS of a `<style>` or `<link>` sheet as scripts see it: as
+    /// changed through the CSSOM, else its own text.
+    pub fn sheet_text(&self, n: NodeId) -> Option<String> {
+        let own = self.own_sheet_text(n)?;
+        Some(match self.cssom.get(&n) {
+            Some((replaced, css)) if *replaced == own => css.clone(),
+            _ => own,
+        })
+    }
+
+    /// Replaces the rules of a `<style>` or `<link>` sheet with `css`
+    /// (CSSOM changes; its text in the DOM stays as it was).
+    pub fn set_sheet(&mut self, n: NodeId, css: String) {
+        if let Some(own) = self.own_sheet_text(n) {
+            self.cssom.insert(n, (own, css));
+            self.needs_style = true;
+        }
     }
 
     /// Delivers a sheet requested by `@import`.
@@ -458,7 +494,7 @@ impl Document {
             let media = MediaList::parse(self.dom.attr(n, "media").unwrap_or(""));
             let sheet = match self.dom.tag(n) {
                 Some("style") => {
-                    let text = self.dom.text_content(n);
+                    let text = self.sheet_text(n).unwrap_or_default();
                     match self.inline_css.get(&n) {
                         Some((t, sheet)) if *t == text => sheet.clone(),
                         _ => {
@@ -473,7 +509,12 @@ impl Document {
                         if self.dom.attr(n, "disabled").is_none()
                             && self.link_rel(n, "stylesheet") =>
                     {
-                        sheet.clone()
+                        match self.cssom.get(&n) {
+                            Some((replaced, css)) if self.linked_text.get(&n) == Some(replaced) => {
+                                Rc::new(parse_stylesheet(css, Some(&base)))
+                            }
+                            _ => sheet.clone(),
+                        }
                     }
                     _ => continue,
                 },

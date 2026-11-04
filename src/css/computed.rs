@@ -35,17 +35,16 @@ pub fn value(style: &Style, prop: &str, used: Used) -> String {
             s.border_width[i]
         }
     };
-    if let Some(rest) = prop.strip_prefix("border-") {
-        if let Some((name, what)) = rest.split_once('-')
-            && let Some(i) = side(name)
-        {
-            return match what {
-                "width" => px(border_width(i)),
-                "style" => line_style(s.border_style[i]).into(),
-                "color" => color(s.border_color[i]),
-                _ => String::new(),
-            };
-        }
+    if let Some(rest) = prop.strip_prefix("border-")
+        && let Some((name, what)) = rest.split_once('-')
+        && let Some(i) = side(name)
+    {
+        return match what {
+            "width" => px(border_width(i)),
+            "style" => line_style(s.border_style[i]).into(),
+            "color" => color(s.border_color[i]),
+            _ => String::new(),
+        };
     }
     for (prefix, values) in [("margin-", &s.margin), ("padding-", &s.padding)] {
         if let Some(i) = prop.strip_prefix(prefix).and_then(side) {

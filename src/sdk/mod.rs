@@ -107,6 +107,8 @@ imports! {
     fn event_pos(which: i32) -> f64;
     fn location(p: *mut u8, cap: usize) -> i32;
     fn languages(p: *mut u8, cap: usize) -> i32;
+    fn sheet_text(h: i32, p: *mut u8, cap: usize) -> i32;
+    fn set_sheet(h: i32, p: *const u8, n: usize);
     fn history_go(delta: i32);
     fn get_checked(h: i32) -> i32;
     fn set_checked(h: i32, v: i32);
@@ -328,6 +330,18 @@ impl Element {
     /// Replaces the element's children with `text`.
     pub fn set_text(self, text: &str) {
         unsafe { ffi::set_text(self.0, text.as_ptr(), text.len()) }
+    }
+
+    /// The CSS of a `<style>` or `<link>` sheet, including changes made
+    /// with [`Element::set_sheet`].
+    pub fn sheet_text(self) -> Option<String> {
+        read_string(|p, cap| unsafe { ffi::sheet_text(self.0, p, cap) })
+    }
+
+    /// Replaces the rules of a `<style>` or `<link>` sheet (the CSSOM:
+    /// the element's text stays as it was).
+    pub fn set_sheet(self, css: &str) {
+        unsafe { ffi::set_sheet(self.0, css.as_ptr(), css.len()) }
     }
 
     pub fn attr(self, name: &str) -> Option<String> {

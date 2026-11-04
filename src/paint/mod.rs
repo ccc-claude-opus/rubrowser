@@ -1616,11 +1616,12 @@ impl Painter<'_> {
             })
             .intersect(&saved),
         );
-        if chars.is_empty() && !focused {
-            if let Some(ph) = self.dom.attr(node, "placeholder") {
-                let baseline = area.y + (lh - (m.ascent + m.descent)) / 2.0 + m.ascent;
-                self.text(c, style, area.x, baseline, ph, PLACEHOLDER);
-            }
+        if chars.is_empty()
+            && !focused
+            && let Some(ph) = self.dom.attr(node, "placeholder")
+        {
+            let baseline = area.y + (lh - (m.ascent + m.descent)) / 2.0 + m.ascent;
+            self.text(c, style, area.x, baseline, ph, PLACEHOLDER);
         }
         let mut start = 0;
         for (i, line) in text.split('\n').enumerate() {
@@ -1995,7 +1996,7 @@ impl Painter<'_> {
             let mut span = |p: i32, n: i32, a: f32| {
                 let a = a.round() as u8;
                 if n > 0 && a > 0 {
-                    if i % 2 == 0 {
+                    if i.is_multiple_of(2) {
                         c.fill_rect_alpha(p, line, n, 1, color.rgb(), a);
                     } else {
                         c.fill_rect_alpha(line, p, 1, n, color.rgb(), a);

@@ -4008,6 +4008,95 @@ mod tests {
     }
 
     #[test]
+    fn cssom_rules_change_the_page() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://www.cssom.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<style id=s>/* c */ p { margin: 0 } @media print { p { color: blue } }</style>
+            <p id=p>x</p><p id=q>y</p>
+            <script>
+              const log = (s) => console.log(s);
+              const s = document.getElementById('s'), sheet = s.sheet;
+              const color = (id) => getComputedStyle(document.getElementById(id)).color;
+              log('rules ' + sheet.cssRules.length + ' ' + sheet.cssRules[0].cssText + ' ' + sheet.cssRules[1].type + ' ' + sheet.cssRules[1].media.mediaText);
+              log('same ' + (s.sheet === sheet) + ' ' + (document.styleSheets[0] === sheet) + ' ' + (sheet.ownerNode === s));
+              sheet.insertRule('#p { color: rgb(0, 128, 0) }', sheet.cssRules.length);
+              log('inserted ' + color('p') + ' text ' + s.textContent.includes('#p'));
+              // An empty @media block, then rules inserted into it.
+              sheet.insertRule('@media{}', 0);
+              sheet.insertRule('--x { --x: 1 2; }', 0);
+              log('custom ' + sheet.cssRules[0].cssText);
+              sheet.cssRules[1].insertRule('#q { color: rgb(255, 0, 0) }', 0);
+              log('nested ' + color('q'));
+              sheet.cssRules[4].style.color = 'rgb(0, 0, 255)';
+              log('style ' + color('p') + ' ' + sheet.cssRules[4].style.getPropertyValue('color'));
+              sheet.deleteRule(4);
+              log('deleted ' + color('p'));
+              try { sheet.insertRule('p {}', 99) } catch (e) { log('index ' + e.name) }
+              try { sheet.insertRule('a {} b {}') } catch (e) { log('syntax ' + e.name) }
+              s.textContent = '#p { color: rgb(1, 2, 3) }';
+              log('replaced ' + color('p') + ' ' + color('q') + ' ' + sheet.cssRules.length);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in [
+            "rules 2 p { margin: 0; } 4 print",
+            "same true true true",
+            "inserted rgb(0, 128, 0) text false",
+            "custom --x { --x: 1 2; }",
+            "nested rgb(255, 0, 0)",
+            "style rgb(0, 0, 255) rgb(0, 0, 255)",
+            "deleted rgb(0, 0, 0)",
+            "index IndexSizeError",
+            "syntax SyntaxError",
+            "replaced rgb(1, 2, 3) rgb(0, 0, 0) 1",
+        ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+    }
+
+    #[test]
+    fn links_expose_the_parts_of_their_url() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://www.links.test/dir/page", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              const a = document.createElement('a');
+              a.setAttribute('href', '../x/y?q=1#top');
+              console.log([a.protocol, a.host, a.hostname, a.port, a.pathname, a.search, a.hash, a.origin].join(' '));
+              a.pathname = 'z'; a.hash = 'end'; a.port = '8080';
+              console.log(a.getAttribute('href'));
+              const none = document.createElement('a');
+              console.log('none ' + none.protocol + ' [' + none.pathname + ']');
+              const div = document.createElement('div');
+              div.hash = 'own';
+              console.log('div ' + (div.protocol === undefined) + ' ' + div.hash);
+              try { null.x } catch (e) { console.error(e) }
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in [
+            "https: www.links.test www.links.test  /x/y ?q=1 #top https://www.links.test",
+            "https://www.links.test:8080/z?q=1#end",
+            "none : []",
+            "div true own",
+        ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+        assert!(
+            h.logs
+                .iter()
+                .any(|l| l.starts_with("error: TypeError") && l.contains("\n    at ")),
+            "errors are logged with their stack: {:?}",
+            h.logs
+        );
+    }
+
+    #[test]
     fn javascript_calculator_with_inline_handlers() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);

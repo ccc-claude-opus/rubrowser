@@ -711,7 +711,7 @@
   function format(args) {
     return args.map((a) => {
       if (typeof a === 'string') return a;
-      if (a instanceof Error) return a.name + ': ' + a.message;
+      if (a instanceof Error) return a.name + ': ' + a.message + (a.stack ? '\n' + a.stack : '');
       if (a instanceof Node) return a.nodeType === 1 ? '<' + a.localName + '>' : a.nodeName;
       try { return JSON.stringify(a) ?? String(a); } catch (_) { return String(a); }
     }).join(' ');
@@ -911,6 +911,418 @@
     unobserve() {}
     disconnect() {}
     takeRecords() { return []; }
+  }
+
+  // HTMLHyperlinkElementUtils (HTML §4.6.6): the parts of an <a> or
+  // <area>'s URL. Other elements keep them as ordinary properties.
+  {
+    const isLink = (el) => el.localName === 'a' || el.localName === 'area';
+    const linkUrl = (el) => {
+      const v = el.getAttribute('href');
+      if (v === null) return null;
+      try { return new URL(v, document.baseURI); } catch (_) { return null; }
+    };
+    const setters = {
+      protocol: (u, v) => { u.protocol = v.replace(/:.*$/, '').toLowerCase() + ':'; },
+      username: (u, v) => { u.username = v; },
+      password: (u, v) => { u.password = v; },
+      host: (u, v) => { u.host = v.toLowerCase(); },
+      hostname: (u, v) => { u.host = v.toLowerCase() + (u.port ? ':' + u.port : ''); },
+      port: (u, v) => { u.host = u.hostname + (v === '' ? '' : ':' + v); },
+      pathname: (u, v) => { u.pathname = v.startsWith('/') ? v : '/' + v; },
+      search: (u, v) => { u.search = v === '' ? '' : v.startsWith('?') ? v : '?' + v; },
+      hash: (u, v) => { u.hash = v === '' ? '' : v.startsWith('#') ? v : '#' + v; },
+    };
+    for (const part of [...Object.keys(setters), 'origin']) {
+      Object.defineProperty(Element.prototype, part, {
+        configurable: true,
+        get() {
+          if (!isLink(this)) return undefined;
+          const u = linkUrl(this);
+          if (u) return u[part];
+          return part === 'protocol' ? ':' : '';
+        },
+        set(v) {
+          if (!isLink(this)) {
+            Object.defineProperty(this, part, { value: v, writable: true, enumerable: true, configurable: true });
+            return;
+          }
+          const u = linkUrl(this);
+          if (!u || !setters[part]) return;
+          setters[part](u, String(v));
+          this.setAttribute('href', u.href);
+        },
+      });
+    }
+  }
+
+  // CSSOM (CSS Object Model): the sheets of <style> and <link> elements,
+  // their rules, insertRule / deleteRule. Changes go to the browser as the
+  // sheet's new CSS (rb.setSheet); the element's text stays as it was.
+  {
+    // Top-level pieces of CSS: rules (or, in a declaration block,
+    // declarations and nested rules), without comments.
+    function splitRules(css) {
+      const out = [];
+      let depth = 0, parens = 0, start = 0, quote = '', text = '';
+      for (let i = 0; i < css.length; i++) {
+        const c = css[i];
+        if (quote) {
+          if (c === '\\') i++;
+          else if (c === quote) quote = '';
+          continue;
+        }
+        if (c === '/' && css[i + 1] === '*') {
+          text += css.slice(start, i);
+          const end = css.indexOf('*/', i + 2);
+          i = end < 0 ? css.length : end + 1;
+          start = i + 1;
+          continue;
+        }
+        if (c === '"' || c === "'") quote = c;
+        else if (c === '(') parens++;
+        else if (c === ')') parens = Math.max(0, parens - 1);
+        else if (c === '{') depth++;
+        else if (c === '}' && depth > 0 && --depth === 0) {
+          out.push(text + css.slice(start, i + 1));
+          text = '';
+          start = i + 1;
+        } else if (c === ';' && depth === 0 && parens === 0) {
+          out.push(text + css.slice(start, i + 1));
+          text = '';
+          start = i + 1;
+        }
+      }
+      out.push(text + css.slice(start));
+      return out.map((r) => r.trim()).filter((r) => r && r !== ';');
+    }
+
+    function ruleList(rules) {
+      Object.defineProperty(rules, 'item', { value: (i) => rules[i] ?? null });
+      return rules;
+    }
+
+    function syntaxError(text) {
+      return new DOMException("Failed to parse the rule '" + text + "'.", 'SyntaxError');
+    }
+
+    class CSSRule {
+      constructor(sheet, parent) {
+        this.parentStyleSheet = sheet;
+        this.parentRule = parent;
+      }
+      _sync() { if (this.parentStyleSheet) this.parentStyleSheet._sync(); }
+    }
+    Object.assign(CSSRule, {
+      STYLE_RULE: 1, CHARSET_RULE: 2, IMPORT_RULE: 3, MEDIA_RULE: 4, FONT_FACE_RULE: 5,
+      PAGE_RULE: 6, KEYFRAMES_RULE: 7, KEYFRAME_RULE: 8, NAMESPACE_RULE: 10, SUPPORTS_RULE: 12,
+    });
+
+    // A rule kept as text (@font-face, @keyframes, @import, …).
+    class CSSTextRule extends CSSRule {
+      constructor(sheet, parent, text, type) {
+        super(sheet, parent);
+        this._text = text;
+        this.type = type;
+      }
+      get cssText() { return this._text; }
+    }
+    class CSSImportRule extends CSSTextRule {
+      get href() { return (/^@import\s+(?:url\()?\s*["']?([^"')\s;]*)/i.exec(this._text) || [])[1] || ''; }
+    }
+    class CSSFontFaceRule extends CSSTextRule {}
+    class CSSKeyframesRule extends CSSTextRule {
+      get name() { return (/^@[-\w]*keyframes\s+([^\s{]+)/i.exec(this._text) || [])[1] || ''; }
+    }
+    const textRules = {
+      'import': [CSSImportRule, 3], 'charset': [CSSTextRule, 2], 'font-face': [CSSFontFaceRule, 5],
+      'page': [CSSTextRule, 6], 'keyframes': [CSSKeyframesRule, 7], '-webkit-keyframes': [CSSKeyframesRule, 7],
+      'namespace': [CSSTextRule, 10],
+    };
+
+    const kebab = (p) => p.startsWith('--') ? p : p.replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
+
+    // The declarations of a style rule.
+    class CSSRuleStyle {
+      constructor(rule, decls) {
+        this._rule = rule;
+        this._decls = decls;
+        return new Proxy(this, {
+          get(t, p) {
+            if (typeof p !== 'string' || p in t || /^\d+$/.test(p)) return /^\d+$/.test(p) ? t.item(+p) : t[p];
+            return t.getPropertyValue(kebab(p));
+          },
+          set(t, p, v) {
+            if (typeof p !== 'string' || p.startsWith('_') || p in CSSRuleStyle.prototype) t[p] = v;
+            else t.setProperty(kebab(p), v);
+            return true;
+          },
+        });
+      }
+      get length() { return this._decls.length; }
+      item(i) { return this._decls[i] ? this._decls[i].name : ''; }
+      getPropertyValue(name) {
+        const d = this._decls.find((d) => d.name === String(name).trim());
+        return d ? d.value : '';
+      }
+      getPropertyPriority(name) {
+        const d = this._decls.find((d) => d.name === String(name).trim());
+        return d && d.important ? 'important' : '';
+      }
+      setProperty(name, value, priority = '') {
+        name = String(name).trim();
+        if (!name.startsWith('--')) name = name.toLowerCase();
+        value = value === null || value === undefined ? '' : String(value).trim();
+        const i = this._decls.findIndex((d) => d.name === name);
+        if (value === '') {
+          if (i >= 0) this._decls.splice(i, 1);
+        } else {
+          const d = { name, value, important: String(priority).toLowerCase() === 'important' };
+          if (i >= 0) this._decls[i] = d;
+          else this._decls.push(d);
+        }
+        this._rule._sync();
+      }
+      removeProperty(name) {
+        const old = this.getPropertyValue(name);
+        this.setProperty(name, '');
+        return old;
+      }
+      get cssText() {
+        return this._decls.map((d) => d.name + ': ' + d.value + (d.important ? ' !important' : '') + ';').join(' ');
+      }
+      set cssText(v) {
+        this._decls = parseDecls(splitRules(String(v)));
+        this._rule._sync();
+      }
+    }
+
+    function parseDecls(parts) {
+      const decls = [];
+      for (let part of parts) {
+        part = part.replace(/;$/, '');
+        const colon = part.indexOf(':');
+        if (colon < 0) continue;
+        let name = part.slice(0, colon).trim();
+        if (!name.startsWith('--')) name = name.toLowerCase();
+        let value = part.slice(colon + 1).trim();
+        const important = /!\s*important$/i.test(value);
+        if (important) value = value.replace(/\s*!\s*important$/i, '');
+        if (name) decls.push({ name, value, important });
+      }
+      return decls;
+    }
+
+    class CSSStyleRule extends CSSRule {
+      constructor(sheet, parent, selector, body) {
+        super(sheet, parent);
+        this._selector = selector;
+        const parts = splitRules(body);
+        this._nested = parts.filter((p) => p.includes('{'));
+        this._style = new CSSRuleStyle(this, parseDecls(parts.filter((p) => !p.includes('{'))));
+      }
+      get type() { return 1; }
+      get selectorText() { return this._selector; }
+      set selectorText(v) { this._selector = String(v).trim(); this._sync(); }
+      get style() { return this._style; }
+      set style(v) { this._style.cssText = v; }
+      get cssText() {
+        const body = [this._style.cssText, ...this._nested].filter(Boolean).join(' ');
+        return this._selector + ' { ' + (body ? body + ' ' : '') + '}';
+      }
+    }
+
+    // @media, @supports, @layer, @container … blocks.
+    class CSSGroupingRule extends CSSRule {
+      constructor(sheet, parent, name, prelude, body) {
+        super(sheet, parent);
+        this._name = name;
+        this._prelude = prelude;
+        this._rules = ruleList(splitRules(body).map((t) => parseRule(t, sheet, this)));
+      }
+      get type() { return 0; }
+      get cssRules() { return this._rules; }
+      insertRule(rule, index = 0) {
+        insertInto(this._rules, rule, index, this.parentStyleSheet, this);
+        this._sync();
+        return index;
+      }
+      deleteRule(index) {
+        removeFrom(this._rules, index);
+        this._sync();
+      }
+      get cssText() {
+        const head = '@' + this._name + (this._prelude ? ' ' + this._prelude : '');
+        const body = this._rules.map((r) => r.cssText).join(' ');
+        return head + ' { ' + (body ? body + ' ' : '') + '}';
+      }
+    }
+    class CSSConditionRule extends CSSGroupingRule {
+      get conditionText() { return this._prelude; }
+    }
+    class CSSMediaRule extends CSSConditionRule {
+      get type() { return 4; }
+      get media() {
+        const rule = this;
+        return {
+          get mediaText() { return rule._prelude; },
+          set mediaText(v) { rule._prelude = String(v).trim(); rule._sync(); },
+          get length() { return rule._prelude ? rule._prelude.split(',').length : 0; },
+          toString() { return rule._prelude; },
+        };
+      }
+    }
+    class CSSSupportsRule extends CSSConditionRule {
+      get type() { return 12; }
+    }
+    const groupingRules = {
+      'media': CSSMediaRule, 'supports': CSSSupportsRule, 'container': CSSConditionRule,
+      'layer': CSSGroupingRule, 'scope': CSSGroupingRule, 'starting-style': CSSGroupingRule,
+      'document': CSSGroupingRule, '-moz-document': CSSGroupingRule,
+    };
+
+    function parseRule(text, sheet, parent) {
+      const brace = text.indexOf('{');
+      if (text[0] === '@') {
+        const name = ((/^@([-\w]+)/.exec(text) || [])[1] || '').toLowerCase();
+        const prelude = (brace < 0 ? text.replace(/;$/, '') : text.slice(0, brace)).slice(name.length + 1).trim();
+        const Group = groupingRules[name];
+        if (Group && brace >= 0) {
+          return new Group(sheet, parent, name, prelude, text.slice(brace + 1, text.lastIndexOf('}')));
+        }
+        const [Rule, type] = textRules[name] || [CSSTextRule, 0];
+        return new Rule(sheet, parent, text, type);
+      }
+      if (brace <= 0 || !text.endsWith('}')) throw syntaxError(text);
+      return new CSSStyleRule(sheet, parent, text.slice(0, brace).trim(), text.slice(brace + 1, -1));
+    }
+
+    function insertInto(rules, text, index, sheet, parent) {
+      index = Number(index) >>> 0;
+      if (index > rules.length) {
+        throw new DOMException('The index provided (' + index + ') is larger than the maximum index (' + rules.length + ').', 'IndexSizeError');
+      }
+      const pieces = splitRules(String(text));
+      if (pieces.length !== 1) throw syntaxError(String(text));
+      rules.splice(index, 0, parseRule(pieces[0], sheet, parent));
+    }
+
+    function removeFrom(rules, index) {
+      index = Number(index) >>> 0;
+      if (index >= rules.length) {
+        throw new DOMException('The index provided (' + index + ') is outside the range [0, ' + rules.length + ').', 'IndexSizeError');
+      }
+      rules.splice(index, 1);
+    }
+
+    const crossOrigin = (href) => {
+      try { return new URL(href, location.href).origin !== location.origin; } catch (_) { return true; }
+    };
+
+    class StyleSheet {}
+    class CSSStyleSheet extends StyleSheet {
+      constructor() {
+        super();
+        this._owner = null;
+        this._text = null;
+        this._rules = ruleList([]);
+        this.disabled = false;
+      }
+      get type() { return 'text/css'; }
+      get ownerNode() { return this._owner; }
+      get ownerRule() { return null; }
+      get parentStyleSheet() { return null; }
+      get href() { return this._owner && this._owner.localName === 'link' ? this._owner.href : null; }
+      get title() { return this._owner ? this._owner.getAttribute('title') : null; }
+      get media() {
+        const text = (this._owner && this._owner.getAttribute('media')) || '';
+        return { mediaText: text, length: text ? text.split(',').length : 0, toString: () => text };
+      }
+      get cssRules() {
+        const owner = this._owner;
+        if (owner) {
+          if (owner.localName === 'link' && crossOrigin(owner.href)) {
+            throw new DOMException("Failed to read the 'cssRules' property from 'CSSStyleSheet': Cannot access rules", 'SecurityError');
+          }
+          const text = rb.sheetText(owner.__h);
+          if (text !== null && text !== this._text) {
+            this._text = text;
+            this._rules = ruleList(splitRules(text).map((t) => parseRule(t, this, null)));
+          }
+        }
+        return this._rules;
+      }
+      get rules() { return this.cssRules; }
+      insertRule(rule, index = 0) {
+        insertInto(this.cssRules, rule, index, this, null);
+        this._sync();
+        return Number(index) >>> 0;
+      }
+      deleteRule(index) {
+        removeFrom(this.cssRules, index);
+        this._sync();
+      }
+      addRule(selector = 'undefined', style = 'undefined', index) {
+        this.insertRule(selector + ' { ' + style + ' }', index === undefined ? this.cssRules.length : index);
+        return -1;
+      }
+      removeRule(index = 0) { this.deleteRule(index); }
+      replaceSync(text) {
+        // Constructed sheets do not load @import rules.
+        const pieces = splitRules(String(text)).filter((t) => !/^@import\b/i.test(t));
+        this._rules = ruleList(pieces.map((t) => parseRule(t, this, null)));
+        this._sync();
+      }
+      replace(text) {
+        try {
+          this.replaceSync(text);
+          return Promise.resolve(this);
+        } catch (e) {
+          return Promise.reject(e);
+        }
+      }
+      _sync() {
+        this._text = this._rules.map((r) => r.cssText).join('\n');
+        if (this._owner) rb.setSheet(this._owner.__h, this._text);
+      }
+    }
+
+    // HTMLStyleElement / HTMLLinkElement .sheet: one per element, null
+    // until the element is in the document (and a link has loaded).
+    const sheets = new Map();
+    Object.defineProperty(Element.prototype, 'sheet', {
+      configurable: true,
+      get() {
+        const name = this.localName;
+        if (name !== 'style' && name !== 'link') return undefined;
+        if (!this.isConnected) return null;
+        if (name === 'link' && !/(^|\s)stylesheet(\s|$)/i.test(this.getAttribute('rel') || '')) return null;
+        if (rb.sheetText(this.__h) === null) return null;
+        let sheet = sheets.get(this.__h);
+        if (!sheet) {
+          sheet = new CSSStyleSheet();
+          sheet._owner = this;
+          sheets.set(this.__h, sheet);
+        }
+        return sheet;
+      },
+    });
+    Object.defineProperty(Document.prototype, 'styleSheets', {
+      configurable: true,
+      get() {
+        const list = [];
+        for (const el of this.querySelectorAll('style, link')) {
+          const sheet = el.sheet;
+          if (sheet) list.push(sheet);
+        }
+        return ruleList(list);
+      },
+    });
+
+    Object.assign(global, {
+      StyleSheet, CSSStyleSheet, CSSRule, CSSStyleRule, CSSGroupingRule, CSSConditionRule,
+      CSSMediaRule, CSSSupportsRule, CSSImportRule, CSSFontFaceRule, CSSKeyframesRule,
+    });
   }
 
   // URL: absolute URLs, or relative ones resolved against a base.
