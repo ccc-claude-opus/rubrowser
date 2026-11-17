@@ -323,7 +323,9 @@ fn decode(
                 for row in 0..oh as usize {
                     let line = &data[row * stride..row * stride + ow as usize * 4];
                     rgb.extend(
-                        line.chunks_exact(4)
+                        line.as_chunks::<4>()
+                            .0
+                            .iter()
                             .map(|p| (p[2] as u32) << 16 | (p[1] as u32) << 8 | p[0] as u32),
                     );
                 }
@@ -382,7 +384,9 @@ fn decode(
                 let mut q = shared.samples.lock().unwrap();
                 q.extend(
                     bytes
-                        .chunks_exact(4)
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
                         .map(|b| f32::from_ne_bytes([b[0], b[1], b[2], b[3]])),
                 );
             }

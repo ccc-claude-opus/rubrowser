@@ -465,6 +465,8 @@ struct Tab {
     doc: Document,
     /// Increases with every navigation, to drop stale fetch results.
     serial: u64,
+    /// Increases with every document shown in the tab.
+    page: u64,
     loading: bool,
     /// The page's wasm scripts (`None` once a script has crashed).
     scripts: Vec<Option<Script>>,
@@ -541,6 +543,8 @@ pub struct Browser {
     requests: HashMap<u32, Request>,
     keyboard: Target,
     pointer: (f32, f32),
+    /// The (tab, document) the pointer's hover was last worked out for.
+    hovered: (u64, u64),
     press: Option<Press>,
     mods: Modifiers,
     /// Time the caret last became visible (it blinks from there).
@@ -578,6 +582,7 @@ impl Browser {
             requests: HashMap::new(),
             keyboard: Target::Page,
             pointer: (-1.0, -1.0),
+            hovered: (0, 0),
             press: None,
             mods: Modifiers::default(),
             caret_epoch: 0.0,
@@ -617,6 +622,7 @@ impl Browser {
             index: 0,
             doc: Document::from_html("", url),
             serial: 0,
+            page: 0,
             loading: false,
             scripts: Vec::new(),
             timers: Vec::new(),
@@ -770,6 +776,7 @@ impl Browser {
         let vp = self.viewport_rect();
         let tab = &mut self.tabs[i];
         tab.loading = false;
+        tab.page += 1;
         tab.doc = Document::from_html(html, url);
         // Scripts see the viewport (`matchMedia`, `innerWidth`) from the start.
         tab.doc.set_viewport(vp.w, vp.h);
@@ -2820,6 +2827,18 @@ impl Browser {
     pub fn render(&mut self, now: f64, host: &mut dyn Host) -> &Canvas {
         self.now = now;
         self.update_layout(host);
+        // A new document (or tab) under a pointer that has not moved: hover
+        // it as if the pointer moved, so the status bubble and :hover
+        // follow the page shown.
+        let shown = (self.tabs[self.active].id, self.tabs[self.active].page);
+        if shown != self.hovered {
+            self.hovered = shown;
+            if self.pointer.0 >= 0.0 && self.press.is_none() {
+                let (x, y) = self.pointer;
+                self.mouse_move(x, y, host);
+                self.update_layout(host);
+            }
+        }
         let caret = self.caret_on();
         let focus_chrome = self.keyboard == Target::Chrome;
         self.chrome.caret_on = caret && focus_chrome;
@@ -4554,6 +4573,39 @@ mod tests {
         b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
         b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
         assert!(find(&h, "https://other.test/").is_some());
+    }
+
+    #[test]
+    fn hover_follows_a_new_page_under_a_still_pointer() {
+        let (mut b, mut h) = browser();
+        let status = |b: &Browser| {
+            let s = b.chrome_el("status").unwrap();
+            b.chrome.dom.text_content(s)
+        };
+        b.navigate("https://one.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = "<a id=a href='/next' style='display:block;height:300px'>link</a>";
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let (x, y) = (300, (vp.y + 100.0) as i32);
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        assert_eq!(status(&b), "https://one.test/next");
+
+        // The next page has no link there: the bubble goes away without
+        // the pointer moving.
+        b.navigate("https://two.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(b"<p>plain</p>".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(status(&b), "");
+
+        // One with a link under the pointer shows it.
+        b.navigate("https://three.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(status(&b), "https://three.test/next");
     }
 
     #[test]

@@ -1,0 +1,6 @@
+<!doctype html><title>ruvm js</title><style>body{font-family:sans-serif;margin:24px}</style>
+<h1 id=h>waiting for JavaScript…</h1>
+<script>
+let s = 0; for (let i = 0; i < 100000; i++) s += i;
+document.getElementById('h').textContent = 'JavaScript ran: sum = ' + s + ', ' + navigator.userAgent.split(' ').pop();
+</script>

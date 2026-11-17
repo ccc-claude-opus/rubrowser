@@ -1066,7 +1066,7 @@ impl Document {
                 let data = unb64(args.get(4)?);
                 let (cw, ch) = (c.size().0 as i64, c.size().1 as i64);
                 let px = c.pixmap.pixels_mut();
-                for (k, rgba) in data.chunks_exact(4).enumerate() {
+                for (k, rgba) in data.as_chunks::<4>().0.iter().enumerate() {
                     let (col, row) = (x + k as i64 % w.max(1), y + k as i64 / w.max(1));
                     if row < 0 || col < 0 || row >= ch || col >= cw {
                         continue;

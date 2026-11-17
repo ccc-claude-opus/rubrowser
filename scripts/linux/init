@@ -1,0 +1,25 @@
+#!/bin/sh
+# /sbin/init for the Debian 13 root under ruvm: a few checks, then power off.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C.UTF-8
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp
+echo "== os"
+. /etc/os-release && echo "$PRETTY_NAME"
+uname -a
+echo "== dynamically linked Debian programs"
+ls --version | head -1
+bash -c 'echo "bash $BASH_VERSION"'
+echo "packages: $(dpkg-query -W | wc -l)"
+echo "== rubrowser"
+for page in page js; do
+    start=$(date +%s)
+    rubrowser --screenshot /root/$page.png --timeout 5 file:///root/$page.html
+    echo "rubrowser $page.html: exit $? in $(( $(date +%s) - start )) s"
+done
+ls -l /root/*.png
+sync
+echo "== done"
+echo o > /proc/sysrq-trigger
+sleep 10
