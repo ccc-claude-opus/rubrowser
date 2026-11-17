@@ -1,0 +1,36 @@
+#!/bin/sh
+# /sbin/init for the rucloud root under ruvm (scripts/linux/rucloud-ruvm.sh): Debian 13 + Node 24;
+# sets up the user-mode network, starts the D1 template app on 0.0.0.0:8787 and checks it.
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin HOME=/root LANG=C.UTF-8
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+mount -t tmpfs tmpfs /tmp
+bb=/opt/busybox
+$bb ifconfig lo 127.0.0.1 up
+$bb ifconfig eth0 10.0.2.15 netmask 255.255.255.0 up
+$bb route add default gw 10.0.2.2
+echo "nameserver 10.0.2.3" > /etc/resolv.conf
+. /etc/os-release
+echo "== $PRETTY_NAME, $(uname -r), $(nproc) CPUs, node $(node --version), $(rucloud --version 2>&1)"
+cd /root
+rucloud init demo -t d1 > /dev/null && echo "== rucloud init demo -t d1: ok"
+start=$(date +%s)
+rucloud dev demo --d1-migrate --bind 0.0.0.0 > /tmp/rucloud.log 2>&1 &
+node -e '
+const go = async () => {
+  for (let i = 0; i < 200; i++) {
+    try { const r = await fetch("http://127.0.0.1:8787/api/todos"); if (r.ok) return; } catch {}
+    await new Promise(r => setTimeout(r, 100));
+  }
+  throw new Error("rucloud did not start");
+};
+go().then(async () => {
+  const add = await fetch("http://127.0.0.1:8787/api/todos", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: "inside ruvm" }) });
+  console.log("POST /api/todos", add.status, await add.text());
+  const all = await fetch("http://127.0.0.1:8787/api/todos");
+  console.log("GET /api/todos", all.status, await all.text());
+})'
+echo "== rucloud ready after $(( $(date +%s) - start )) s"
+echo RUCLOUD-READY
+sleep infinity

@@ -21,7 +21,7 @@ cargo install rubrowser
 rubrowser
 ```
 
-It runs on macOS and Linux (X11 or Wayland; building needs a C compiler). [doc/linux.md](doc/linux.md) covers cross-building for Linux from macOS, testing in Debian 13 with Docker, and booting that Debian in the [ruvm](https://github.com/ccc-claude-opus/ruvm) emulator to run rubrowser there.
+It runs on macOS and Linux (X11 or Wayland; building needs a C compiler). [doc/linux.md](doc/linux.md) covers cross-building for Linux from macOS, testing in Debian 13 with Docker, and booting that Debian in the [ruvm](https://github.com/ccc-claude-opus/ruvm) emulator to run rubrowser there. [doc/system.md](doc/system.md) plans a phone + desktop system with rubrowser as the only interface, [rucloud](https://github.com/ccc-claude-opus/rucloud) for apps and services, and Linux in ruvm.
 
 To play audio and video, build with the `media` feature, which uses FFmpeg (install FFmpeg 8 first, e.g. `brew install ffmpeg`):
 

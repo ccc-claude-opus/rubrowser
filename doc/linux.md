@@ -46,6 +46,15 @@ scripts/linux/ruvm-boot.sh ~/path/to/ruvm           # 開機、截圖、關機
 
 ruvm 不需要修改：Debian 的 glibc、bash、coreutils、dpkg，以及 rubrowser（含 wasmtime 的 Cranelift JIT 在模擬的 CPU 上產生並執行機器碼）都正常執行，截圖與原生執行的結果相同。
 
+ruvm 1.2 起可以不用直譯器，改用主機的硬體虛擬化（macOS 的 Hypervisor.framework、Linux 的 KVM），客體指令直接在 CPU 上執行：
+
+```bash
+(cd ~/path/to/ruvm && cargo build --release && tools/hvf-sign.sh)   # macOS：簽上 hypervisor entitlement
+scripts/linux/ruvm-boot.sh ~/path/to/ruvm hvf                        # 或 kvm（ARM64 Linux 主機），4 個 CPU
+```
+
+截圖與直譯器的結果逐位元組相同。做法見 ruvm 的 [doc/v1.2.md](https://github.com/ccc-claude-opus/ruvm/blob/main/doc/v1.2.md)。
+
 ## 4. 量測（2026-11-18，M3 iMac）
 
 | 項目 | 時間 |
@@ -57,5 +66,7 @@ ruvm 不需要修改：Debian 的 glibc、bash、coreutils、dpkg，以及 rubro
 | ruvm：靜態網頁 | 客體時間 278 秒 |
 | ruvm：JS 網頁（含 Cranelift 編譯 `js.wasm`） | 客體時間 5,746 秒 |
 | ruvm：整個流程（開機、兩頁、關機） | 實際 9 分 38 秒，約 617 億條指令（每秒約 1.07 億條） |
+| ruvm `-accel hvf`：靜態網頁 / JS 網頁 | 0.2 秒 / 2.0 秒（4 CPU；1 CPU 時 JS 網頁 4.0 秒） |
+| ruvm `-accel hvf`：整個流程（含取出截圖） | 實際 4.4 秒（4 CPU） |
 
 ruvm 的時鐘每條指令前進一格（以 10 MHz 計），所以客體時間是「指令數 ÷ 1000 萬」，不是實際經過的時間。JS 網頁慢，是因為 wasmtime 第一次要在模擬的 CPU 上把 6.6 MB 的 `js.wasm` 編成機器碼。
