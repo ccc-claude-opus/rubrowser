@@ -1382,6 +1382,34 @@ impl Builder<'_> {
                 col_widths[col] = Some(col_widths[col].map_or(w, |o: f32| o.max(w)));
             }
         }
+        // table-layout: fixed (CSS 2.1 17.5.2.1): the table's width and the
+        // first row's cell widths decide the columns; the rest share what is
+        // left equally, whatever the cells contain.
+        let fixed_tracks = (css.table_layout_fixed && css.width != Dim::Auto).then(|| {
+            let mut tracks: Vec<Option<TrackSizingFunction>> = vec![None; ncols];
+            for &(cell, r, col, _, span) in &cells {
+                if r != 0 || span != 1 {
+                    continue;
+                }
+                let Some(st) = self.style(cell) else { continue };
+                let pad = st.padding[cs::LEFT].px_or_zero(0.0)
+                    + st.padding[cs::RIGHT].px_or_zero(0.0)
+                    + st.border(cs::LEFT)
+                    + st.border(cs::RIGHT);
+                tracks[col] = match st.width {
+                    Dim::Px(w) => Some(length(match st.box_sizing {
+                        cs::BoxSizing::BorderBox => w,
+                        cs::BoxSizing::ContentBox => w + pad,
+                    })),
+                    Dim::Percent(p) => Some(percent(p / 100.0)),
+                    _ => None,
+                };
+            }
+            tracks
+                .into_iter()
+                .map(|t| GridTemplateComponent::Single(t.unwrap_or_else(|| minmax(length(0.0), fr(1.0)))))
+                .collect::<Vec<_>>()
+        });
         let collapse = css.border_collapse;
         for (cell, r, col, rs, cs) in cells {
             let node = self.build(tree, cell);
@@ -1394,6 +1422,11 @@ impl Builder<'_> {
                 start: line(col),
                 end: spanning(cs),
             };
+            if fixed_tracks.is_some() {
+                // the column already has the cell's width: fill it
+                st.size.width = Dimension::auto();
+                st.min_size.width = LengthPercentageAuto::length(0.0);
+            }
             if collapse {
                 // Adjacent cells share one border: overlap by its width.
                 if r > 0 {
@@ -1410,7 +1443,7 @@ impl Builder<'_> {
         let gap = if collapse { 0.0 } else { css.border_spacing };
         tstyle.display = Display::Grid;
         tstyle.item_is_table = true;
-        tstyle.grid_template_columns = Self::table_columns(&col_widths);
+        tstyle.grid_template_columns = fixed_tracks.unwrap_or_else(|| Self::table_columns(&col_widths));
         tstyle.gap = Size {
             width: LengthPercentage::length(gap),
             height: LengthPercentage::length(gap),
@@ -2195,6 +2228,32 @@ mod tests {
         assert!((a.h - (c.y + c.h - b.y)).abs() < 1.0, "A spans 2 rows");
         assert!(f.y > c.y, "footer last");
         assert!(l.rect("after").y >= t.y + t.h);
+    }
+
+    #[test]
+    fn table_layout_fixed_ignores_content() {
+        // CSS 2.1 17.5.2.1: the first row's widths decide; the other columns
+        // share the rest equally, however long their content is.
+        let l = lay(
+            r#"<style>body{margin:0} table{border-spacing:0;table-layout:fixed;width:700px} td{padding:0}</style>
+               <table id=t>
+                 <tr><td id=a>a</td><td id=b>a much longer cell with plenty of words</td><td id=c style="width:100px">c</td><td id=d style="width:20%">d</td></tr>
+                 <tr><td id=e>e</td><td>f</td><td>g</td><td>h</td></tr>
+               </table>
+               <table id=u style="table-layout:fixed;width:350px;border-spacing:0">
+                 <tr><td id=u1 style="width:14.28%">1</td><td id=u2 style="width:14.28%">2 two two two two two</td><td style="width:14.28%">3</td>
+                 <td style="width:14.28%">4</td><td style="width:14.28%">5</td><td style="width:14.28%">6</td><td style="width:14.28%">7</td></tr>
+               </table>"#,
+            800.0,
+            400.0,
+        );
+        assert!((l.rect("t").w - 700.0).abs() < 1.0, "the table keeps its width: {:?}", l.rect("t"));
+        assert!((l.rect("c").w - 100.0).abs() < 1.0, "fixed column: {:?}", l.rect("c"));
+        assert!((l.rect("d").w - 140.0).abs() < 1.0, "percent column: {:?}", l.rect("d"));
+        let (a, b) = (l.rect("a"), l.rect("b"));
+        assert!((a.w - b.w).abs() < 1.0 && (a.w - 230.0).abs() < 1.0, "auto columns share the rest equally: {a:?} {b:?}");
+        assert_eq!(l.rect("e").w, a.w, "later rows follow the first row");
+        assert!((l.rect("u1").w - l.rect("u2").w).abs() < 1.0 && (l.rect("u1").w - 50.0).abs() < 1.0, "seven equal columns: {:?} {:?}", l.rect("u1"), l.rect("u2"));
     }
 
     #[test]

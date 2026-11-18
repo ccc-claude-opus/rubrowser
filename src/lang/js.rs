@@ -69,8 +69,10 @@ impl Clock for HostClock {
 struct Hooks;
 
 impl HostHooks for Hooks {
-    fn local_timezone_offset_seconds(&self, _unix_time_seconds: i64) -> i32 {
-        0
+    // Date's local time is the host's time zone (the browser's tz database).
+    fn local_timezone_offset_seconds(&self, unix_time_seconds: i64) -> i32 {
+        let m = unsafe { ffi::tz_offset([].as_ptr(), 0, unix_time_seconds as f64 * 1000.0) };
+        if m.is_finite() { (m * 60.0) as i32 } else { 0 }
     }
 }
 
@@ -535,6 +537,19 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             Ok(JsValue::undefined())
         }),
         ("now", 0, |_, _, _| Ok(unsafe { ffi::now() }.into())),
+        // Time zones for Intl: the host's IANA name, a zone's offset in
+        // minutes at a time (NaN: unknown zone), the names the browser knows.
+        ("tzLocal", 0, |_, _, _| {
+            Ok(string(&read_string(|p, n| unsafe { ffi::tz_local(p, n) }).unwrap_or_default()))
+        }),
+        ("tzOffset", 2, |_, a, c| {
+            let name = text(a, 0, c)?;
+            let ms = num(a, 1, c)?;
+            Ok(unsafe { ffi::tz_offset(name.as_ptr(), name.len(), ms) }.into())
+        }),
+        ("tzNames", 0, |_, _, _| {
+            Ok(string(&read_string(|p, n| unsafe { ffi::tz_names(p, n) }).unwrap_or_default()))
+        }),
         ("location", 0, |_, _, _| {
             Ok(string(
                 &read_string(|p, n| unsafe { ffi::location(p, n) }).unwrap_or_default(),

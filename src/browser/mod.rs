@@ -3949,6 +3949,14 @@ mod tests {
               log('d5 ' + f({ hour: 'numeric', minute: '2-digit', hour12: false }));
               log('d6 ' + new Intl.DateTimeFormat('en', { ...tz, month: 'long', year: 'numeric' }).formatToParts(d).map((p) => p.type).join());
               log('d7 ' + d.toLocaleDateString('en-US', { ...tz, weekday: 'short', month: 'short', day: 'numeric' }));
+              log('z1 ' + new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', minute: '2-digit' }).format(d));
+              log('z2 ' + new Intl.DateTimeFormat('en-US', { timeZone: 'America/New_York', dateStyle: 'short', timeStyle: 'short' }).format(d));
+              log('z3 ' + new Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Taipei', dateStyle: 'medium', timeStyle: 'short' }).format(d));
+              log('z4 ' + Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Tokyo', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(d));
+              const zh = (o) => new Intl.DateTimeFormat('zh-TW', { ...tz, ...o }).format(d);
+              log('z7 ' + [zh({ dateStyle: 'full', timeStyle: 'short' }), zh({ dateStyle: 'short', timeStyle: 'short' }), zh({ month: 'numeric', day: 'numeric', weekday: 'short' }), zh({ weekday: 'long', hour: 'numeric' }), zh({ year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'long' }), zh({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })].join(' | '));
+              try { new Intl.DateTimeFormat('en-US', { timeZone: 'Nowhere/Atlantis' }); } catch (e) { log('z5 ' + e.name); }
+              log('z6 ' + Intl.supportedValuesOf('timeZone').includes('Europe/London'));
               const n = (v, o) => new Intl.NumberFormat('en-US', o).format(v);
               log('n1 ' + n(1234567.891));
               log('n2 ' + n(0.256, { style: 'percent' }));
@@ -3968,10 +3976,17 @@ mod tests {
             "d1 11/3/2026",
             "d2 Nov 3",
             "d3 Nov 3, 2026",
-            "d4 Tuesday, November 3, 2026, 2:05 PM",
+            "d4 Tuesday, November 3, 2026 at 2:05 PM",
             "d5 14:05",
             "d6 month,literal,year",
             "d7 Tue, Nov 3",
+            "z1 10:05 PM",
+            "z2 11/3/26, 9:05 AM",
+            "z3 2026年11月3日 晚上10:05",
+            "z4 2026年11月3日星期二",
+            "z5 RangeError",
+            "z6 true",
+            "z7 2026年11月3日 星期二 下午2:05 | 2026/11/3 下午2:05 | 11/3（週二） | 星期二下午2時 | 2026年11月3日 星期二 | 14:05",
             "n1 1,234,567.891",
             "n2 26%",
             "n3 -$1,234.50",

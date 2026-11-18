@@ -11,6 +11,8 @@
 // wasmtime's typed functions are cloned; wasmi's are `Copy`.
 #![cfg_attr(not(feature = "native"), allow(clippy::clone_on_copy))]
 
+mod tz;
+
 #[cfg(not(feature = "native"))]
 use wasmi as engine;
 #[cfg(feature = "native")]
@@ -1241,6 +1243,18 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
     })?;
     l.func_wrap("rb", "wall_time", |mut c: C| -> f64 {
         script_time(&mut c) + c.data().wall_offset
+    })?;
+    // Time zones: the host's IANA name, a zone's offset in minutes at a
+    // time (NaN for an unknown zone; "" is the host's zone), the known names.
+    l.func_wrap("rb", "tz_local", |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+        write_str(&mut c, p, cap, &tz::local_name())
+    })?;
+    l.func_wrap("rb", "tz_offset", |c: C, p: i32, n: i32, unix_ms: f64| -> Result<f64, Error> {
+        let name = read_str(&c, p, n)?;
+        Ok(tz::offset_minutes(&name, unix_ms).unwrap_or(f64::NAN))
+    })?;
+    l.func_wrap("rb", "tz_names", |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+        write_str(&mut c, p, cap, &tz::names().join("\n"))
     })?;
 
     // ----- ABI v1: tree navigation ---------------------------------------

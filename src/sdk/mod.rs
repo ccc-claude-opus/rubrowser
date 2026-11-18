@@ -93,6 +93,9 @@ imports! {
     fn log(p: *const u8, n: usize);
     fn now() -> f64;
     fn wall_time() -> f64;
+    fn tz_local(p: *mut u8, cap: usize) -> i32;
+    fn tz_offset(p: *const u8, n: usize, unix_ms: f64) -> f64;
+    fn tz_names(p: *mut u8, cap: usize) -> i32;
     // Whether the browser asked the running call to stop (it ran too
     // long): runtimes then end it at their next safe point.
     fn interrupted() -> i32;

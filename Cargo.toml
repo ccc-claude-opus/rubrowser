@@ -29,7 +29,7 @@ core = [
     "dep:rustybuzz",
 ]
 # Native window version (main).
-native = ["core", "dep:wasmtime", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2", "dep:rfd"]
+native = ["core", "dep:wasmtime", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2", "dep:rfd", "dep:jiff"]
 # Audio and video playback with FFmpeg (needs FFmpeg 8 installed, e.g.
 # `brew install ffmpeg`); without it, media elements report an error.
 media = ["native", "dep:ffmpeg-next", "dep:cpal", "image/avif-native"]
@@ -49,6 +49,9 @@ arboard = { version = "3", default-features = false, optional = true }
 # The native file dialog for <input type=file> (MIT; macOS: NSOpenPanel,
 # Linux: the XDG desktop portal over D-Bus).
 rfd = { version = "0.18", optional = true }
+# Time zones for Date and Intl.DateTimeFormat (MIT OR Unlicense): reads the
+# host's IANA database (/usr/share/zoneinfo, macOS /var/db/timezone/zoneinfo).
+jiff = { version = "0.2", default-features = false, features = ["std", "tz-system", "tzdb-zoneinfo"], optional = true }
 fontdue = { version = "0.9", optional = true }
 dejavu = { version = "2.37", optional = true }
 html5ever = { version = "0.40", optional = true }

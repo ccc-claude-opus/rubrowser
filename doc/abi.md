@@ -128,6 +128,9 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `log(ptr, len)` | 輸出到主控台（原生版為 stderr，網頁版為瀏覽器 console） |
 | `now() -> f64` | 瀏覽器啟動後的毫秒數（一次呼叫中依已用的 fuel 前進） |
 | `wall_time() -> f64` | 真實時間：Unix epoch 起的毫秒數（`Date.now()`） |
+| `tz_local(ptr, cap) -> i32` | 主機的 IANA 時區名稱（例如 `Asia/Taipei`；沒有時為 `UTC`） |
+| `tz_offset(ptr, len, unix_ms: f64) -> f64` | 時區在某個時間點相對 UTC 的分鐘數（空字串為主機的時區）；不認得的時區回傳 NaN |
+| `tz_names(ptr, cap) -> i32` | 認得的時區名稱，以換行分隔（`Intl.supportedValuesOf('timeZone')`） |
 | `interrupted() -> i32` | 1：這次呼叫已用完 fuel，請在下一個安全點結束（還有一小段寬限的 fuel） |
 
 ## 4. 沙箱

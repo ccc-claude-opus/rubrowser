@@ -417,6 +417,8 @@ pub struct Style {
     pub text_transform: TextTransform,
     pub border_spacing: f32,
     pub border_collapse: bool,
+    /// `table-layout: fixed` (not inherited).
+    pub table_layout_fixed: bool,
     pub color: Rgba,
     pub font_size: f32,
     pub bold: bool,
@@ -535,6 +537,7 @@ impl Default for Style {
             text_transform: TextTransform::None,
             border_spacing: 0.0,
             border_collapse: false,
+            table_layout_fixed: false,
             color: Rgba::BLACK,
             font_size: 16.0,
             bold: false,
@@ -1393,6 +1396,7 @@ impl Style {
                 }
             }
             "border-collapse" => self.border_collapse = v == "collapse",
+            "table-layout" => self.table_layout_fixed = v == "fixed",
             _ => {}
         }
     }
@@ -1633,6 +1637,7 @@ impl Style {
             "vertical-align" => self.vertical_align = from.vertical_align,
             "border-spacing" => self.border_spacing = from.border_spacing,
             "border-collapse" => self.border_collapse = from.border_collapse,
+            "table-layout" => self.table_layout_fixed = from.table_layout_fixed,
             "flex-grow" => self.flex_grow = from.flex_grow,
             "flex-shrink" => self.flex_shrink = from.flex_shrink,
             "flex-basis" => self.flex_basis = from.flex_basis,

@@ -2509,8 +2509,9 @@
     hasFeature() { return true; },
   };
 
-  // Intl (ECMA-402) with English (en-US) data only: other locales format
-  // as en-US, which `resolvedOptions().locale` reports.
+  // Intl (ECMA-402) with English (en-US) data, plus Traditional Chinese
+  // (zh-TW) dates: other locales format as en-US, which
+  // `resolvedOptions().locale` reports.
   const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
     'August', 'September', 'October', 'November', 'December'];
   const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -2631,10 +2632,27 @@
     get() { const f = (n) => this.formatToParts(n).map((p) => p.value).join(''); return f; },
   });
 
+  // Time zones come from the browser's IANA database (__rb.tzOffset gives a
+  // zone's offset in minutes at a time, NaN for an unknown zone).
+  let localZone;
+  const hostZone = () => localZone || (localZone = (global.__rb && __rb.tzLocal && __rb.tzLocal()) || 'UTC');
+  const zoneOffset = (zone, ms) => (zone === 'UTC' ? 0 : __rb.tzOffset(zone, ms));
+  function canonicalZone(z) {
+    const s = String(z);
+    if (/^(utc|etc\/utc|gmt|etc\/gmt|z|etc\/universal|universal)$/i.test(s)) return 'UTC';
+    if (!global.__rb || !__rb.tzOffset || Number.isNaN(__rb.tzOffset(s, 0))) throw new RangeError('Invalid time zone specified: ' + s);
+    return s;
+  }
+  // Traditional Chinese (zh-TW) data; every other locale formats as en-US.
+  const ZH_DAYS = ['日', '一', '二', '三', '四', '五', '六'];
+  const isZh = (l) => /^zh(-|$)/i.test(l);
+
   class DateTimeFormat {
     constructor(locale, opts) {
       const o = Object.assign({}, opts);
-      this.timeZone = o.timeZone && String(o.timeZone).toUpperCase() === 'UTC' ? 'UTC' : undefined;
+      const req = [].concat(locale === undefined ? [] : locale).map(String);
+      this.locale = req.length && isZh(req[0]) ? 'zh-TW' : 'en-US';
+      this.timeZone = o.timeZone === undefined ? hostZone() : canonicalZone(o.timeZone);
       const fields = ['weekday', 'era', 'year', 'month', 'day', 'hour', 'minute', 'second', 'fractionalSecondDigits', 'timeZoneName', 'dayPeriod'];
       this.o = {};
       for (const f of fields) if (o[f] !== undefined) this.o[f] = o[f];
@@ -2644,8 +2662,9 @@
       if (!this.dateStyle && !this.timeStyle && !Object.keys(this.o).some((k) => k !== 'timeZoneName' && k !== 'era')) {
         this.o.year = 'numeric'; this.o.month = 'numeric'; this.o.day = 'numeric';
       }
+      const zh = this.locale === 'zh-TW';
       const ds = { full: { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }, long: { year: 'numeric', month: 'long', day: 'numeric' },
-        medium: { year: 'numeric', month: 'short', day: 'numeric' }, short: { year: '2-digit', month: 'numeric', day: 'numeric' } };
+        medium: { year: 'numeric', month: zh ? 'long' : 'short', day: 'numeric' }, short: { year: zh ? 'numeric' : '2-digit', month: 'numeric', day: 'numeric' } };
       const ts = { full: { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'long' }, long: { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' },
         medium: { hour: 'numeric', minute: '2-digit', second: '2-digit' }, short: { hour: 'numeric', minute: '2-digit' } };
       if (this.dateStyle) Object.assign(this.o, ds[this.dateStyle]);
@@ -2655,9 +2674,12 @@
     formatToParts(date) {
       const d = date === undefined ? new Date() : new Date(typeof date === 'object' ? date.valueOf() : date);
       if (Number.isNaN(d.getTime())) throw new RangeError('Invalid time value');
-      const utc = this.timeZone === 'UTC';
-      const get = (f) => (utc ? d['getUTC' + f]() : d['get' + f]());
+      // the wall-clock time in this.timeZone, read with the UTC getters
+      const off = zoneOffset(this.timeZone, d.getTime()) || 0;
+      const w = new Date(d.getTime() + off * 60000);
+      const get = (f) => w['getUTC' + f]();
       const o = this.o;
+      const zh = this.locale === 'zh-TW';
       const two = (n) => String(n).padStart(2, '0');
       const out = [];
       const lit = (v) => out.push({ type: 'literal', value: v });
@@ -2665,41 +2687,86 @@
       const yv = o.year === '2-digit' ? two(year % 100) : String(year);
       const dv = o.day === '2-digit' ? two(day) : String(day);
       const textMonth = o.month === 'long' || o.month === 'short' || o.month === 'narrow';
-      const mv = o.month === 'long' ? MONTHS[month] : o.month === 'short' ? MONTHS[month].slice(0, 3) : o.month === 'narrow' ? MONTHS[month][0] :
-        o.month === '2-digit' ? two(month + 1) : String(month + 1);
-      if (o.weekday) {
-        const w = DAYS[get('Day')];
-        out.push({ type: 'weekday', value: o.weekday === 'long' ? w : o.weekday === 'short' ? w.slice(0, 3) : w[0] });
-        if (o.year || o.month || o.day || o.hour) lit(', ');
-      }
-      if (textMonth) {
-        if (o.month) out.push({ type: 'month', value: mv });
-        if (o.day) { if (o.month) lit(' '); out.push({ type: 'day', value: dv }); }
-        if (o.year) { if (o.month || o.day) lit(o.day ? ', ' : ' '); out.push({ type: 'year', value: yv }); }
+      if (zh) {
+        // CLDR zh-Hant patterns: y年M月d日 (text month, or numeric with a
+        // weekday), y/M/d, M/d（E）; dateStyle/timeStyle use flexible day
+        // periods (凌晨…晚上), single fields 上午/下午.
+        const date = [];
+        const md = (v) => (o.month === '2-digit' ? two(v) : String(v));
+        const ymd = textMonth || (o.weekday && o.year) || (o.year && !o.month && !o.day) || this.dateStyle === 'full' || this.dateStyle === 'long' || this.dateStyle === 'medium';
+        if (ymd) {
+          if (o.year) date.push({ type: 'year', value: yv }, { type: 'literal', value: '年' });
+          if (o.month) date.push({ type: 'month', value: md(month + 1) }, { type: 'literal', value: '月' });
+          if (o.day) date.push({ type: 'day', value: dv }, { type: 'literal', value: '日' });
+        } else {
+          const seq = [];
+          if (o.year) seq.push({ type: 'year', value: yv });
+          if (o.month) seq.push({ type: 'month', value: md(month + 1) });
+          if (o.day) seq.push({ type: 'day', value: dv });
+          seq.forEach((p, i) => { if (i) date.push({ type: 'literal', value: '/' }); date.push(p); });
+        }
+        out.push(...date);
+        if (o.weekday) {
+          const wd = ZH_DAYS[get('Day')];
+          const v = { type: 'weekday', value: o.weekday === 'long' ? '星期' + wd : o.weekday === 'short' ? '週' + wd : wd };
+          if (!out.length) out.push(v);
+          else if (!ymd) { lit('（'); out.push(v); lit('）'); }
+          else { if (!textMonth || this.dateStyle) lit(' '); out.push(v); }
+        }
+        if (o.hour || o.minute || o.second) {
+          if (out.length && !(o.weekday && !o.year && !o.month && !o.day)) lit(' ');
+          let h = get('Hours');
+          if (o.hour && this.hour12) {
+            const flexible = this.timeStyle !== undefined;
+            const period = !flexible ? (h < 12 ? '上午' : '下午')
+              : h < 5 ? '凌晨' : h < 8 ? '清晨' : h < 12 ? '上午' : h < 13 ? '中午' : h < 19 ? '下午' : '晚上';
+            out.push({ type: 'dayPeriod', value: period });
+            h = h % 12 || 12;
+          }
+          const t = [];
+          if (o.hour) t.push({ type: 'hour', value: o.hour === '2-digit' || (!this.hour12 && o.minute) ? two(h) : String(h) });
+          if (o.minute) t.push({ type: 'minute', value: o.hour || o.minute === '2-digit' ? two(get('Minutes')) : String(get('Minutes')) });
+          if (o.second) t.push({ type: 'second', value: o.minute || o.second === '2-digit' ? two(get('Seconds')) : String(get('Seconds')) });
+          t.forEach((p, i) => { if (i) lit(':'); out.push(p); });
+          if (o.hour && !o.minute && !o.second) lit('時');
+          if (o.fractionalSecondDigits) { lit('.'); out.push({ type: 'fractionalSecond', value: String(get('Milliseconds')).padStart(3, '0').slice(0, o.fractionalSecondDigits) }); }
+        }
       } else {
-        const seq = [];
-        if (o.month) seq.push({ type: 'month', value: mv });
-        if (o.day) seq.push({ type: 'day', value: dv });
-        if (o.year) seq.push({ type: 'year', value: yv });
-        seq.forEach((p, i) => { if (i) lit('/'); out.push(p); });
-      }
-      if (o.hour || o.minute || o.second) {
-        if (out.length) lit(', ');
-        let h = get('Hours');
-        const pm = h >= 12;
-        if (this.hour12) h = h % 12 || 12;
-        const t = [];
-        if (o.hour) t.push({ type: 'hour', value: o.hour === '2-digit' || (!this.hour12 && o.minute) ? two(h) : String(h) });
-        if (o.minute) t.push({ type: 'minute', value: o.hour || o.minute === '2-digit' ? two(get('Minutes')) : String(get('Minutes')) });
-        if (o.second) t.push({ type: 'second', value: o.minute || o.second === '2-digit' ? two(get('Seconds')) : String(get('Seconds')) });
-        t.forEach((p, i) => { if (i) lit(':'); out.push(p); });
-        if (o.fractionalSecondDigits) { lit('.'); out.push({ type: 'fractionalSecond', value: String(get('Milliseconds')).padStart(3, '0').slice(0, o.fractionalSecondDigits) }); }
-        if (o.hour && this.hour12) { lit(' '); out.push({ type: 'dayPeriod', value: pm ? 'PM' : 'AM' }); }
+        const mv = o.month === 'long' ? MONTHS[month] : o.month === 'short' ? MONTHS[month].slice(0, 3) : o.month === 'narrow' ? MONTHS[month][0] :
+          o.month === '2-digit' ? two(month + 1) : String(month + 1);
+        if (o.weekday) {
+          const wd = DAYS[get('Day')];
+          out.push({ type: 'weekday', value: o.weekday === 'long' ? wd : o.weekday === 'short' ? wd.slice(0, 3) : wd[0] });
+          if (o.year || o.month || o.day || o.hour) lit(', ');
+        }
+        if (textMonth) {
+          if (o.month) out.push({ type: 'month', value: mv });
+          if (o.day) { if (o.month) lit(' '); out.push({ type: 'day', value: dv }); }
+          if (o.year) { if (o.month || o.day) lit(o.day ? ', ' : ' '); out.push({ type: 'year', value: yv }); }
+        } else {
+          const seq = [];
+          if (o.month) seq.push({ type: 'month', value: mv });
+          if (o.day) seq.push({ type: 'day', value: dv });
+          if (o.year) seq.push({ type: 'year', value: yv });
+          seq.forEach((p, i) => { if (i) lit('/'); out.push(p); });
+        }
+        if (o.hour || o.minute || o.second) {
+          if (out.length && !(o.weekday && !o.year && !o.month && !o.day)) lit((this.dateStyle === 'full' || this.dateStyle === 'long') && this.timeStyle ? ' at ' : ', ');
+          let h = get('Hours');
+          const pm = h >= 12;
+          if (this.hour12) h = h % 12 || 12;
+          const t = [];
+          if (o.hour) t.push({ type: 'hour', value: o.hour === '2-digit' || (!this.hour12 && o.minute) ? two(h) : String(h) });
+          if (o.minute) t.push({ type: 'minute', value: o.hour || o.minute === '2-digit' ? two(get('Minutes')) : String(get('Minutes')) });
+          if (o.second) t.push({ type: 'second', value: o.minute || o.second === '2-digit' ? two(get('Seconds')) : String(get('Seconds')) });
+          t.forEach((p, i) => { if (i) lit(':'); out.push(p); });
+          if (o.fractionalSecondDigits) { lit('.'); out.push({ type: 'fractionalSecond', value: String(get('Milliseconds')).padStart(3, '0').slice(0, o.fractionalSecondDigits) }); }
+          if (o.hour && this.hour12) { lit(' '); out.push({ type: 'dayPeriod', value: pm ? 'PM' : 'AM' }); }
+        }
       }
       if (o.timeZoneName) {
         lit(' ');
-        const off = utc ? 0 : -d.getTimezoneOffset();
-        const name = off === 0 ? (o.timeZoneName === 'long' ? 'Coordinated Universal Time' : 'UTC')
+        const name = off === 0 ? (o.timeZoneName === 'long' && !zh ? 'Coordinated Universal Time' : 'UTC')
           : 'GMT' + (off > 0 ? '+' : '-') + Math.floor(Math.abs(off) / 60) + (Math.abs(off) % 60 ? ':' + two(Math.abs(off) % 60) : '');
         out.push({ type: 'timeZoneName', value: name });
       }
@@ -2707,7 +2774,7 @@
     }
     formatRange(a, b) { return this.format(a) + ' – ' + this.format(b); }
     resolvedOptions() {
-      return Object.assign({ locale: 'en-US', calendar: 'gregory', numberingSystem: 'latn', timeZone: this.timeZone || 'UTC', hour12: this.hour12, hourCycle: this.hour12 ? 'h12' : 'h23' },
+      return Object.assign({ locale: this.locale, calendar: 'gregory', numberingSystem: 'latn', timeZone: this.timeZone, hour12: this.hour12, hourCycle: this.hour12 ? 'h12' : 'h23' },
         this.dateStyle ? { dateStyle: this.dateStyle } : {}, this.timeStyle ? { timeStyle: this.timeStyle } : {}, this.dateStyle || this.timeStyle ? {} : this.o);
     }
     static supportedLocalesOf(l) { return l ? [].concat(l).slice(0, 1).map(String) : []; }
@@ -2863,10 +2930,20 @@
     minimize() { return this; }
   }
 
+  // ECMA-402: DateTimeFormat, NumberFormat and Collator may also be called
+  // without `new`.
+  const callable = (C) => {
+    const F = function (locales, options) { return new C(locales, options); };
+    F.prototype = C.prototype;
+    Object.defineProperty(C.prototype, 'constructor', { value: F, writable: true, configurable: true });
+    for (const k of Object.getOwnPropertyNames(C)) if (!['length', 'name', 'prototype'].includes(k)) F[k] = C[k];
+    Object.defineProperty(F, 'name', { value: C.name });
+    return F;
+  };
   const Intl = {
-    NumberFormat, DateTimeFormat, RelativeTimeFormat, PluralRules, Collator, ListFormat, Segmenter, DisplayNames, Locale,
+    NumberFormat: callable(NumberFormat), DateTimeFormat: callable(DateTimeFormat), RelativeTimeFormat, PluralRules, Collator: callable(Collator), ListFormat, Segmenter, DisplayNames, Locale,
     getCanonicalLocales: (l) => (l ? [].concat(l).map(String) : []),
-    supportedValuesOf: (k) => (k === 'timeZone' ? ['UTC'] : k === 'currency' ? Object.keys(CURRENCY) : []),
+    supportedValuesOf: (k) => (k === 'timeZone' ? ((global.__rb && __rb.tzNames && __rb.tzNames()) || 'UTC').split('\n') : k === 'currency' ? Object.keys(CURRENCY) : []),
   };
   // Locale-sensitive methods of built-ins go through Intl (boa without its
   // `intl` feature formats them like toString).
