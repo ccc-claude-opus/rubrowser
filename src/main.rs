@@ -1,7 +1,8 @@
 use std::time::Duration;
 
-const USAGE: &str = "usage: rubrowser [--no-js] [URL]
-       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] URL";
+const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [URL]
+       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] URL
+  --installer URL  an app installer (ruwebos's): pages declaring <link rel=\"ruwebos-app\"> get an Install button";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -13,6 +14,7 @@ fn main() {
         scale: 1.0,
         timeout: Duration::from_secs(30),
         javascript: true,
+        installer: None,
     };
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -31,6 +33,7 @@ fn main() {
                 shot.timeout = Duration::from_secs(secs);
             }
             "--no-js" => shot.javascript = false,
+            "--installer" => shot.installer = Some(value("--installer")),
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -46,7 +49,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        None => rubrowser::platform::native::run(url, shot.javascript),
+        None => rubrowser::platform::native::run(url, shot.javascript, shot.installer),
     };
     if let Err(e) = result {
         eprintln!("rubrowser: {e}");

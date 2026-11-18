@@ -28,13 +28,15 @@ const MAX_BODY: u64 = 32 << 20;
 /// Opens the browser window (showing `url` if given) and runs until closed.
 /// Opens the browser window at `url` (or the home page). `javascript`:
 /// whether web pages may run scripts.
-pub fn run(url: Option<String>, javascript: bool) -> Result<(), Box<dyn Error>> {
+/// `installer`: an app installer's URL (see [`Browser::set_installer`]).
+pub fn run(url: Option<String>, javascript: bool, installer: Option<String>) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Fetched>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App {
         state: None,
         url,
         javascript,
+        installer,
         proxy,
         start: Instant::now(),
     };
@@ -106,6 +108,7 @@ struct App {
     state: Option<State>,
     url: Option<String>,
     javascript: bool,
+    installer: Option<String>,
     proxy: EventLoopProxy<Fetched>,
     start: Instant,
 }
@@ -559,6 +562,8 @@ pub struct Shot {
     pub javascript: bool,
     /// Give up waiting for resources after this long.
     pub timeout: Duration,
+    /// An app installer's URL (see [`Browser::set_installer`]).
+    pub installer: Option<String>,
 }
 
 /// Loads `url` without a window, waits for its resources, and writes the
@@ -626,6 +631,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     );
     let mut browser = Browser::with_fonts(pw, ph, shot.scale, Fonts::with_system_fonts());
     browser.set_javascript(shot.javascript);
+    browser.set_installer(shot.installer.clone());
     let start = Instant::now();
     let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
     browser.navigate(&url::from_input(url), &mut host);
@@ -788,6 +794,7 @@ impl ApplicationHandler<Fetched> for App {
             Fonts::with_system_fonts(),
         );
         browser.set_javascript(self.javascript);
+        browser.set_installer(self.installer.clone());
         let mut host = NativeHost {
             window: window.clone(),
             proxy: self.proxy.clone(),

@@ -605,6 +605,12 @@ pub struct Browser {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u32,
+    /// An app installer (ruwebos's): pages that declare an app package
+    /// (`<link rel="ruwebos-app">`) get an Install button opening
+    /// `<installer>install?src=<page>`; the menu adds the page to its favorites.
+    installer: Option<String>,
+    /// Whether the active page declares a package, for (tab, page, DOM version).
+    offers_app: ((u64, u64, u64), bool),
     /// Open WebSockets: connection id → (tab id, script slot, the script's id).
     sockets: HashMap<u32, (u64, usize, i32)>,
     next_tab: u64,
@@ -656,6 +662,8 @@ impl Browser {
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
+            installer: None,
+            offers_app: ((0, 0, 0), false),
             sockets: HashMap::new(),
             next_tab: 1,
             requests: HashMap::new(),
@@ -1470,6 +1478,39 @@ impl Browser {
         self.javascript = on;
     }
 
+    /// Sets the app installer (see [`Browser::installer`]'s field docs); the URL ends with `/`.
+    pub fn set_installer(&mut self, url: Option<String>) {
+        self.installer = url.map(|u| if u.ends_with('/') { u } else { format!("{u}/") });
+        self.dirty = true;
+    }
+
+    /// Whether the active page declares an app package to install.
+    fn page_offers_app(&mut self) -> bool {
+        let t = &self.tabs[self.active];
+        let key = (t.id, t.page, t.doc.dom.version());
+        if self.offers_app.0 != key {
+            let dom = &t.doc.dom;
+            // The installer downloads the package: only for web pages.
+            let web = t.url().starts_with("http://") || t.url().starts_with("https://");
+            let found = !t.loading
+                && web
+                && dom.descendants(crate::dom::Dom::ROOT).into_iter().any(|n| {
+                    dom.tag(n) == Some("link")
+                        && dom.attr(n, "href").is_some()
+                        && dom.attr(n, "rel").is_some_and(|r| r.split_ascii_whitespace().any(|w| w.eq_ignore_ascii_case("ruwebos-app")))
+                });
+            self.offers_app = (key, found);
+        }
+        self.offers_app.1
+    }
+
+    /// Opens `<installer><path>?<query>` in the active tab.
+    fn open_installer(&mut self, path: &str, query: &[(&str, &str)], host: &mut dyn Host) {
+        let Some(base) = self.installer.clone() else { return };
+        let pairs: Vec<(String, String)> = query.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        self.navigate(&format!("{base}{path}?{}", crate::document::urlencode(&pairs)), host);
+    }
+
     /// Debug dump of the active page's layout (see
     /// [`Document::dump_layout`]).
     pub fn dump_layout(&self, selector: &str, depth: usize) -> String {
@@ -2143,6 +2184,18 @@ impl Browser {
                 dom.append(tab, close);
                 dom.append(strip, tab);
             }
+        }
+        let offer = self.installer.is_some() && self.page_offers_app();
+        if let Some(n) = self.chrome_el("install")
+            && self.chrome.dom.attr(n, "hidden").is_some() == offer
+            && let Some(e) = self.chrome.dom_mut().element_mut(n)
+        {
+            if offer {
+                e.remove_attr("hidden");
+            } else {
+                e.set_attr("hidden", "");
+            }
+            self.chrome.dom_changed();
         }
         for (id, enabled) in [("back", can_back), ("forward", can_forward)] {
             let class = if enabled { "" } else { "disabled" };
@@ -3024,6 +3077,10 @@ impl Browser {
             "back" => self.go(-1, host),
             "forward" => self.go(1, host),
             "reload" => self.reload(host),
+            "install" => {
+                let url = self.tabs[self.active].url().to_string();
+                self.open_installer("install", &[("src", &url)], host);
+            }
             "close-download" => {
                 if let Some(bar) = self.chrome_el("download")
                     && let Some(e) = self.chrome.dom_mut().element_mut(bar)
@@ -3108,6 +3165,10 @@ impl Browser {
             items.extend([("複製", "ctx-copy", selected, k("Ctrl+C", "⌘C")), ("全選", "ctx-select-all", t == Target::Page, k("Ctrl+A", "⌘A"))]);
         }
         let tab = &self.tabs[self.active];
+        if self.installer.is_some() {
+            let web = tab.url().starts_with("http://") || tab.url().starts_with("https://");
+            items.extend([("", "", false, ""), ("加到主畫面", "ctx-favorite", web, "")]);
+        }
         items.extend([
             ("", "", false, ""),
             ("上一頁", "back", tab.index > 0, k("Alt+←", "⌘[")),
@@ -3199,6 +3260,11 @@ impl Browser {
                 }
             }
             "ctx-copy-link" => host.clipboard_set(ctx.link.as_deref().unwrap_or("")),
+            "ctx-favorite" => {
+                let t = &self.tabs[self.active];
+                let (url, title) = (t.url().to_string(), t.doc.title().unwrap_or_default());
+                self.open_installer("favorites/new", &[("url", &url), ("title", &title)], host);
+            }
             "ctx-copy-image" => host.clipboard_set(ctx.image.as_deref().unwrap_or("")),
             "ctx-save-link" | "ctx-save-image" => {
                 if let Some(u) = if action == "ctx-save-link" { ctx.link } else { ctx.image } {
@@ -4150,6 +4216,25 @@ mod tests {
         assert!(rt.y + rt.h <= base.y + 0.5, "annotation above: {rt:?} {base:?}");
         assert!((rt.x + rt.w / 2.0 - (base.x + base.w / 2.0)).abs() < 1.0, "centered: {rt:?} {base:?}");
         assert!((base.y + base.h - (after.y + after.h)).abs() < 1.0, "base on the line: {base:?} {after:?}");
+    }
+
+    #[test]
+    fn pages_declaring_an_app_package_offer_to_install_it() {
+        let (mut b, mut h) = browser();
+        let hidden = |b: &Browser| b.chrome.dom.attr(b.chrome_el("install").unwrap(), "hidden").is_some();
+        let page = r#"<head><link rel="icon" href="i.svg"><link rel="ruwebos-app" href="app.tar.gz"></head><p>app</p>"#;
+        b.navigate("https://apps.test/notes/", &mut h);
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert!(hidden(&b), "no installer: no button");
+        b.set_installer(Some("http://installer.localhost:8700".into()));
+        b.render(0.0, &mut h);
+        assert!(!hidden(&b), "the page declares a package");
+        b.command("install", None, &mut h);
+        assert_eq!(b.tabs[b.active].url(), "http://installer.localhost:8700/install?src=https%3A%2F%2Fapps.test%2Fnotes%2F");
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(b"<p>installer</p>".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert!(hidden(&b), "the installer page declares nothing");
     }
 
     #[test]

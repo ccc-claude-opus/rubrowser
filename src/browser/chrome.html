@@ -107,6 +107,9 @@
     font-size: 14px;
   }
   #address:focus { border-color: #5b8def; }
+  #install { width: auto; padding: 0 12px; background: #2b8a3e; color: #ffffff; border-radius: 15px; }
+  #install:hover { background: #37a14d; }
+  #install[hidden] { display: none; }
 
   /* The active tab's page is drawn over this box. */
   #viewport {
@@ -191,6 +194,7 @@
     <button id="forward" data-action="forward">&#x2192;</button>
     <button id="reload" data-action="reload">&#x21bb;</button>
     <input id="address" placeholder="Enter an address">
+    <button id="install" data-action="install" hidden>安裝</button>
   </div>
   <div id="viewport"></div>
   <div id="download"><span id="download-text"></span><button id="download-close" data-action="close-download">&#x2715;</button></div>
