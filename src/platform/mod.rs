@@ -2,5 +2,7 @@
 
 #[cfg(feature = "native")]
 pub mod native;
+#[cfg(feature = "native")]
+mod ws;
 #[cfg(all(feature = "web", target_arch = "wasm32"))]
 pub mod web;

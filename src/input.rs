@@ -106,7 +106,29 @@ pub struct HttpRequest {
     pub referrer: String,
 }
 
+/// What happened on a WebSocket connection (RFC 6455), reported by the
+/// platform with [`Browser::ws_event`](crate::browser::Browser::ws_event).
+#[derive(Clone, Debug, PartialEq)]
+pub enum WsEvent {
+    /// The opening handshake succeeded, with the subprotocol the server chose.
+    Open(String),
+    Text(String),
+    Binary(Vec<u8>),
+    /// The connection is closed (`clean`: after a closing handshake).
+    Close { code: u16, reason: String, clean: bool },
+}
+
 pub trait Host {
+    /// Opens WebSocket connection `id` to `url` (`ws:` / `wss:`) for a page
+    /// of `origin`, offering `protocols`; events come back through
+    /// [`Browser::ws_event`](crate::browser::Browser::ws_event). Platforms
+    /// without sockets report the connection closed.
+    fn ws_open(&mut self, _id: u32, _url: &str, _protocols: &[String], _origin: &str) {}
+    /// Sends a message on connection `id` (`text`: a text frame).
+    fn ws_send(&mut self, _id: u32, _data: &[u8], _text: bool) {}
+    /// Starts the closing handshake of connection `id`.
+    fn ws_close(&mut self, _id: u32, _code: u16, _reason: &str) {}
+
     /// Starts loading `url`; the platform later calls
     /// [`Browser::fetch_done`](crate::browser::Browser::fetch_done) with `id`.
     fn fetch(&mut self, id: u32, url: &str);

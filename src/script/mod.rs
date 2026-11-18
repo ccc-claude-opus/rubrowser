@@ -107,6 +107,19 @@ pub struct Output {
     /// Elements whose activation behavior the script asked for
     /// (`click()` on a link or a file input, `showPicker()`).
     pub activate: Vec<NodeId>,
+    /// Elements the script focused (`focus()`, true) or blurred (`blur()`).
+    pub focus: Vec<(NodeId, bool)>,
+    /// WebSocket requests (`new WebSocket`, `send`, `close`).
+    pub ws: Vec<WsCall>,
+}
+
+/// A WebSocket request from a script; the browser reports what happens
+/// with [`Script::ws_event`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum WsCall {
+    Open { id: i32, url: String, protocols: Vec<String> },
+    Send { id: i32, data: Vec<u8>, text: bool },
+    Close { id: i32, code: u16, reason: String },
 }
 
 /// An HTTP request started by a script; the browser answers it with
@@ -141,6 +154,8 @@ pub struct EventInfo {
     pub button: i32,
     /// A key held down (`KeyboardEvent.repeat`).
     pub repeat: bool,
+    /// `WheelEvent.deltaX` / `deltaY` (pixels).
+    pub delta: (f64, f64),
 }
 
 struct State {
@@ -176,6 +191,7 @@ pub struct Script {
     event_fn: Option<TypedFunc<i32, ()>>,
     timer_fn: Option<TypedFunc<i32, ()>>,
     http_fn: Option<TypedFunc<(i32, i32), ()>>,
+    ws_fn: Option<TypedFunc<(i32, i32), ()>>,
     alloc_fn: Option<TypedFunc<i32, i32>>,
     eval_fn: Option<TypedFunc<(i32, i32, i32, i32), ()>>,
     memory: Option<Memory>,
@@ -237,6 +253,7 @@ impl Script {
             event_fn: None,
             timer_fn: None,
             http_fn: None,
+            ws_fn: None,
             alloc_fn: None,
             eval_fn: None,
             memory: None,
@@ -249,6 +266,7 @@ impl Script {
             s.event_fn = instance.get_typed_func(&mut s.store, "rb_event").ok();
             s.timer_fn = instance.get_typed_func(&mut s.store, "rb_timer").ok();
             s.http_fn = instance.get_typed_func(&mut s.store, "rb_http").ok();
+            s.ws_fn = instance.get_typed_func(&mut s.store, "rb_ws").ok();
             s.alloc_fn = instance.get_typed_func(&mut s.store, "rb_alloc").ok();
             s.eval_fn = instance.get_typed_func(&mut s.store, "rb_eval").ok();
             s.memory = instance.get_memory(&mut s.store, "memory");
@@ -401,6 +419,27 @@ impl Script {
         };
         self.store.data_mut().response = Some((id, body, headers.to_string()));
         let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, (id, status)));
+        self.store.data_mut().response = None;
+        r
+    }
+
+    /// Reports to the script what happened on its WebSocket `id`: `kind`
+    /// 1 open (`info`: the subprotocol), 2 text message, 3 binary message
+    /// (`data`), 4 closed (`info`: "code clean reason"), 5 error.
+    pub fn ws_event(
+        &mut self,
+        doc: &mut Document,
+        id: i32,
+        kind: i32,
+        data: Vec<u8>,
+        info: &str,
+        now: f64,
+    ) -> Result<(), String> {
+        let Some(f) = self.ws_fn.clone() else {
+            return Ok(());
+        };
+        self.store.data_mut().response = Some((id, data, info.to_string()));
+        let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, (id, kind)));
         self.store.data_mut().response = None;
         r
     }
@@ -771,6 +810,11 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         let activated = doc.user_activated;
         Ok(doc.audio.command(&cmd, now, activated))
     })?;
+    // 1: the document renders in quirks mode (no or an old doctype).
+    l.func_wrap("rb", "focused", |c: C| -> i32 {
+        c.data().doc.state().focus.map_or(-1, |n| n as i32)
+    })?;
+    l.func_wrap("rb", "quirks", |c: C| -> i32 { c.data().doc.dom.quirks as i32 })?;
     l.func_wrap("rb", "image_info", |c: C, h: i32, which: i32| -> f64 {
         // An <img>: 0 its state (0 loading, 1 loaded, 2 broken, 3 no
         // image requested), 1 its natural width, 2 its natural height.
@@ -1052,6 +1096,13 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         |c: C, p: i32, n: i32| -> Result<i32, Error> {
             let query = read_str(&c, p, n)?;
             Ok(c.data().doc.media_matches(&query) as i32)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "css_supports",
+        |c: C, p: i32, n: i32| -> Result<i32, Error> {
+            Ok(crate::css::media::supports(&read_str(&c, p, n)?) as i32)
         },
     )?;
     l.func_wrap(
@@ -1466,11 +1517,14 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         })
     })?;
     l.func_wrap("rb", "event_pos", |c: C, which: i32| -> f64 {
-        // which: 0 x, 1 y (page coordinates).
-        c.data()
-            .event
-            .as_ref()
-            .map_or(0.0, |e| if which == 0 { e.x } else { e.y })
+        // which: 0 x, 1 y (page coordinates), 2 wheel deltaX, 3 deltaY.
+        c.data().event.as_ref().map_or(0.0, |e| match which {
+            0 => e.x,
+            1 => e.y,
+            2 => e.delta.0,
+            3 => e.delta.1,
+            _ => 0.0,
+        })
     })?;
     l.func_wrap(
         "rb",
@@ -1485,6 +1539,44 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         "languages",
         |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
             write_str(&mut c, p, cap, &crate::net::languages().join(","))
+        },
+    )?;
+    // ----- WebSocket -----------------------------------------------------------
+    l.func_wrap(
+        "rb",
+        "ws_open",
+        |mut c: C, up: i32, ul: i32, pp: i32, pl: i32| -> Result<i32, Error> {
+            let url = read_str(&c, up, ul)?;
+            let protocols = read_str(&c, pp, pl)?;
+            let s = c.data_mut();
+            s.next_http += 1;
+            let id = s.next_http;
+            let protocols = protocols.split(',').filter(|p| !p.is_empty()).map(String::from).collect();
+            s.out.ws.push(WsCall::Open { id, url, protocols });
+            Ok(id)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "ws_send",
+        |mut c: C, id: i32, p: i32, n: i32, text: i32| -> Result<(), Error> {
+            let data = {
+                let mem = memory(&c)?;
+                let bytes = mem.data(&c);
+                bytes[range(bytes, p, n.max(0) as usize)?].to_vec()
+            };
+            c.data_mut().out.ws.push(WsCall::Send { id, data, text: text != 0 });
+            Ok(())
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "ws_close",
+        |mut c: C, id: i32, code: i32, p: i32, n: i32| -> Result<(), Error> {
+            let reason = read_str(&c, p, n)?;
+            let code = u16::try_from(code).unwrap_or(1005);
+            c.data_mut().out.ws.push(WsCall::Close { id, code, reason });
+            Ok(())
         },
     )?;
     l.func_wrap("rb", "history_go", |mut c: C, delta: i32| {
@@ -1519,11 +1611,14 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         }
     })?;
     l.func_wrap("rb", "form_action", |mut c: C, h: i32, op: i32| {
-        // op: 0 submit, 1 reset (forms); 2 activate (any element).
+        // op: 0 submit, 1 reset (forms); 2 activate, 3 focus, 4 blur (any element).
         let s = c.data_mut();
-        if op == 2 {
+        if (2..=4).contains(&op) {
             if let Some(e) = element(&s.doc, h) {
-                s.out.activate.push(e);
+                match op {
+                    2 => s.out.activate.push(e),
+                    _ => s.out.focus.push((e, op == 3)),
+                }
             }
             return;
         }

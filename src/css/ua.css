@@ -24,6 +24,10 @@ head, style, script, title, meta, link, base, template, noscript {
 
 li { display: list-item; }
 
+ruby { display: ruby; text-indent: 0; }
+rt { display: ruby-text; font-size: 50%; line-height: 1; text-align: center; white-space: nowrap; }
+rp { display: none; }
+
 img, canvas, video { display: inline-block; }
 video { object-fit: contain; }
 audio { display: none; }

@@ -336,8 +336,9 @@
       return { finished: Promise.resolve(), cancel() {}, finish() {}, play() {}, pause() {}, onfinish: null };
     }
     isEqualNode(other) { return !!other && this.outerHTML === other.outerHTML; }
-    focus() {}
-    blur() {}
+    // The browser moves focus (firing blur / focus) once the script returns.
+    focus() { rb.formAction(this.__h, 3); }
+    blur() { rb.formAction(this.__h, 4); }
     get innerHTML() { return rb.getHtml(this.__h, 0); }
     set innerHTML(v) { rb.setHtml(this.__h, String(v)); }
     get outerHTML() { return rb.getHtml(this.__h, 1); }
@@ -419,8 +420,6 @@
       if (this.localName === 'input' && this.type === 'file') rb.formAction(this.__h, 2);
       else if (this.localName !== 'input' && this.localName !== 'select') throw new DOMException('showPicker() needs an input', 'NotSupportedError');
     }
-    focus() {}
-    blur() {}
   }
 
   // A fragment is a detached <template> element whose children move when it
@@ -466,6 +465,8 @@
       }
     }
     get readyState() { return 'complete'; }
+    // DOM §4.5: quirks mode is BackCompat, otherwise CSS1Compat.
+    get compatMode() { return rb.quirks() ? 'BackCompat' : 'CSS1Compat'; }
     getElementById(id) {
       const v = String(id).replace(/["\\]/g, '\\$&');
       return wrap(rb.query('[id="' + v + '"]'));
@@ -474,7 +475,7 @@
     get images() { return this.querySelectorAll('img'); }
     get links() { return this.querySelectorAll('a[href], area[href]'); }
     get scripts() { return this.querySelectorAll('script'); }
-    get activeElement() { return this.body; }
+    get activeElement() { const h = rb.focused(); return h >= 0 ? wrap(h) : this.body; }
     hasFocus() { return true; }
     createEvent(kind) { return new (/custom/i.test(kind) ? CustomEvent : Event)(''); }
     createComment(text) { return this.createTextNode(''); }
@@ -556,6 +557,7 @@
     ['PopStateEvent', 'Event', { state: null }],
     ['HashChangeEvent', 'Event', { oldURL: '', newURL: '' }],
     ['MessageEvent', 'Event', { data: null, origin: '', lastEventId: '', source: null, ports: [] }],
+    ['CloseEvent', 'Event', { wasClean: false, code: 0, reason: '' }],
     ['StorageEvent', 'Event', { key: null, oldValue: null, newValue: null, url: '', storageArea: null }],
     ['SubmitEvent', 'Event', { submitter: null }],
     ['AnimationEvent', 'Event', { animationName: '', elapsedTime: 0, pseudoElement: '' }],
@@ -621,6 +623,7 @@
       button: rb.eventInt(4),
     });
     if (e instanceof eventInterfaces.KeyboardEvent) e.repeat = rb.eventInt(5) === 1;
+    if (e instanceof eventInterfaces.WheelEvent) Object.assign(e, { deltaX: rb.eventPos(2), deltaY: rb.eventPos(3), deltaMode: 0 });
     if (!(e instanceof eventInterfaces.MouseEvent)) {
       e.pageX = e.clientX;
       e.pageY = e.clientY;
@@ -1752,6 +1755,53 @@
     target.dispatchEvent(e);
   }
 
+  // The element interfaces of HTML (§ of each element) and SVGElement: they
+  // share Element's methods, and `x instanceof HTMLIFrameElement` holds for
+  // the elements of that interface only.
+  const SVG_NS = 'http://www.w3.org/2000/svg';
+  const HTML_NS = 'http://www.w3.org/1999/xhtml';
+  if (!Object.getOwnPropertyDescriptor(Element.prototype, 'namespaceURI')) {
+    // From the tree: inside <svg> (but not inside its <foreignObject>) or <math>.
+    Object.defineProperty(Element.prototype, 'namespaceURI', {
+      configurable: true,
+      get() {
+        for (let n = this; n && n.nodeType === 1; n = n.parentNode) {
+          const t = n.localName;
+          if (t === 'foreignObject' && n !== this) return HTML_NS;
+          if (t === 'svg') return SVG_NS;
+          if (t === 'math') return 'http://www.w3.org/1998/Math/MathML';
+        }
+        return HTML_NS;
+      },
+    });
+  }
+  const elementInterfaces = {};
+  for (const [name, tags] of Object.entries({
+    HTMLAnchorElement: 'a', HTMLAreaElement: 'area', HTMLAudioElement: 'audio', HTMLBRElement: 'br', HTMLBaseElement: 'base',
+    HTMLBodyElement: 'body', HTMLButtonElement: 'button', HTMLCanvasElement: 'canvas', HTMLDListElement: 'dl', HTMLDataElement: 'data',
+    HTMLDataListElement: 'datalist', HTMLDetailsElement: 'details', HTMLDialogElement: 'dialog', HTMLDivElement: 'div',
+    HTMLEmbedElement: 'embed', HTMLFieldSetElement: 'fieldset', HTMLFormElement: 'form', HTMLHRElement: 'hr', HTMLHeadElement: 'head',
+    HTMLHeadingElement: 'h1 h2 h3 h4 h5 h6', HTMLHtmlElement: 'html', HTMLIFrameElement: 'iframe', HTMLImageElement: 'img',
+    HTMLInputElement: 'input', HTMLLIElement: 'li', HTMLLabelElement: 'label', HTMLLegendElement: 'legend', HTMLLinkElement: 'link',
+    HTMLMapElement: 'map', HTMLMediaElement: 'audio video', HTMLMenuElement: 'menu', HTMLMetaElement: 'meta', HTMLMeterElement: 'meter',
+    HTMLModElement: 'ins del', HTMLOListElement: 'ol', HTMLObjectElement: 'object', HTMLOptGroupElement: 'optgroup',
+    HTMLOptionElement: 'option', HTMLOutputElement: 'output', HTMLParagraphElement: 'p', HTMLPictureElement: 'picture',
+    HTMLPreElement: 'pre listing xmp', HTMLProgressElement: 'progress', HTMLQuoteElement: 'q blockquote', HTMLScriptElement: 'script',
+    HTMLSelectElement: 'select', HTMLSlotElement: 'slot', HTMLSourceElement: 'source', HTMLSpanElement: 'span', HTMLStyleElement: 'style',
+    HTMLTableCaptionElement: 'caption', HTMLTableCellElement: 'td th', HTMLTableColElement: 'col colgroup', HTMLTableElement: 'table',
+    HTMLTableRowElement: 'tr', HTMLTableSectionElement: 'thead tbody tfoot', HTMLTemplateElement: 'template',
+    HTMLTextAreaElement: 'textarea', HTMLTimeElement: 'time', HTMLTitleElement: 'title', HTMLTrackElement: 'track',
+    HTMLUListElement: 'ul', HTMLVideoElement: 'video', SVGElement: null,
+  })) {
+    const list = tags && tags.split(' ');
+    const F = { [name]: function () { throw new TypeError('Illegal constructor'); } }[name];
+    F.prototype = Element.prototype;
+    Object.defineProperty(F, Symbol.hasInstance, {
+      value: (x) => x instanceof Element && (list ? x.namespaceURI !== SVG_NS && list.includes(x.localName) : x.namespaceURI === SVG_NS),
+    });
+    elementInterfaces[name] = F;
+  }
+
   // ----- Web Audio (a subset: oscillators, gain, AudioParam automation) -----
   // The graph renders in the browser (media::webaudio); here each call is a
   // command, fields separated by U+0001.
@@ -2143,6 +2193,79 @@
     httpPending.delete(id);
     if (done) done(status, status ? rb.httpBytes(id) : new Uint8Array(0), status ? rb.httpHeaders(id) : '');
   };
+  // WebSocket (HTML § 9.3, RFC 6455): the browser holds the connection and
+  // reports to __rb_ws (1 open, 2 text, 3 binary, 4 closed, 5 error).
+  const sockets = new Map(); // id -> WebSocket
+  class WebSocket extends EventTarget {
+    constructor(url, protocols) {
+      super();
+      let u;
+      try { u = new URL(String(url), location.href); } catch (e) { throw new DOMException(`Failed to construct 'WebSocket': The URL '${url}' is invalid.`, 'SyntaxError'); }
+      if (u.protocol === 'http:') u.protocol = 'ws:';
+      else if (u.protocol === 'https:') u.protocol = 'wss:';
+      if (u.protocol !== 'ws:' && u.protocol !== 'wss:') throw new DOMException(`Failed to construct 'WebSocket': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '${u.protocol}' is not allowed.`, 'SyntaxError');
+      if (u.hash) throw new DOMException("Failed to construct 'WebSocket': The URL contains a fragment identifier.", 'SyntaxError');
+      const list = protocols === undefined ? [] : [].concat(protocols).map(String);
+      if (new Set(list).size !== list.length || list.some((p) => !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(p))) throw new DOMException("Failed to construct 'WebSocket': The subprotocol is invalid.", 'SyntaxError');
+      this.url = u.href;
+      this.readyState = 0;
+      this.protocol = '';
+      this.extensions = '';
+      this.bufferedAmount = 0;
+      this.binaryType = 'blob';
+      for (const t of ['open', 'message', 'error', 'close']) this['on' + t] = null;
+      this._id = rb.wsOpen(this.url, list.join(','));
+      sockets.set(this._id, this);
+    }
+    send(data) {
+      if (this.readyState === 0) throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", 'InvalidStateError');
+      if (this.readyState !== 1) return;
+      if (data instanceof Blob) rb.wsSend(this._id, data._data, 0);
+      else {
+        const bytes = sourceBytes(data);
+        rb.wsSend(this._id, bytes ? bytes.slice() : String(data), 0);
+      }
+    }
+    close(code, reason) {
+      if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) throw new DOMException(`Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. ${code} is neither.`, 'InvalidAccessError');
+      reason = reason === undefined ? '' : String(reason);
+      if (rb.encodeUtf8(reason).length > 123) throw new DOMException("Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.", 'SyntaxError');
+      if (this.readyState >= 2) return;
+      this.readyState = 2;
+      rb.wsClose(this._id, code === undefined ? (reason ? 1000 : 1005) : code, reason);
+    }
+    _fire(e) {
+      Object.defineProperty(e, 'target', { value: this, configurable: true });
+      Object.defineProperty(e, 'currentTarget', { value: this, configurable: true });
+      if (typeof this['on' + e.type] === 'function') call(this['on' + e.type], this, [e]);
+      this.dispatchEvent(e);
+    }
+  }
+  Object.assign(WebSocket, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  Object.assign(WebSocket.prototype, { CONNECTING: 0, OPEN: 1, CLOSING: 2, CLOSED: 3 });
+  global.__rb_ws = function (id, kind) {
+    const ws = sockets.get(id);
+    if (!ws) return;
+    const origin = new URL(ws.url).origin;
+    if (kind === 1) {
+      ws.readyState = 1;
+      ws.protocol = rb.httpHeaders(id);
+      ws._fire(new Event('open'));
+    } else if (kind === 2 || kind === 3) {
+      if (ws.readyState !== 1) return;
+      const bytes = rb.httpBytes(id);
+      const data = kind === 2 ? rb.decodeUtf8(bytes) : ws.binaryType === 'arraybuffer' ? bytes.slice().buffer : new Blob([bytes]);
+      ws._fire(new eventInterfaces.MessageEvent('message', { data, origin }));
+    } else if (kind === 4) {
+      const m = /^(\d+) (\d) ([\s\S]*)$/.exec(rb.httpHeaders(id)) || [0, 1006, 0, ''];
+      sockets.delete(id);
+      const failed = m[2] === '0';
+      ws.readyState = 3;
+      if (failed) ws._fire(new Event('error'));
+      ws._fire(new eventInterfaces.CloseEvent('close', { wasClean: !failed, code: Number(m[1]), reason: m[3] }));
+    }
+  };
+
   function httpRequest(method, url, body, contentType, done) {
     const href = new URL(String(url), location.href).href;
     const local = localResponse(href, method);
@@ -2809,15 +2932,22 @@
     if (!global.__rb || !__rb.tzOffset || Number.isNaN(__rb.tzOffset(s, 0))) throw new RangeError('Invalid time zone specified: ' + s);
     return s;
   }
-  // Traditional Chinese (zh-TW) data; every other locale formats as en-US.
+  // Traditional Chinese (zh-TW), Swedish (sv-SE, its numeric dates are
+  // ISO 8601's y-MM-dd) and Canadian English (en-CA) data; every other
+  // locale formats as en-US.
   const ZH_DAYS = ['日', '一', '二', '三', '四', '五', '六'];
+  const SV_MONTHS = ['januari', 'februari', 'mars', 'april', 'maj', 'juni', 'juli', 'augusti', 'september', 'oktober', 'november', 'december'];
+  const SV_MONTHS_SHORT = ['jan.', 'feb.', 'mars', 'apr.', 'maj', 'juni', 'juli', 'aug.', 'sep.', 'okt.', 'nov.', 'dec.'];
+  const SV_DAYS = ['söndag', 'måndag', 'tisdag', 'onsdag', 'torsdag', 'fredag', 'lördag'];
+  const SV_DAYS_SHORT = ['sön', 'mån', 'tis', 'ons', 'tors', 'fre', 'lör'];
   const isZh = (l) => /^zh(-|$)/i.test(l);
+  const dateLocale = (l) => (isZh(l) ? 'zh-TW' : /^sv(-|$)/i.test(l) ? 'sv-SE' : /^en-CA$/i.test(l) ? 'en-CA' : 'en-US');
 
   class DateTimeFormat {
     constructor(locale, opts) {
       const o = Object.assign({}, opts);
       const req = [].concat(locale === undefined ? [] : locale).map(String);
-      this.locale = req.length && isZh(req[0]) ? 'zh-TW' : 'en-US';
+      this.locale = req.length ? dateLocale(req[0]) : 'en-US';
       this.timeZone = o.timeZone === undefined ? hostZone() : canonicalZone(o.timeZone);
       const fields = ['weekday', 'era', 'year', 'month', 'day', 'hour', 'minute', 'second', 'fractionalSecondDigits', 'timeZoneName', 'dayPeriod'];
       this.o = {};
@@ -2829,13 +2959,14 @@
         this.o.year = 'numeric'; this.o.month = 'numeric'; this.o.day = 'numeric';
       }
       const zh = this.locale === 'zh-TW';
+      const sv = this.locale === 'sv-SE';
       const ds = { full: { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }, long: { year: 'numeric', month: 'long', day: 'numeric' },
-        medium: { year: 'numeric', month: zh ? 'long' : 'short', day: 'numeric' }, short: { year: zh ? 'numeric' : '2-digit', month: 'numeric', day: 'numeric' } };
+        medium: { year: 'numeric', month: zh ? 'long' : 'short', day: 'numeric' }, short: { year: this.locale === 'en-US' ? '2-digit' : 'numeric', month: 'numeric', day: 'numeric' } };
       const ts = { full: { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'long' }, long: { hour: 'numeric', minute: '2-digit', second: '2-digit', timeZoneName: 'short' },
         medium: { hour: 'numeric', minute: '2-digit', second: '2-digit' }, short: { hour: 'numeric', minute: '2-digit' } };
       if (this.dateStyle) Object.assign(this.o, ds[this.dateStyle]);
       if (this.timeStyle) Object.assign(this.o, ts[this.timeStyle]);
-      this.hour12 = o.hour12 !== undefined ? !!o.hour12 : o.hourCycle ? o.hourCycle === 'h12' || o.hourCycle === 'h11' : true;
+      this.hour12 = o.hour12 !== undefined ? !!o.hour12 : o.hourCycle ? o.hourCycle === 'h12' || o.hourCycle === 'h11' : !sv;
     }
     formatToParts(date) {
       const d = date === undefined ? new Date() : new Date(typeof date === 'object' ? date.valueOf() : date);
@@ -2853,7 +2984,41 @@
       const yv = o.year === '2-digit' ? two(year % 100) : String(year);
       const dv = o.day === '2-digit' ? two(day) : String(day);
       const textMonth = o.month === 'long' || o.month === 'short' || o.month === 'narrow';
-      if (zh) {
+      if (this.locale === 'sv-SE') {
+        // CLDR sv patterns: y-MM-dd, y-MM, d/M; EEEE d MMMM y; HH:mm:ss
+        if (o.weekday) {
+          out.push({ type: 'weekday', value: (o.weekday === 'long' ? SV_DAYS : SV_DAYS_SHORT)[get('Day')] });
+          if (o.year || o.month || o.day) lit(' ');
+        }
+        if (textMonth) {
+          if (o.day) out.push({ type: 'day', value: dv });
+          if (o.month) { if (o.day) lit(' '); out.push({ type: 'month', value: (o.month === 'long' ? SV_MONTHS : SV_MONTHS_SHORT)[month] }); }
+          if (o.year) { if (o.month || o.day) lit(' '); out.push({ type: 'year', value: yv }); }
+        } else if (o.year && (o.month || o.day)) {
+          out.push({ type: 'year', value: yv });
+          if (o.month) { lit('-'); out.push({ type: 'month', value: two(month + 1) }); }
+          if (o.day) { lit('-'); out.push({ type: 'day', value: two(day) }); }
+        } else {
+          const seq = [];
+          if (o.year) seq.push({ type: 'year', value: yv });
+          if (o.day) seq.push({ type: 'day', value: dv });
+          if (o.month) seq.push({ type: 'month', value: o.month === '2-digit' ? two(month + 1) : String(month + 1) });
+          seq.forEach((p, i) => { if (i) lit('/'); out.push(p); });
+        }
+        if (o.hour || o.minute || o.second) {
+          if (out.length) lit(' ');
+          let h = get('Hours');
+          const pm = h >= 12;
+          if (this.hour12) h = h % 12 || 12;
+          const t = [];
+          if (o.hour) t.push({ type: 'hour', value: this.hour12 && o.hour !== '2-digit' ? String(h) : two(h) });
+          if (o.minute) t.push({ type: 'minute', value: two(get('Minutes')) });
+          if (o.second) t.push({ type: 'second', value: two(get('Seconds')) });
+          t.forEach((p, i) => { if (i) lit(':'); out.push(p); });
+          if (o.fractionalSecondDigits) { lit(','); out.push({ type: 'fractionalSecond', value: String(get('Milliseconds')).padStart(3, '0').slice(0, o.fractionalSecondDigits) }); }
+          if (o.hour && this.hour12) { lit(' '); out.push({ type: 'dayPeriod', value: pm ? 'em' : 'fm' }); }
+        }
+      } else if (zh) {
         // CLDR zh-Hant patterns: y年M月d日 (text month, or numeric with a
         // weekday), y/M/d, M/d（E）; dateStyle/timeStyle use flexible day
         // periods (凌晨…晚上), single fields 上午/下午.
@@ -2909,6 +3074,13 @@
           if (o.month) out.push({ type: 'month', value: mv });
           if (o.day) { if (o.month) lit(' '); out.push({ type: 'day', value: dv }); }
           if (o.year) { if (o.month || o.day) lit(o.day ? ', ' : ' '); out.push({ type: 'year', value: yv }); }
+        } else if (this.locale === 'en-CA' && (o.month || o.year)) {
+          // en-CA numeric dates: y-MM-dd, y-MM, MM-dd
+          const seq = [];
+          if (o.year) seq.push({ type: 'year', value: yv });
+          if (o.month) seq.push({ type: 'month', value: two(month + 1) });
+          if (o.day) seq.push({ type: 'day', value: two(day) });
+          seq.forEach((p, i) => { if (i) lit('-'); out.push(p); });
         } else {
           const seq = [];
           if (o.month) seq.push({ type: 'month', value: mv });
@@ -2927,7 +3099,8 @@
           if (o.second) t.push({ type: 'second', value: o.minute || o.second === '2-digit' ? two(get('Seconds')) : String(get('Seconds')) });
           t.forEach((p, i) => { if (i) lit(':'); out.push(p); });
           if (o.fractionalSecondDigits) { lit('.'); out.push({ type: 'fractionalSecond', value: String(get('Milliseconds')).padStart(3, '0').slice(0, o.fractionalSecondDigits) }); }
-          if (o.hour && this.hour12) { lit(' '); out.push({ type: 'dayPeriod', value: pm ? 'PM' : 'AM' }); }
+          const ca = this.locale === 'en-CA';
+          if (o.hour && this.hour12) { lit(' '); out.push({ type: 'dayPeriod', value: pm ? (ca ? 'p.m.' : 'PM') : ca ? 'a.m.' : 'AM' }); }
         }
       }
       if (o.timeZoneName) {
@@ -3137,6 +3310,30 @@
     disconnect() {}
   }
   PerformanceObserver.supportedEntryTypes = [];
+
+  // The CSS namespace (CSSOM, CSS Conditional Rules 3): supports() asks the
+  // browser's @supports evaluation; escape() serializes an identifier.
+  const CSS = {
+    supports(prop, value) {
+      if (arguments.length === 0) throw new TypeError('CSS.supports: 1 argument required');
+      const cond = arguments.length > 1 ? `(${prop}: ${value})` : String(prop);
+      return rb.cssSupports(cond) || (arguments.length === 1 && rb.cssSupports(`(${cond})`));
+    },
+    escape(ident) {
+      if (arguments.length === 0) throw new TypeError('CSS.escape: 1 argument required');
+      const s = String(ident);
+      let out = '';
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c === 0) out += '\uFFFD';
+        else if ((c >= 1 && c <= 0x1f) || c === 0x7f || (i === 0 && c >= 0x30 && c <= 0x39) || (i === 1 && c >= 0x30 && c <= 0x39 && s.charCodeAt(0) === 0x2d)) out += '\\' + c.toString(16) + ' ';
+        else if (i === 0 && s.length === 1 && c === 0x2d) out += '\\' + s[i];
+        else if (c >= 0x80 || c === 0x2d || c === 0x5f || (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a)) out += s[i];
+        else out += '\\' + s[i];
+      }
+      return out;
+    },
+  };
 
   // matchMedia: evaluated by the browser against the current viewport each
   // time `matches` is read (change events are not sent yet).
@@ -3375,7 +3572,12 @@
       cookieJar = [...rest, pair.trim()].join('; ');
     },
   });
-  for (const name of ['load', 'domcontentloaded', 'keydown', 'click', 'message', 'hashchange', 'popstate', 'selectstart']) handlerProperty(global, name);
+  // The event handler attributes of Window (HTML §8.1.8.2): pages test
+  // `'onwheel' in window` and the like to choose the events they listen to.
+  for (const name of ['load', 'domcontentloaded', 'keydown', 'keyup', 'keypress', 'click', 'dblclick', 'contextmenu', 'message', 'hashchange',
+    'popstate', 'selectstart', 'wheel', 'scroll', 'resize', 'mousedown', 'mouseup', 'mousemove', 'mouseover', 'mouseout', 'pointerdown',
+    'pointerup', 'pointermove', 'pointercancel', 'focus', 'blur', 'input', 'change', 'submit', 'error', 'beforeunload', 'unload',
+    'pagehide', 'pageshow', 'online', 'offline', 'storage', 'visibilitychange']) handlerProperty(global, name);
 
   // window.postMessage: a `message` event at this window, later. (There
   // are no other windows to talk to: frames run no scripts.)
@@ -3580,16 +3782,6 @@
     DOMParser,
     Intl: typeof global.Intl === 'object' ? global.Intl : Intl,
     PerformanceObserver,
-    HTMLInputElement: Element,
-    HTMLAnchorElement: Element,
-    HTMLButtonElement: Element,
-    HTMLFormElement: Element,
-    HTMLImageElement: Element,
-    HTMLCanvasElement: Element,
-    HTMLMediaElement: Element,
-    HTMLVideoElement: Element,
-    HTMLAudioElement: Element,
-    HTMLSourceElement: Element,
     TimeRanges,
     Audio: function Audio(src) {
       const a = document.createElement('audio');
@@ -3601,13 +3793,8 @@
     CanvasPattern,
     Path2D,
     ImageData,
-    HTMLDivElement: Element,
-    HTMLTemplateElement: Element,
-    HTMLScriptElement: Element,
-    HTMLSelectElement: Element,
-    HTMLTextAreaElement: Element,
-    SVGElement: Element,
     ShadowRoot: DocumentFragment,
+    ...elementInterfaces,
     AudioContext, webkitAudioContext: AudioContext, BaseAudioContext, AudioNode, AudioParam, AudioDestinationNode, GainNode, OscillatorNode,
     Image: function Image(w, h) { const i = document.createElement('img'); if (w) i.width = w; if (h) i.height = h; return i; },
     Option: function Option(text, value) { const o = document.createElement('option'); o.textContent = text || ''; if (value !== undefined) o.value = value; return o; },
@@ -3624,6 +3811,8 @@
     ResizeObserver,
     IntersectionObserver,
     matchMedia,
+    CSS,
+    WebSocket,
     navigator,
     devicePixelRatio: 1,
     scrollX: 0,

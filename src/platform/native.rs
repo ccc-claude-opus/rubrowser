@@ -18,7 +18,7 @@ use winit::window::{CursorIcon, Window, WindowId};
 use crate::abi::key;
 use crate::browser::{Browser, ResponseInfo};
 use crate::document::FileData;
-use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers};
+use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers, WsEvent};
 use crate::net::url;
 use crate::text::Fonts;
 
@@ -42,9 +42,11 @@ pub fn run(url: Option<String>, javascript: bool) -> Result<(), Box<dyn Error>> 
     Ok(())
 }
 
-/// A finished fetch, sent from a loader thread to the event loop.
+/// A finished fetch, sent from a loader thread to the event loop (or, with
+/// `ws`, what happened on WebSocket connection `id`).
 struct Fetched {
     id: u32,
+    ws: Option<WsEvent>,
     result: Result<Vec<u8>, String>,
     /// The URL after redirects, if it changed.
     final_url: Option<String>,
@@ -57,12 +59,14 @@ impl Fetched {
         match loaded {
             Ok(l) => Fetched {
                 id,
+                ws: None,
                 result: Ok(l.body),
                 final_url: l.final_url,
                 info: l.info,
             },
             Err(e) => Fetched {
                 id,
+                ws: None,
                 result: Err(e),
                 final_url: None,
                 info: None,
@@ -70,8 +74,15 @@ impl Fetched {
         }
     }
 
+    fn ws(id: u32, event: WsEvent) -> Fetched {
+        Fetched { id, ws: Some(event), result: Ok(Vec::new()), final_url: None, info: None }
+    }
+
     /// Hands the fetch to `browser`.
     fn deliver(self, browser: &mut Browser, host: &mut dyn Host) {
+        if let Some(event) = self.ws {
+            return browser.ws_event(self.id, event, host);
+        }
         if let Some(u) = &self.final_url {
             browser.fetch_redirected(self.id, u);
         }
@@ -115,14 +126,46 @@ struct State {
 struct NativeHost {
     window: Rc<Window>,
     proxy: EventLoopProxy<Fetched>,
+    sockets: Sockets,
     clipboard: Option<arboard::Clipboard>,
     cursor: Cursor,
     title: String,
 }
 
+/// Open WebSocket connections, by id.
+type Sockets = std::collections::HashMap<u32, std::sync::mpsc::Sender<super::ws::Command>>;
+
+fn ws_send(sockets: &Sockets, id: u32, data: &[u8], text: bool) {
+    if let Some(tx) = sockets.get(&id) {
+        let _ = tx.send(super::ws::Command::Send(data.to_vec(), text));
+    }
+}
+
+fn ws_close(sockets: &mut Sockets, id: u32, code: u16, reason: &str) {
+    if let Some(tx) = sockets.remove(&id) {
+        let _ = tx.send(super::ws::Command::Close(code, reason.to_string()));
+    }
+}
+
 impl Host for NativeHost {
     fn fetch(&mut self, id: u32, url: &str) {
         self.fetch_with(id, url, &HttpRequest::default());
+    }
+
+    fn ws_open(&mut self, id: u32, url: &str, protocols: &[String], origin: &str) {
+        let proxy = self.proxy.clone();
+        let tx = super::ws::open(url, protocols, origin, &user_agent(), move |e| {
+            let _ = proxy.send_event(Fetched::ws(id, e));
+        });
+        self.sockets.insert(id, tx);
+    }
+
+    fn ws_send(&mut self, id: u32, data: &[u8], text: bool) {
+        ws_send(&self.sockets, id, data, text);
+    }
+
+    fn ws_close(&mut self, id: u32, code: u16, reason: &str) {
+        ws_close(&mut self.sockets, id, code, reason);
     }
 
     fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
@@ -525,10 +568,24 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     struct Headless {
         tx: mpsc::Sender<Fetched>,
         pending: usize,
+        sockets: Sockets,
     }
     impl Host for Headless {
         fn fetch(&mut self, id: u32, url: &str) {
             self.fetch_with(id, url, &HttpRequest::default());
+        }
+        fn ws_open(&mut self, id: u32, url: &str, protocols: &[String], origin: &str) {
+            let tx = self.tx.clone();
+            let socket = super::ws::open(url, protocols, origin, &user_agent(), move |e| {
+                let _ = tx.send(Fetched::ws(id, e));
+            });
+            self.sockets.insert(id, socket);
+        }
+        fn ws_send(&mut self, id: u32, data: &[u8], text: bool) {
+            ws_send(&self.sockets, id, data, text);
+        }
+        fn ws_close(&mut self, id: u32, code: u16, reason: &str) {
+            ws_close(&mut self.sockets, id, code, reason);
         }
         fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
             self.pending += 1;
@@ -562,7 +619,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         }
     }
     let (tx, rx) = mpsc::channel();
-    let mut host = Headless { tx, pending: 0 };
+    let mut host = Headless { tx, pending: 0, sockets: Sockets::new() };
     let (pw, ph) = (
         (shot.width as f32 * shot.scale) as usize,
         (shot.height as f32 * shot.scale) as usize,
@@ -577,6 +634,18 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     let pump = |browser: &mut Browser, host: &mut Headless| loop {
         browser.render(now(&start), host);
         if host.pending == 0 {
+            // WebSocket messages that arrived meanwhile.
+            let mut any = false;
+            while let Ok(f) = rx.try_recv() {
+                any = true;
+                if f.ws.is_none() {
+                    host.pending -= 1;
+                }
+                f.deliver(browser, host);
+            }
+            if any {
+                continue;
+            }
             break;
         }
         let wait = deadline.saturating_duration_since(Instant::now());
@@ -585,7 +654,9 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 // Deliver everything that has arrived, then render once.
                 let mut next = Some(first);
                 while let Some(f) = next {
-                    host.pending -= 1;
+                    if f.ws.is_none() {
+                        host.pending -= 1;
+                    }
                     f.deliver(browser, host);
                     next = rx.try_recv().ok();
                 }
@@ -602,7 +673,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     pump(&mut browser, &mut host);
     browser.render(now(&start), &mut host);
     // A debugging aid: input to play before the screenshot, e.g.
-    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; wait 500"
+    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; type 文字; js console.log(1); wait 500"
     // (window logical px; keys are letters or escape/enter/tab/left/right/up/down).
     if let Ok(script) = std::env::var("RUBROWSER_INPUT") {
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -614,6 +685,10 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 "right" => browser.event(Event::MouseDown { x: num(1), y: num(2), button: 2 }, t, &mut host),
                 "up" => browser.event(Event::MouseUp { x: num(1), y: num(2), button: 0 }, t, &mut host),
                 "move" => browser.event(Event::MouseMove { x: num(1), y: num(2) }, t, &mut host),
+                "wheel" => {
+                    browser.event(Event::MouseMove { x: num(1), y: num(2) }, t, &mut host);
+                    browser.event(Event::Wheel { dx: 0, dy: num(3) }, t, &mut host);
+                }
                 "click" => {
                     browser.event(Event::MouseMove { x: num(1), y: num(2) }, t, &mut host);
                     browser.event(Event::MouseDown { x: num(1), y: num(2), button: 0 }, t, &mut host);
@@ -643,6 +718,8 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                     }
                 }
                 "wait" => std::thread::sleep(Duration::from_millis(num(1).max(0) as u64)),
+                "type" => browser.event(Event::Text(step[4..].trim_start().to_string()), t, &mut host),
+                "js" => browser.run_script(&step[2..], &mut host),
                 other => eprintln!("rubrowser: RUBROWSER_INPUT: unknown step {other}"),
             }
             pump(&mut browser, &mut host);
@@ -714,6 +791,7 @@ impl ApplicationHandler<Fetched> for App {
         let mut host = NativeHost {
             window: window.clone(),
             proxy: self.proxy.clone(),
+            sockets: Sockets::new(),
             clipboard: arboard::Clipboard::new().ok(),
             cursor: Cursor::Default,
             title: String::new(),

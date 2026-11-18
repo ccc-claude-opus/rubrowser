@@ -13,10 +13,10 @@ use crate::css::ElementState;
 use crate::document::{Document, FrameLoad};
 use crate::dom::{Element, NodeId};
 use crate::gfx::Canvas;
-use crate::input::{Cursor, Event, Host, Modifiers};
+use crate::input::{Cursor, Event, Host, Modifiers, WsEvent};
 use crate::layout::RectF;
 use crate::net::url;
-use crate::script::{EventInfo, Limits, Script};
+use crate::script::{EventInfo, Limits, Script, WsCall};
 use crate::text::Fonts;
 use crate::ui::textfield::Action;
 
@@ -483,6 +483,8 @@ struct EventInit {
     button: i32,
     /// A key held down (auto-repeat).
     repeat: bool,
+    /// Wheel deltas in pixels.
+    delta: (f32, f32),
 }
 
 impl EventInit {
@@ -515,6 +517,9 @@ struct Timer {
 struct Tab {
     id: u64,
     history: Vec<String>,
+    /// The page's scroll position when each history entry was left, to
+    /// restore it on return (HTML's scroll restoration, mode `auto`).
+    scrolls: Vec<f32>,
     index: usize,
     doc: Document,
     /// Increases with every navigation, to drop stale fetch results.
@@ -570,6 +575,13 @@ impl Tab {
         &self.history[self.index]
     }
 
+    /// Remembers where the shown page is scrolled, for its history entry.
+    fn save_scroll(&mut self) {
+        if !self.loading && self.doc.url == self.history[self.index] {
+            self.scrolls[self.index] = self.doc.scroll_y();
+        }
+    }
+
     fn title(&self) -> String {
         if self.loading {
             return "Loading…".into();
@@ -593,6 +605,8 @@ pub struct Browser {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u32,
+    /// Open WebSockets: connection id → (tab id, script slot, the script's id).
+    sockets: HashMap<u32, (u64, usize, i32)>,
     next_tab: u64,
     requests: HashMap<u32, Request>,
     keyboard: Target,
@@ -642,6 +656,7 @@ impl Browser {
             tabs: Vec::new(),
             active: 0,
             next_id: 1,
+            sockets: HashMap::new(),
             next_tab: 1,
             requests: HashMap::new(),
             keyboard: Target::Page,
@@ -688,6 +703,7 @@ impl Browser {
         self.tabs.push(Tab {
             id,
             history: vec![url.to_string()],
+            scrolls: vec![0.0],
             index: 0,
             doc: Document::from_html("", url),
             serial: 0,
@@ -730,6 +746,7 @@ impl Browser {
         if i >= self.tabs.len() {
             return;
         }
+        self.close_sockets(self.tabs[i].id, host);
         self.tabs.remove(i);
         if self.tabs.is_empty() {
             self.new_tab("about:home", host);
@@ -762,8 +779,11 @@ impl Browser {
             return;
         }
         let tab = &mut self.tabs[self.active];
+        tab.save_scroll();
         tab.history.truncate(tab.index + 1);
+        tab.scrolls.truncate(tab.index + 1);
         tab.history.push(url.to_string());
+        tab.scrolls.push(0.0);
         tab.index += 1;
         let before = tab.doc.url.clone();
         if self.same_document(self.active) {
@@ -780,9 +800,12 @@ impl Browser {
         let tab = &mut self.tabs[self.active];
         let next = tab.index as isize + delta;
         if next >= 0 && (next as usize) < tab.history.len() {
+            tab.save_scroll();
             tab.index = next as usize;
             let before = tab.doc.url.clone();
             if self.same_document(self.active) {
+                let tab = &mut self.tabs[self.active];
+                tab.doc.restore_scroll(tab.scrolls[tab.index]);
                 self.fragment_changed(&before, true, host);
             } else {
                 self.load(self.active, host);
@@ -821,6 +844,12 @@ impl Browser {
         tab.doc.url = target;
         self.dirty = true;
         true
+    }
+
+    /// Reloads the active tab, keeping its scroll position.
+    fn reload(&mut self, host: &mut dyn Host) {
+        self.tabs[self.active].save_scroll();
+        self.load(self.active, host);
     }
 
     /// (Re)loads the current history entry of tab `i`.
@@ -906,10 +935,15 @@ impl Browser {
 
     fn set_page(&mut self, i: usize, html: &str, url: &str, host: &mut dyn Host) {
         let vp = self.viewport_rect();
+        // The old document's connections go with it.
+        self.close_sockets(self.tabs[i].id, host);
         let tab = &mut self.tabs[i];
         tab.loading = false;
         tab.page += 1;
         tab.doc = Document::from_html(html, url);
+        if tab.scrolls[tab.index] > 0.0 {
+            tab.doc.restore_scroll(tab.scrolls[tab.index]);
+        }
         // Scripts see the viewport (`matchMedia`, `innerWidth`) from the start.
         tab.doc.set_viewport(vp.w, vp.h);
         tab.doc.set_fonts(self.fonts.clone());
@@ -1374,6 +1408,12 @@ impl Browser {
         }
     }
 
+    /// Runs JavaScript `source` in the active page, as a classic script
+    /// would (a debugging aid: `js …` in `RUBROWSER_INPUT`).
+    pub fn run_script(&mut self, source: &str, host: &mut dyn Host) {
+        self.run_source(self.active, "text/javascript", source, "debug script", host);
+    }
+
     /// Runs `mime` source code in the page's runtime for that language,
     /// starting a built-in runtime if needed.
     fn run_source(&mut self, i: usize, mime: &str, source: &str, name: &str, host: &mut dyn Host) {
@@ -1705,6 +1745,7 @@ impl Browser {
         tab.loading = false;
         if tab.index > 0 && tab.history[tab.index] != tab.doc.url {
             tab.history.remove(tab.index);
+            tab.scrolls.remove(tab.index);
             tab.index -= 1;
         }
         self.dirty = true;
@@ -1844,6 +1885,9 @@ impl Browser {
             };
             host.fetch_with(fid, &target, &request);
         }
+        for call in out.ws {
+            self.ws_call(i, si, call, host);
+        }
         if changed {
             self.adopt_inserted(i, host);
         }
@@ -1861,8 +1905,78 @@ impl Browser {
             for node in out.activate {
                 self.script_activate(node, host);
             }
+            for (node, on) in out.focus {
+                let doc = &self.tabs[i].doc;
+                if on && doc.is_focusable(node) {
+                    self.keyboard = Target::Page;
+                    self.focus_page(Some(node), host);
+                } else if !on && doc.state().focus == Some(node) {
+                    self.focus_page(None, host);
+                }
+            }
         }
         (out.prevent_default, out.stop_propagation)
+    }
+
+    /// Passes a script's WebSocket request to the platform.
+    fn ws_call(&mut self, i: usize, si: usize, call: WsCall, host: &mut dyn Host) {
+        let tab = self.tabs[i].id;
+        let find = |b: &Browser, sid: i32| b.sockets.iter().find(|(_, v)| **v == (tab, si, sid)).map(|(k, _)| *k);
+        match call {
+            WsCall::Open { id, url, protocols } => {
+                let gid = self.next_id;
+                self.next_id += 1;
+                self.sockets.insert(gid, (tab, si, id));
+                // The server decides from Origin whom to accept (no CORS).
+                let page = &self.tabs[i].doc.url;
+                let origin = origin(page).unwrap_or_else(|| "null".into());
+                host.ws_open(gid, &url, &protocols, &origin);
+            }
+            WsCall::Send { id, data, text } => {
+                if let Some(gid) = find(self, id) {
+                    host.ws_send(gid, &data, text);
+                }
+            }
+            WsCall::Close { id, code, reason } => {
+                if let Some(gid) = find(self, id) {
+                    host.ws_close(gid, code, &reason);
+                }
+            }
+        }
+    }
+
+    /// Closes the WebSockets of tab `tab` (its page is going away).
+    fn close_sockets(&mut self, tab: u64, host: &mut dyn Host) {
+        let ids: Vec<u32> = self.sockets.iter().filter(|(_, v)| v.0 == tab).map(|(k, _)| *k).collect();
+        for gid in ids {
+            self.sockets.remove(&gid);
+            host.ws_close(gid, 1001, "");
+        }
+    }
+
+    /// Something happened on WebSocket connection `id` (from the platform).
+    pub fn ws_event(&mut self, id: u32, event: WsEvent, host: &mut dyn Host) {
+        let Some(&(tab, si, sid)) = self.sockets.get(&id) else { return };
+        let (kind, data, info) = match event {
+            WsEvent::Open(protocol) => (1, Vec::new(), protocol),
+            WsEvent::Text(t) => (2, t.into_bytes(), String::new()),
+            WsEvent::Binary(b) => (3, b, String::new()),
+            WsEvent::Close { code, reason, clean } => {
+                self.sockets.remove(&id);
+                (4, Vec::new(), format!("{code} {} {reason}", clean as i32))
+            }
+        };
+        let Some(i) = self.tab_index(tab) else { return };
+        let now = self.now;
+        let t = &mut self.tabs[i];
+        if let Some(Some(rt)) = t.scripts.get_mut(si) {
+            match rt.ws_event(&mut t.doc, sid, kind, data, &info, now) {
+                Ok(()) => {
+                    self.after_script(i, si, host);
+                }
+                Err(e) => self.script_failed(i, si, &e, host),
+            }
+        }
     }
 
     /// Reports a script failure and stops that script.
@@ -1906,6 +2020,7 @@ impl Browser {
             y: init.y as f64,
             button: init.button,
             repeat: init.repeat,
+            delta: (init.delta.0 as f64, init.delta.1 as f64),
         };
         let mut prevented = false;
         let mut n = Some(node);
@@ -2128,9 +2243,19 @@ impl Browser {
             Event::MouseDown { x, y, button: 2 } => self.context_menu(x as f32, y as f32, host),
             Event::MouseUp { x, y, button: 0 } => self.mouse_up(x as f32, y as f32, host),
             Event::MouseDown { .. } | Event::MouseUp { .. } => {}
-            Event::Wheel { dy, .. } => {
+            Event::Wheel { dx, dy } => {
                 self.close_menu();
                 let (t, lx, ly) = self.target_at(self.pointer.0, self.pointer.1);
+                // The page hears `wheel` first; canceling it (a map zooming)
+                // keeps the page from scrolling.
+                if t == Target::Page
+                    && let Some(e) = self.doc(t).hit_test(lx, ly).element
+                {
+                    let init = EventInit { delta: (dx as f32, dy as f32), ..EventInit::pointer(lx, ly, 0) };
+                    if self.dispatch(e, "wheel", init, host) {
+                        return;
+                    }
+                }
                 // A frame under the pointer scrolls first.
                 let doc = &mut self.tabs[self.active].doc;
                 if t == Target::Page
@@ -2898,7 +3023,7 @@ impl Browser {
             "close-tab" => self.close_tab(tab.unwrap_or(self.active), host),
             "back" => self.go(-1, host),
             "forward" => self.go(1, host),
-            "reload" => self.load(self.active, host),
+            "reload" => self.reload(host),
             "close-download" => {
                 if let Some(bar) = self.chrome_el("download")
                     && let Some(e) = self.chrome.dom_mut().element_mut(bar)
@@ -3150,8 +3275,8 @@ impl Browser {
             c if cmd && c == 'L' as i32 => return self.focus_address(true),
             c if cmd && c == 'T' as i32 => return self.new_tab("about:home", host),
             c if cmd && c == 'W' as i32 => return self.close_tab(self.active, host),
-            c if cmd && c == 'R' as i32 => return self.load(self.active, host),
-            key::F5 => return self.load(self.active, host),
+            c if cmd && c == 'R' as i32 => return self.reload(host),
+            key::F5 => return self.reload(host),
             key::LEFT_BRACKET if cmd => return self.go(-1, host),
             key::RIGHT_BRACKET if cmd => return self.go(1, host),
             key::LEFT if mods.alt && self.focused_text_input().is_none() => {
@@ -3991,6 +4116,43 @@ mod tests {
     }
 
     #[test]
+    fn back_returns_to_the_scroll_position() {
+        let (mut b, mut h) = browser();
+        let page = br##"<body style="margin:0"><div style="height:5000px">tall</div></body>"##;
+        b.navigate("https://w.org/a", &mut h);
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert!(b.tabs[b.active].doc.scroll_by(10.0, 10.0, 1234.0));
+        b.navigate("https://w.org/b", &mut h);
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 0.0, "a new page starts at the top");
+        b.go(-1, &mut h);
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 1234.0, "back to where it was");
+        b.go(1, &mut h);
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 0.0);
+    }
+
+    #[test]
+    fn ruby_annotations_sit_above_their_bases() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://w.org/ruby", &mut h);
+        let page = r#"<body style="margin:0;font-size:20px">a<ruby><span id=base>漢</span><rp>(</rp><rt id=rt>kan</rt><rp>)</rp></ruby>b<span id=after style=display:inline-block>c</span>"#;
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let doc = &b.tabs[b.active].doc;
+        let rect = |id: &str| doc.content_box(page_el(&b, id)).unwrap();
+        let (base, rt, after) = (rect("base"), rect("rt"), rect("after"));
+        assert!(rt.y + rt.h <= base.y + 0.5, "annotation above: {rt:?} {base:?}");
+        assert!((rt.x + rt.w / 2.0 - (base.x + base.w / 2.0)).abs() < 1.0, "centered: {rt:?} {base:?}");
+        assert!((base.y + base.h - (after.y + after.h)).abs() < 1.0, "base on the line: {base:?} {after:?}");
+    }
+
+    #[test]
     fn wasm_counter_page() {
         let (mut b, mut h) = browser();
         b.navigate("about:counter", &mut h);
@@ -4178,6 +4340,55 @@ mod tests {
         }
         fn wall_clock(&mut self) -> Option<f64> {
             Some(1_700_000_000_000.0)
+        }
+        fn ws_open(&mut self, id: u32, url: &str, protocols: &[String], origin: &str) {
+            self.logs.push(format!("ws_open {id} {url} {} {origin}", protocols.join(",")));
+        }
+        fn ws_send(&mut self, id: u32, data: &[u8], text: bool) {
+            self.logs.push(format!("ws_send {id} {} {text}", String::from_utf8_lossy(data)));
+        }
+        fn ws_close(&mut self, id: u32, code: u16, reason: &str) {
+            self.logs.push(format!("ws_close {id} {code} {reason}"));
+        }
+    }
+
+    #[test]
+    fn websockets_go_through_the_host() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://ws.test/room", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              const w = new WebSocket('/live?x=1', ['chat']);
+              console.log('state ' + w.readyState + ' ' + w.url);
+              w.binaryType = 'arraybuffer';
+              w.onopen = () => { console.log('open ' + w.protocol); w.send('hi'); w.send(new Uint8Array([1, 2])); };
+              w.addEventListener('message', (e) => console.log('message ' + (typeof e.data === 'string' ? e.data : new Uint8Array(e.data).join('+'))));
+              w.onclose = (e) => console.log('close ' + e.code + ' ' + e.wasClean + ' ' + e.reason + ' ' + w.readyState);
+              try { new WebSocket('ftp://x/'); } catch (e) { console.log('bad ' + e.name); }
+              window.w = w;
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let open = h.logs.iter().find(|l| l.starts_with("ws_open ")).expect("opened").clone();
+        assert!(open.ends_with(" wss://ws.test/live?x=1 chat https://ws.test"), "{open}");
+        let gid: u32 = open.split(' ').nth(1).unwrap().parse().unwrap();
+        b.ws_event(gid, WsEvent::Open("chat".into()), &mut h);
+        b.ws_event(gid, WsEvent::Text("hello".into()), &mut h);
+        b.ws_event(gid, WsEvent::Binary(vec![7, 8]), &mut h);
+        b.ws_event(gid, WsEvent::Close { code: 1000, reason: "done here".into(), clean: true }, &mut h);
+        for want in [
+            "state 0 wss://ws.test/live?x=1",
+            "bad SyntaxError",
+            "open chat",
+            &format!("ws_send {gid} hi true"),
+            &format!("ws_send {gid} \u{1}\u{2} false"),
+            "message hello",
+            "message 7+8",
+            "close 1000 true done here 3",
+        ] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
     }
 
@@ -4548,6 +4759,9 @@ mod tests {
               log('z4 ' + Intl.DateTimeFormat('zh-TW', { timeZone: 'Asia/Tokyo', weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' }).format(d));
               const zh = (o) => new Intl.DateTimeFormat('zh-TW', { ...tz, ...o }).format(d);
               log('z7 ' + [zh({ dateStyle: 'full', timeStyle: 'short' }), zh({ dateStyle: 'short', timeStyle: 'short' }), zh({ month: 'numeric', day: 'numeric', weekday: 'short' }), zh({ weekday: 'long', hour: 'numeric' }), zh({ year: 'numeric', month: 'numeric', day: 'numeric', weekday: 'long' }), zh({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })].join(' | '));
+              const sv = (o) => new Intl.DateTimeFormat('sv', { ...tz, ...o }).format(d);
+              log('s1 ' + [d.toLocaleDateString('sv', tz), d.toLocaleString('sv-SE', tz), sv({ dateStyle: 'full' }), sv({ dateStyle: 'medium', timeStyle: 'short' }), sv({ month: 'numeric', day: 'numeric' }), sv({ weekday: 'short' }), sv({ year: 'numeric', month: '2-digit' })].join(' | '));
+              log('c1 ' + [d.toLocaleDateString('en-CA', tz), d.toLocaleString('en-CA', tz), new Intl.DateTimeFormat('en-CA', { ...tz, dateStyle: 'medium' }).format(d)].join(' | '));
               try { new Intl.DateTimeFormat('en-US', { timeZone: 'Nowhere/Atlantis' }); } catch (e) { log('z5 ' + e.name); }
               log('z6 ' + Intl.supportedValuesOf('timeZone').includes('Europe/London'));
               const n = (v, o) => new Intl.NumberFormat('en-US', o).format(v);
@@ -4577,6 +4791,8 @@ mod tests {
             "z2 11/3/26, 9:05 AM",
             "z3 2026年11月3日 晚上10:05",
             "z4 2026年11月3日星期二",
+            "s1 2026-11-03 | 2026-11-03 14:05:09 | tisdag 3 november 2026 | 3 nov. 2026 14:05 | 3/11 | tis | 2026-11",
+            "c1 2026-11-03 | 2026-11-03, 2:05:09 p.m. | Nov 3, 2026",
             "z5 RangeError",
             "z6 true",
             "z7 2026年11月3日 星期二 下午2:05 | 2026/11/3 下午2:05 | 11/3（週二） | 星期二下午2時 | 2026年11月3日 星期二 | 14:05",

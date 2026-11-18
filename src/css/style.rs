@@ -35,6 +35,10 @@ pub enum Display {
     TableRow,
     TableCell,
     TableCaption,
+    /// `display: ruby` (CSS Ruby 1): annotations above their bases.
+    Ruby,
+    /// `display: ruby-text`: an annotation (`<rt>`).
+    RubyText,
 }
 
 impl Display {
@@ -42,7 +46,11 @@ impl Display {
     pub fn is_inline_level(&self) -> bool {
         matches!(
             self,
-            Display::Inline | Display::InlineBlock | Display::InlineFlex | Display::InlineGrid
+            Display::Inline
+                | Display::InlineBlock
+                | Display::InlineFlex
+                | Display::InlineGrid
+                | Display::Ruby
         )
     }
 }
@@ -418,6 +426,9 @@ pub struct Style {
     /// `user-select: none` here or on an ancestor (CSS UI 4: `auto` takes the
     /// parent's `none`): text here cannot start a selection.
     pub user_select_none: bool,
+    /// `pointer-events: none` (inherited): the box is never the target of
+    /// pointer events; they go to what is under it.
+    pub pointer_events_none: bool,
     pub border_spacing: f32,
     pub border_collapse: bool,
     /// `table-layout: fixed` (not inherited).
@@ -539,6 +550,7 @@ impl Default for Style {
             align_content: Align::Normal,
             text_transform: TextTransform::None,
             user_select_none: false,
+            pointer_events_none: false,
             border_spacing: 0.0,
             border_collapse: false,
             table_layout_fixed: false,
@@ -642,6 +654,7 @@ impl Style {
             border_collapse: parent.border_collapse,
             text_transform: parent.text_transform,
             user_select_none: parent.user_select_none,
+            pointer_events_none: parent.pointer_events_none,
             text_shadow: parent.text_shadow.clone(),
             vars: parent.vars.clone(),
             ..Style::default()
@@ -745,6 +758,8 @@ impl Style {
                     "inline-grid" => Display::InlineGrid,
                     "contents" => Display::Contents,
                     "list-item" => Display::ListItem,
+                    "ruby" => Display::Ruby,
+                    "ruby-text" => Display::RubyText,
                     _ => return,
                 }
             }
@@ -1231,6 +1246,10 @@ impl Style {
             "outline-style" => set(&mut self.outline_style, border_style(v)),
             "outline-color" => set(&mut self.outline_color, values::color(value, self.color)),
             "outline-offset" => set(&mut self.outline_offset, px(v)),
+            "pointer-events" => {
+                // The SVG values other than `none` act as `auto` on HTML boxes.
+                self.pointer_events_none = v == "none";
+            }
             "user-select" | "-webkit-user-select" => {
                 self.user_select_none = match v {
                     "none" => true,
@@ -1617,6 +1636,7 @@ impl Style {
             "opacity" => self.opacity = from.opacity,
             "text-transform" => self.text_transform = from.text_transform,
             "user-select" | "-webkit-user-select" => self.user_select_none = from.user_select_none,
+            "pointer-events" => self.pointer_events_none = from.pointer_events_none,
             "overflow" | "overflow-y" => self.overflow = from.overflow,
             "color" => self.color = from.color,
             "font-size" => self.font_size = from.font_size,
@@ -1739,6 +1759,7 @@ fn is_inherited(name: &str) -> bool {
                 | "border-collapse"
                 | "text-transform"
                 | "writing-mode"
+                | "pointer-events"
         )
 }
 

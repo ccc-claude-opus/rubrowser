@@ -24,7 +24,7 @@ pub fn scheme(s: &str) -> Option<&str> {
 pub fn from_input(input: &str) -> String {
     let s = input.trim();
     if s.is_empty() || scheme(s).is_some() {
-        return s.to_string();
+        return encode(s);
     }
     if s.starts_with('/') || s.starts_with("./") || s.starts_with("../") {
         return s.to_string();
@@ -32,16 +32,61 @@ pub fn from_input(input: &str) -> String {
     let host = s.split('/').next().unwrap_or("");
     let is_file_name = !s.contains('/') && s.ends_with(".wasm");
     if host.starts_with("localhost") || host.starts_with("127.0.0.1") {
-        return format!("http://{s}");
+        return encode(&format!("http://{s}"));
     }
     if host.contains('.') && !is_file_name {
-        return format!("https://{s}");
+        return encode(&format!("https://{s}"));
     }
     s.to_string()
 }
 
-/// Resolves `link` (possibly relative) against the page at `base`.
+/// Percent-encodes what the URL Standard's parser encodes in an `http(s)`
+/// URL: in the path, controls, space, `"`, `<`, `>`, `` ` ``, `{`, `}` and
+/// non-ASCII (as UTF-8); in the query, controls, space, `"`, `'`, `<`, `>`
+/// and non-ASCII; in the fragment, controls, space, `"`, `<`, `>`, `` ` ``
+/// and non-ASCII. Existing `%XX` escapes are kept. Other schemes are
+/// returned as they are.
+pub fn encode(url: &str) -> String {
+    if !matches!(scheme(url), Some("http" | "https")) || url.bytes().all(|b| b > 0x20 && b < 0x7f && !b"\"<>`{}'".contains(&b)) {
+        return url.to_string();
+    }
+    let (rest, fragment) = match url.split_once('#') {
+        Some((r, f)) => (r, Some(f)),
+        None => (url, None),
+    };
+    let (path, query) = match rest.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (rest, None),
+    };
+    let esc = |s: &str, set: &[u8], out: &mut String| {
+        for &b in s.as_bytes() {
+            if b <= 0x20 || b >= 0x7f || set.contains(&b) {
+                out.push_str(&format!("%{b:02X}"));
+            } else {
+                out.push(b as char);
+            }
+        }
+    };
+    let mut out = String::with_capacity(url.len() * 2);
+    esc(path, b"\"<>`{}", &mut out);
+    if let Some(q) = query {
+        out.push('?');
+        esc(q, b"\"'<>", &mut out);
+    }
+    if let Some(f) = fragment {
+        out.push('#');
+        esc(f, b"\"<>`", &mut out);
+    }
+    out
+}
+
+/// Resolves `link` (possibly relative) against the page at `base`, then
+/// percent-encodes it ([`encode`]).
 pub fn resolve(base: &str, link: &str) -> String {
+    encode(&resolve_raw(base, link))
+}
+
+fn resolve_raw(base: &str, link: &str) -> String {
     let link = link.trim();
     if scheme(link).is_some() {
         return link.to_string();
@@ -249,6 +294,18 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn non_ascii_is_percent_encoded() {
+        assert_eq!(
+            resolve("https://cccbook.github.io/cccbook2026/", "電腦/演算法/"),
+            "https://cccbook.github.io/cccbook2026/%E9%9B%BB%E8%85%A6/%E6%BC%94%E7%AE%97%E6%B3%95/"
+        );
+        assert_eq!(resolve("https://a.test/", "/a b?q=x y&n='é'#f g"), "https://a.test/a%20b?q=x%20y&n=%27%C3%A9%27#f%20g");
+        assert_eq!(resolve("https://a.test/", "/%E9%9B%BB?a=%20"), "https://a.test/%E9%9B%BB?a=%20", "escapes stay");
+        assert_eq!(from_input("zh.wikipedia.org/wiki/電腦"), "https://zh.wikipedia.org/wiki/%E9%9B%BB%E8%85%A6");
+        assert_eq!(resolve("about:home", "電腦"), "about:電腦");
+    }
 
     #[test]
     fn schemes() {

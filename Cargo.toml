@@ -29,7 +29,7 @@ core = [
     "dep:rustybuzz",
 ]
 # Native window version (main).
-native = ["core", "dep:wasmtime", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:arboard", "dep:memmap2", "dep:rfd", "dep:jiff"]
+native = ["core", "dep:wasmtime", "resvg/system-fonts", "dep:winit", "dep:softbuffer", "dep:ureq", "dep:tungstenite", "dep:arboard", "dep:memmap2", "dep:rfd", "dep:jiff"]
 # Audio and video playback with FFmpeg (needs FFmpeg 8 installed, e.g.
 # `brew install ffmpeg`); without it, media elements report an error.
 media = ["native", "dep:ffmpeg-next", "dep:cpal", "image/avif-native"]
@@ -45,6 +45,8 @@ wasmi = { version = "2", default-features = false, features = ["std", "stable", 
 # Native builds compile scripts to machine code (wasmi interprets them).
 wasmtime = { version = "50", default-features = false, features = ["std", "runtime", "cranelift", "parallel-compilation", "async"], optional = true }
 ureq = { version = "3", optional = true, features = ["cookies", "brotli", "charset"] }
+# WebSocket connections (MIT OR Apache-2.0), TLS through rustls as ureq.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"], optional = true }
 arboard = { version = "3", default-features = false, optional = true }
 # The native file dialog for <input type=file> (MIT; macOS: NSOpenPanel,
 # Linux: the XDG desktop portal over D-Bus).

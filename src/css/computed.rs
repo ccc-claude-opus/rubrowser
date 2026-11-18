@@ -258,6 +258,8 @@ fn display(d: Display) -> &'static str {
         Display::Grid => "grid",
         Display::InlineGrid => "inline-grid",
         Display::Contents => "contents",
+        Display::Ruby => "ruby",
+        Display::RubyText => "ruby-text",
         Display::Table => "table",
         Display::TableRowGroup => "table-row-group",
         Display::TableRow => "table-row",

@@ -261,6 +261,26 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             }
             Ok(JsArray::from_iter(out.into_iter().map(JsValue::from), c).into())
         }),
+        ("wsOpen", 2, |_, a, c| {
+            let (url, protocols) = (text(a, 0, c)?, text(a, 1, c)?);
+            Ok(unsafe { ffi::ws_open(url.as_ptr(), url.len(), protocols.as_ptr(), protocols.len()) }.into())
+        }),
+        ("wsSend", 3, |_, a, c| {
+            let id = a.get_or_undefined(0).to_i32(c)?;
+            let (data, is_text) = match bytes(a.get_or_undefined(1), c)? {
+                Some(b) => (b, 0),
+                None => (text(a, 1, c)?.into_bytes(), 1),
+            };
+            unsafe { ffi::ws_send(id, data.as_ptr(), data.len(), is_text) };
+            Ok(JsValue::undefined())
+        }),
+        ("wsClose", 3, |_, a, c| {
+            let id = a.get_or_undefined(0).to_i32(c)?;
+            let code = a.get_or_undefined(1).to_i32(c)?;
+            let reason = text(a, 2, c)?;
+            unsafe { ffi::ws_close(id, code, reason.as_ptr(), reason.len()) };
+            Ok(JsValue::undefined())
+        }),
         ("http", 4, |_, a, c| {
             // The body is a string (sent as UTF-8) or bytes.
             let body = match bytes(a.get_or_undefined(2), c)? {
@@ -359,6 +379,8 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             let s = text(a, 0, c)?;
             Ok(unsafe { ffi::audio(s.as_ptr(), s.len()) }.into())
         }),
+        ("quirks", 0, |_, _, _| Ok(unsafe { ffi::quirks() }.into())),
+        ("focused", 0, |_, _, _| Ok(unsafe { ffi::focused() }.into())),
         ("imageInfo", 2, |_, a, c| {
             Ok(unsafe { ffi::image_info(int(a, 0, c)?, int(a, 1, c)?) }.into())
         }),
@@ -433,6 +455,10 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
         ("mediaMatches", 1, |_, a, c| {
             let q = text(a, 0, c)?;
             Ok((unsafe { ffi::media_matches(q.as_ptr(), q.len()) } != 0).into())
+        }),
+        ("cssSupports", 1, |_, a, c| {
+            let q = text(a, 0, c)?;
+            Ok((unsafe { ffi::css_supports(q.as_ptr(), q.len()) } != 0).into())
         }),
         ("computedStyle", 2, |_, a, c| {
             let (h, name) = (int(a, 0, c)?, text(a, 1, c)?);
@@ -877,6 +903,18 @@ pub fn http(id: i32, status: i32) {
     });
 }
 
+/// `rb_ws`: something happened on WebSocket `id` (see `Script::ws_event`).
+pub fn ws(id: i32, kind: i32) {
+    with_context(|ctx| {
+        let f = ctx.global_object().get(js_string!("__rb_ws"), ctx);
+        if let Some(f) = f.ok().and_then(|f| f.as_callable())
+            && let Err(e) = f.call(&JsValue::undefined(), &[id.into(), kind.into()], ctx)
+        {
+            report(e, ctx);
+        }
+    });
+}
+
 /// `rb_event`: runs listener `id`.
 pub fn event(id: i32) {
     call_global("__rb_dispatch", id);
@@ -921,6 +959,11 @@ macro_rules! js_runtime {
         #[unsafe(no_mangle)]
         pub extern "C" fn rb_http(id: i32, status: i32) {
             $crate::lang::js::http(id, status)
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn rb_ws(id: i32, kind: i32) {
+            $crate::lang::js::ws(id, kind)
         }
     };
 }

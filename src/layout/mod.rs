@@ -745,6 +745,9 @@ impl Builder<'_> {
         if css.display == CDisplay::Table {
             return self.build_table(tree, id, &css, tstyle);
         }
+        if css.display == CDisplay::Ruby {
+            return self.build_ruby(tree, id, tstyle);
+        }
 
         if matches!(
             self.dom.tag(id),
@@ -902,6 +905,87 @@ impl Builder<'_> {
             }
         }
         let node = tree.new_with_children(tstyle, &kids).unwrap();
+        tree.set_node_context(
+            node,
+            Some(Ctx {
+                node: Some(id),
+                style_node: id,
+                inline: None,
+                intrinsic: None,
+                keeps_ratio: false,
+                ratio_only: false,
+            }),
+        )
+        .unwrap();
+        node
+    }
+
+    /// A ruby container (CSS Ruby 1, simplified): each run of base content
+    /// with the annotations (`display: ruby-text`) after it becomes a pair,
+    /// the annotation centered above the base; pairs sit side by side with
+    /// their bases on one line, and the container's baseline is the bases'.
+    fn build_ruby(&mut self, tree: &mut TaffyTree<Ctx>, id: NodeId, mut tstyle: Style) -> taffy::NodeId {
+        let mut parts: Vec<Part> = Vec::new();
+        self.collect_children(tree, id, true, &mut parts);
+        let ctx = |inline| Ctx {
+            node: None,
+            style_node: id,
+            inline,
+            intrinsic: None,
+            keeps_ratio: false,
+            ratio_only: false,
+        };
+        let column = Style {
+            display: Display::Flex,
+            flex_direction: taffy::FlexDirection::Column,
+            align_items: AlignItems::CENTER,
+            ..Default::default()
+        };
+        let mut pairs = Vec::new();
+        let (mut bases, mut texts) = (Vec::new(), Vec::new());
+        let mut close = |tree: &mut TaffyTree<Ctx>, bases: &mut Vec<taffy::NodeId>, texts: &mut Vec<taffy::NodeId>| {
+            if bases.is_empty() && texts.is_empty() {
+                return;
+            }
+            let kids: Vec<_> = texts.drain(..).chain(bases.drain(..)).collect();
+            let pair = tree.new_with_children(column.clone(), &kids).unwrap();
+            tree.set_node_context(pair, Some(ctx(None))).unwrap();
+            pairs.push(pair);
+        };
+        for p in parts {
+            match p {
+                Part::Inline(items) => {
+                    let content = Content { owner: id, items };
+                    if content.is_blank(self.styles) {
+                        continue;
+                    }
+                    if !texts.is_empty() {
+                        close(tree, &mut bases, &mut texts);
+                    }
+                    let anon = tree.new_leaf_with_context(Style::default(), ctx(Some(content))).unwrap();
+                    bases.push(anon);
+                }
+                Part::Block(c) => {
+                    let annotation = tree
+                        .get_node_context(c)
+                        .and_then(|x| self.style(x.style_node))
+                        .is_some_and(|s| s.display == CDisplay::RubyText);
+                    if annotation {
+                        texts.push(c);
+                    } else {
+                        if !texts.is_empty() {
+                            close(tree, &mut bases, &mut texts);
+                        }
+                        bases.push(c);
+                    }
+                }
+            }
+        }
+        close(tree, &mut bases, &mut texts);
+        tstyle.display = Display::Flex;
+        tstyle.flex_direction = taffy::FlexDirection::Row;
+        tstyle.align_items = AlignItems::FLEX_END;
+        let node = tree.new_with_children(tstyle, &pairs).unwrap();
         tree.set_node_context(
             node,
             Some(Ctx {

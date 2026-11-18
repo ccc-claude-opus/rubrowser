@@ -125,6 +125,9 @@ pub struct Document {
     /// Fragment (`#id`) to keep scrolled into view while the page loads,
     /// until the user scrolls.
     fragment: Option<String>,
+    /// Page scroll position to return to (going back / forward, reload),
+    /// kept while the page loads until the user scrolls.
+    restore: Option<f32>,
     size: (f32, f32),
     needs_style: bool,
     /// After element-state changes only: the subtrees to restyle.
@@ -186,6 +189,7 @@ impl Document {
                 .split_once('#')
                 .map(|(_, f)| f.to_string())
                 .filter(|f| !f.is_empty()),
+            restore: None,
             size: (0.0, 0.0),
             needs_style: true,
             restyle_roots: Vec::new(),
@@ -1702,6 +1706,10 @@ impl Document {
         if clips && !inside {
             return false;
         }
+        // `pointer-events: none` and `visibility: hidden` boxes are not
+        // targets themselves; their children may be.
+        let targetable = |s: Option<&crate::css::Style>| s.is_none_or(|s| s.visible && !s.pointer_events_none);
+        let inside = inside && targetable(style);
         let scrolls =
             clips && style.is_some_and(|s| s.overflow.scrolls()) && b.content_h > b.rect.h;
         let sy = if clips { self.scroll_of(b.node) } else { 0.0 };
@@ -1746,7 +1754,7 @@ impl Document {
                                 w: *width,
                                 h: line.height,
                             };
-                            if rect.contains(x, y) {
+                            if rect.contains(x, y) && targetable(self.style(*node)) {
                                 hit.element = self.real_node(*node).and_then(|n| {
                                     if n == *node {
                                         self.dom.parent(n)
@@ -1803,11 +1811,26 @@ impl Document {
     /// Scrolls the page to the element named by `fragment` (`id`, or
     /// `<a name>`), or to the top for an empty fragment / `top`.
     pub fn scroll_to_fragment(&mut self, fragment: &str) {
+        self.restore = None;
         self.fragment = Some(fragment.to_string());
         self.apply_fragment();
     }
 
+    /// Returns the page to scroll position `y` (a history entry's), and
+    /// keeps it there as the page grows while loading, until the user scrolls.
+    pub fn restore_scroll(&mut self, y: f32) {
+        self.fragment = None;
+        self.restore = Some(y);
+        self.apply_fragment();
+    }
+
     fn apply_fragment(&mut self) {
+        if let Some(y) = self.restore {
+            if !self.tree.boxes.is_empty() {
+                self.scroll.insert(None, y.min(self.max_scroll(None)));
+            }
+            return;
+        }
         let Some(f) = self.fragment.clone() else {
             return;
         };
@@ -1841,6 +1864,7 @@ impl Document {
     /// Returns true if something scrolled.
     pub fn scroll_by(&mut self, x: f32, y: f32, dy: f32) -> bool {
         self.fragment = None;
+        self.restore = None;
         for s in self.hit_test(x, y).scrollers {
             let cur = self.scroll_of(s);
             let next = (cur + dy).clamp(0.0, self.max_scroll(s));

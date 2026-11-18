@@ -60,8 +60,13 @@ imports! {
     fn rect(h: i32, which: i32) -> f64;
     fn image_info(h: i32, which: i32) -> f64;
     fn audio(p: *const u8, n: usize) -> f64;
+    fn quirks() -> i32;
+    fn focused() -> i32;
     fn http(up: *const u8, ul: usize, mp: *const u8, ml: usize, bp: *const u8, bl: usize, cp: *const u8, cl: usize) -> i32;
     fn http_body(id: i32, p: *mut u8, cap: usize) -> i32;
+    fn ws_open(up: *const u8, ul: usize, pp: *const u8, pl: usize) -> i32;
+    fn ws_send(id: i32, p: *const u8, n: usize, text: i32);
+    fn ws_close(id: i32, code: i32, p: *const u8, n: usize);
     fn http_headers(id: i32, p: *mut u8, cap: usize) -> i32;
     fn files(h: i32, p: *mut u8, cap: usize) -> i32;
     fn file_data(h: i32, i: i32, p: *mut u8, cap: usize) -> i32;
@@ -72,6 +77,7 @@ imports! {
     fn set_text(h: i32, p: *const u8, n: usize);
     fn get_attr(h: i32, np: *const u8, nl: usize, p: *mut u8, cap: usize) -> i32;
     fn media_matches(p: *const u8, n: usize) -> i32;
+    fn css_supports(p: *const u8, n: usize) -> i32;
     fn canvas(h: i32, p: *const u8, n: usize, out: *mut u8, cap: usize) -> i32;
     fn media(h: i32, p: *const u8, n: usize, out: *mut u8, cap: usize) -> i32;
     fn computed_style(h: i32, np: *const u8, nl: usize, p: *mut u8, cap: usize) -> i32;

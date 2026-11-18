@@ -46,6 +46,8 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `query_within(root, sel_ptr, sel_len, out_ptr, max) -> i32` | 同上，但只找 `root` 底下的節點（`root` 不在文件中也可以） |
 | `rect(h, which) -> f64` | 上次排版的幾何（邏輯像素、相對於視窗）：0 x、1 y、2 寬、3 高（border box），4 寬、5 高（padding box）；`h = 0` 是視窗 |
 | `audio(ptr, len) -> f64` | Web Audio 的指令（欄位以 U+0001 分隔，見 `src/media/webaudio.rs`）：建立 context 與節點、連接、參數排程、開始與停止；回傳新 id、`currentTime` 等數字 |
+| `quirks() -> i32` | 1：文件以 quirks 模式呈現（沒有或舊式的 doctype） |
+| `focused() -> i32` | 頁面目前有焦點的元素（`document.activeElement`），沒有時 -1 |
 | `image_info(h, which) -> f64` | `<img>` 的圖片：0 狀態（0 載入中、1 已載入、2 失敗、3 沒有要求圖片），1 原始寬度、2 原始高度（像素） |
 | `http(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, type_ptr, type_len) -> i32` | 發出 HTTP 請求（只限同源），回傳請求編號；完成時瀏覽器呼叫匯出的 `rb_http(id, status)`（`status` 0 表示失敗） |
 | `http_body(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應內容，回傳總長度 |
@@ -70,6 +72,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `canvas(h, cmd_ptr, cmd_len, ptr, cap) -> i32` | `<canvas>` 的 2D 繪圖指令：名稱與參數以 U+0001 分隔（例如 `fillRect␁0␁0␁10␁10`）；查詢指令（`measureText`、`getImageData`、`toDataURL`、`isPointInPath`、建立漸層 / 圖樣）把結果字串寫到 `ptr`，否則回傳 -1 |
 | `media(h, cmd_ptr, cmd_len, ptr, cap) -> i32` | `<video>` / `<audio>`：`play`（結果 `ok` 或錯誤名稱）、`pause`、`seek␁秒`、`volume␁v`、`muted␁0/1`、`loop␁0/1`、`load`、`info`（以逗號分隔：paused、ended、currentTime、duration、readyState、volume、muted、videoWidth、videoHeight、錯誤碼、網址）、`canPlayType␁MIME`（`probably` / `maybe` / 空字串，不需元素） |
 | `media_matches(ptr, len) -> i32` | 媒體查詢（如 `(max-width: 600px)`）是否符合目前的 viewport（`matchMedia`） |
+| `css_supports(ptr, len) -> i32` | `@supports` 的條件（如 `(display: grid)`）是否成立（`CSS.supports`） |
 | `computed_style(h, name_ptr, name_len, ptr, cap) -> i32` | CSS 屬性的計算值（`getComputedStyle`；不認得的屬性為空字串），`h` 不是元素時回傳 -1 |
 | `set_attr(h, name_ptr, name_len, val_ptr, val_len)` | 設定屬性 |
 | `remove_attr(h, name_ptr, name_len)` | 移除屬性 |
@@ -188,7 +191,7 @@ JavaScript 等直譯式語言以「runtime 模組」執行：一個額外匯出�
 |---|---|
 | `get_checked(h) -> i32` / `set_checked(h, v)` | checkbox / radio 是否勾選（radio 會取消同組其他項） |
 | `get_selected(h) -> i32` / `set_selected(h, i)` | `<select>` 選中的 option 索引（-1 表示沒有） |
-| `form_action(h, op)` | 對 `<form>`：0 送出（不觸發 submit 事件，依 method / enctype 編碼）、1 重設；對任何元素：2 執行它的 activation behavior（`click()` / `showPicker()`）：`<input type=file>` 開選檔對話框、連結換頁或下載、送出 / 重設按鈕 |
+| `form_action(h, op)` | 對 `<form>`：0 送出（不觸發 submit 事件，依 method / enctype 編碼）、1 重設；對任何元素：2 執行它的 activation behavior（`click()` / `showPicker()`）：`<input type=file>` 開選檔對話框、連結換頁或下載、送出 / 重設按鈕；3 `focus()`、4 `blur()`（腳本返回後瀏覽器移動焦點並送 `blur` / `focus`） |
 | `files(h, ptr, cap) -> i32` | `<input type=file>` 選的檔案：第一行是這次選擇的序號（選擇改變就變），之後每檔一行 `name\ttype\tsize\tlastModified`；不是 file input 回傳 -1 |
 | `file_data(h, i, ptr, cap) -> i32` | 第 `i` 個檔案的內容（位元組），回傳總長度 |
 
