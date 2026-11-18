@@ -35,6 +35,8 @@ pub struct Painter<'a> {
     pub focus: Option<NodeId>,
     /// Whether the blinking caret is currently shown.
     pub caret: bool,
+    /// Selected page text: the characters selected in each run of text.
+    pub selection: &'a crate::document::selection::Highlights,
     pub images: &'a Images,
     pub forms: &'a FormState,
     /// Top of the page viewport while painting (for sticky boxes).
@@ -2164,6 +2166,22 @@ impl Painter<'_> {
                                 h: m.ascent + m.descent,
                             };
                             self.fill(c, bg, ps.background);
+                        }
+                        // Selected characters: a highlight behind them.
+                        let sel = (*node, line.top.to_bits(), tx.to_bits());
+                        if let Some(&(from, to)) = self.selection.get(&sel) {
+                            let at = |n: usize| {
+                                let end = text.char_indices().nth(n).map_or(text.len(), |(b, _)| b);
+                                self.fonts.measure(st.font(), st.font_size, &text[..end])
+                            };
+                            let (a, b) = (at(from), at(to));
+                            let hl = RectF {
+                                x: x + tx + a,
+                                y: y + line.top,
+                                w: (b - a).max(1.0),
+                                h: line.height,
+                            };
+                            self.fill(c, hl, SELECTION);
                         }
                         self.text(c, st, x + tx, baseline, text, st.color);
                         let thick = (st.font_size / 14.0).max(1.0);

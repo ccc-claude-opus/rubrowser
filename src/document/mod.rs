@@ -25,6 +25,7 @@ pub mod canvas;
 mod forms;
 mod image;
 pub mod media;
+pub mod selection;
 
 pub use forms::{
     Control, FileData, FormState, FormValue, control, entry_pairs, extensions_for_mime, form_of,
@@ -133,6 +134,9 @@ pub struct Document {
     inputs: HashMap<NodeId, TextField>,
     /// Whether the caret is in its visible blink phase.
     pub caret_on: bool,
+    /// Selected page text, and the characters it covers in each run.
+    pub selection: Option<selection::Selection>,
+    pub highlights: selection::Highlights,
     /// Option under the pointer in the open `<select>` list.
     pub popup_hover: Option<usize>,
     pub images: Images,
@@ -186,6 +190,8 @@ impl Document {
             needs_layout: true,
             inputs: HashMap::new(),
             caret_on: true,
+            selection: None,
+            highlights: Default::default(),
             popup_hover: None,
             images: Images::default(),
             forms: FormState::default(),
@@ -606,6 +612,8 @@ impl Document {
         self.update_style();
         if self.needs_layout {
             let replaced = self.replaced_sizes(fonts);
+            // The selection follows its text to its new place.
+            let runs_before = self.selection.is_some().then(|| self.text_runs());
             self.tree = layout(
                 &self.dom,
                 &self.styles,
@@ -618,6 +626,9 @@ impl Document {
             self.needs_layout = false;
             self.clamp_scroll();
             self.apply_fragment();
+            if let Some(before) = runs_before {
+                self.refresh_selection(&before);
+            }
             if let Some(t) = t0 {
                 eprintln!(
                     "[profile] style+layout {:.1} ms",
@@ -809,6 +820,7 @@ impl Document {
             inputs: &self.inputs,
             focus: self.state.focus,
             caret: self.caret_on,
+            selection: &self.highlights,
             images: &self.images,
             forms: &self.forms,
             view_top: Default::default(),

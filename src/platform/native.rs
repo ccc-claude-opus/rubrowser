@@ -105,6 +105,8 @@ struct State {
     browser: Browser,
     host: NativeHost,
     mods: Modifiers,
+    /// A Ctrl-click (macOS secondary click) is held down.
+    ctrl_click: bool,
     scale: f64,
     /// Last pointer position in logical pixels (button events have none).
     pointer: (i32, i32),
@@ -126,7 +128,7 @@ impl Host for NativeHost {
     fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
         let proxy = self.proxy.clone();
         let url = url.to_string();
-        let request = (!request.method.is_empty()).then(|| request.clone());
+        let request = (!request.method.is_empty() || !request.referrer.is_empty()).then(|| request.clone());
         std::thread::spawn(move || {
             let _ = proxy.send_event(Fetched::new(id, load_full(&url, request.as_ref())));
         });
@@ -437,25 +439,36 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
     {
         {
             let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
-            let mut resp = match request.filter(|r| r.method != "GET") {
+            let referrer = request.map_or("", |r| r.referrer.as_str());
+            let mut resp = match request.filter(|r| r.method != "GET" && !r.method.is_empty()) {
                 Some(r) => {
                     let ctype = if r.content_type.is_empty() {
                         "text/plain;charset=UTF-8"
                     } else {
                         &r.content_type
                     };
-                    agent()
+                    let mut req = agent()
                         .post(url)
                         .header("Accept", "*/*")
                         .header("Accept-Language", crate::net::accept_language())
-                        .header("Content-Type", ctype)
-                        .send(&r.body[..])
+                        .header("Content-Type", ctype);
+                    if !referrer.is_empty() {
+                        req = req.header("Referer", referrer);
+                    }
+                    req.send(&r.body[..])
                 }
-                None => agent()
-                    .get(url)
-                    .header("Accept", if request.is_some() { "*/*" } else { accept })
-                    .header("Accept-Language", crate::net::accept_language())
-                    .call(),
+                None => {
+                    // script requests (fetch, XHR) accept anything
+                    let script = request.is_some_and(|r| !r.method.is_empty());
+                    let mut req = agent()
+                        .get(url)
+                        .header("Accept", if script { "*/*" } else { accept })
+                        .header("Accept-Language", crate::net::accept_language());
+                    if !referrer.is_empty() {
+                        req = req.header("Referer", referrer);
+                    }
+                    req.call()
+                }
             }
             .map_err(|e| e.to_string())?;
             let status = resp.status();
@@ -521,7 +534,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
             self.pending += 1;
             let tx = self.tx.clone();
             let url = url.to_string();
-            let request = (!request.method.is_empty()).then(|| request.clone());
+            let request = (!request.method.is_empty() || !request.referrer.is_empty()).then(|| request.clone());
             std::thread::spawn(move || {
                 let _ = tx.send(Fetched::new(id, load_full(&url, request.as_ref())));
             });
@@ -662,6 +675,7 @@ impl ApplicationHandler<Fetched> for App {
             browser,
             host,
             mods: Modifiers::default(),
+            ctrl_click: false,
             scale,
             pointer: (-1, -1),
         });
@@ -743,6 +757,12 @@ impl ApplicationHandler<Fetched> for App {
             WindowEvent::CursorLeft { .. } => Some(Event::MouseLeave),
             WindowEvent::MouseInput { state, button, .. } => {
                 let button = match button {
+                    // Ctrl-click is the secondary click on macOS (the button
+                    // stays secondary until it is released).
+                    MouseButton::Left if cfg!(target_os = "macos") && (s.mods.ctrl || (state == ElementState::Released && s.ctrl_click)) => {
+                        s.ctrl_click = state == ElementState::Pressed;
+                        2
+                    }
                     MouseButton::Left => 0,
                     MouseButton::Middle => 1,
                     MouseButton::Right => 2,

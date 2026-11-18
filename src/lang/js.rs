@@ -355,6 +355,9 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
         ("rect", 2, |_, a, c| {
             Ok(unsafe { ffi::rect(int(a, 0, c)?, int(a, 1, c)?) }.into())
         }),
+        ("imageInfo", 2, |_, a, c| {
+            Ok(unsafe { ffi::image_info(int(a, 0, c)?, int(a, 1, c)?) }.into())
+        }),
         ("nodeType", 1, |_, a, c| {
             Ok(unsafe { ffi::node_type(int(a, 0, c)?) }.into())
         }),

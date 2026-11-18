@@ -3283,6 +3283,20 @@
     });
   }
 
+  // <img>: whether its image is done (loaded, broken or none) and its size
+  // (HTML's `complete`, `naturalWidth`, `naturalHeight`).
+  for (const [prop, get] of [
+    ['complete', (h) => rb.imageInfo(h, 0) !== 0],
+    ['naturalWidth', (h) => (rb.imageInfo(h, 0) === 1 ? rb.imageInfo(h, 1) : 0)],
+    ['naturalHeight', (h) => (rb.imageInfo(h, 0) === 1 ? rb.imageInfo(h, 2) : 0)],
+  ]) {
+    if (Object.getOwnPropertyDescriptor(Element.prototype, prop)) continue;
+    Object.defineProperty(Element.prototype, prop, {
+      configurable: true,
+      get() { return this.localName === 'img' ? get(this.__h) : undefined; },
+    });
+  }
+
   // `element.onclick = …` and friends.
   for (const name of ['load', 'error', 'click', 'dblclick', 'contextmenu', 'input', 'change', 'submit',
     'reset', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'mousedown', 'mouseup', 'mousemove',

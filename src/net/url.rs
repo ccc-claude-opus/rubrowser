@@ -199,8 +199,55 @@ pub fn title(url: &str) -> String {
     }
 }
 
+/// The `Referer` for a request from a document at `doc` to `target`, under
+/// the default referrer policy `strict-origin-when-cross-origin` (Referrer
+/// Policy §3): the whole URL (without fragment) to the same origin, only
+/// the origin elsewhere, nothing from HTTPS to HTTP or from non-HTTP pages.
+pub fn referrer(doc: &str, target: &str) -> String {
+    let origin = |u: &str| -> Option<String> {
+        let (scheme, rest) = u.split_once("://")?;
+        let scheme = scheme.to_ascii_lowercase();
+        if scheme != "http" && scheme != "https" {
+            return None;
+        }
+        let host = rest.split(['/', '?', '#']).next()?;
+        // credentials are never sent
+        let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
+        Some(format!("{scheme}://{}", host.to_ascii_lowercase()))
+    };
+    let (Some(from), Some(to)) = (origin(doc), origin(target)) else {
+        return String::new();
+    };
+    if from.starts_with("https:") && to.starts_with("http:") {
+        return String::new();
+    }
+    if from == to {
+        let url = doc.split('#').next().unwrap_or(doc);
+        // and no credentials in the full URL either
+        return match url.split_once("://") {
+            Some((s, rest)) => match rest.split_once('/') {
+                Some((auth, path)) => format!("{s}://{}/{path}", auth.rsplit_once('@').map_or(auth, |(_, h)| h)),
+                None => from + "/",
+            },
+            None => url.to_string(),
+        };
+    }
+    from + "/"
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn referrer_follows_strict_origin_when_cross_origin() {
+        use super::referrer;
+        assert_eq!(referrer("http://map.localhost:8700/a/b?q=1#x", "http://map.localhost:8700/c.png"), "http://map.localhost:8700/a/b?q=1");
+        assert_eq!(referrer("http://map.localhost:8700/a/b", "https://tile.openstreetmap.org/1/2/3.png"), "http://map.localhost:8700/");
+        assert_eq!(referrer("https://a.test/secret/page", "http://b.test/x"), "");
+        assert_eq!(referrer("https://user:pw@a.test/p", "https://a.test/q"), "https://a.test/p");
+        assert_eq!(referrer("file:///tmp/x.html", "https://b.test/"), "");
+        assert_eq!(referrer("about:home", "https://b.test/"), "");
+    }
+
     use super::*;
 
     #[test]

@@ -92,12 +92,16 @@ pub enum Cursor {
 }
 
 /// What the browser needs from the platform it runs on.
-/// Method and body of an HTTP request made by a page script.
+/// Method, body and referrer of an HTTP request (method empty: a plain GET
+/// for a page or a resource it uses).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HttpRequest {
     pub method: String,
     pub body: Vec<u8>,
     pub content_type: String,
+    /// The `Referer` to send (empty: none), from the document's URL and the
+    /// default referrer policy.
+    pub referrer: String,
 }
 
 pub trait Host {

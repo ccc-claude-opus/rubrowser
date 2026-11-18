@@ -761,6 +761,24 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
             Ok(found.len() as i32)
         },
     )?;
+    l.func_wrap("rb", "image_info", |c: C, h: i32, which: i32| -> f64 {
+        // An <img>: 0 its state (0 loading, 1 loaded, 2 broken, 3 no
+        // image requested), 1 its natural width, 2 its natural height.
+        use crate::document::ImageState;
+        let doc = &c.data().doc;
+        let Some(n) = node(doc, h) else { return 0.0 };
+        match (doc.images.get(n), which) {
+            (Some(ImageState::Loading(_)), 0) => 0.0,
+            (Some(ImageState::Ready(..)), 0) => 1.0,
+            (Some(ImageState::Failed(_)), 0) => 2.0,
+            // a src that has not been requested yet is still loading
+            (None, 0) if doc.dom.attr(n, "src").is_some_and(|s| !s.trim().is_empty()) => 0.0,
+            (None, 0) => 3.0,
+            (Some(ImageState::Ready(_, b)), 1) => b.width as f64,
+            (Some(ImageState::Ready(_, b)), 2) => b.height as f64,
+            _ => 0.0,
+        }
+    })?;
     l.func_wrap("rb", "rect", |mut c: C, h: i32, which: i32| -> f64 {
         c.data_mut().doc.ensure_layout();
         // Layout geometry from the last layout (logical px, viewport

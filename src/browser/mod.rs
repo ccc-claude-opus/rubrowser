@@ -64,6 +64,19 @@ struct Press {
     input: Option<NodeId>,
     /// Range input whose thumb is being dragged.
     range: Option<NodeId>,
+    /// Page text selection started here (a text point and the page point).
+    select: Option<(crate::document::selection::TextPoint, f32, f32)>,
+    /// The press became a drag that selected text (it is not a click).
+    selected: bool,
+}
+
+/// The context menu: what was under the pointer when it opened.
+#[derive(Clone, Debug, Default)]
+struct MenuCtx {
+    link: Option<String>,
+    image: Option<String>,
+    /// The text field it was opened on.
+    field: Option<(Target, NodeId)>,
 }
 
 /// What an outstanding fetch is for.
@@ -596,6 +609,10 @@ pub struct Browser {
     local: Vec<(u32, Result<Vec<u8>, String>)>,
     /// Last page click (element, time), to detect double clicks.
     last_click: Option<(NodeId, f64)>,
+    /// The last page mouse press (point and time), for double-clicking a word.
+    last_down: Option<(f32, f32, f64)>,
+    /// The open context menu.
+    menu: Option<MenuCtx>,
     /// Status and headers of responses not delivered yet (by fetch id).
     responses: HashMap<u32, ResponseInfo>,
 }
@@ -632,6 +649,8 @@ impl Browser {
             shown_tabs: Vec::new(),
             local: Vec::new(),
             last_click: None,
+            last_down: None,
+            menu: None,
             javascript: true,
             responses: HashMap::new(),
         };
@@ -817,7 +836,21 @@ impl Browser {
             self.local
                 .push((id, result.map(|f| f.bytes.to_vec()).map_err(String::from)));
         } else {
-            host.fetch(id, url);
+            // Resources of a page carry its URL as the referrer (pages
+            // themselves are opened without one).
+            let referrer = match self.requests[&id] {
+                Request::Page { .. } => String::new(),
+                ref r => self
+                    .tabs
+                    .iter()
+                    .find(|t| t.id == r.tab())
+                    .map_or_else(String::new, |t| url::referrer(&t.doc.url, url)),
+            };
+            if referrer.is_empty() {
+                host.fetch(id, url);
+            } else {
+                host.fetch_with(id, url, &crate::input::HttpRequest { referrer, ..Default::default() });
+            }
         }
     }
 
@@ -1472,6 +1505,20 @@ impl Browser {
                 {
                     doc.image_loaded(node, &src, result);
                     self.dirty = true;
+                    // An <img> of the page hears `load` (decoded) or `error`.
+                    if frame.is_none()
+                        && let Some(n) = node
+                        && self.tabs[i].doc.dom.tag(n) == Some("img")
+                    {
+                        let kind = match self.tabs[i].doc.images.get(n) {
+                            Some(crate::document::ImageState::Ready(s, _)) if *s == src => Some("load"),
+                            Some(crate::document::ImageState::Failed(s)) if *s == src => Some("error"),
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            self.element_event(i, n, kind, host);
+                        }
+                    }
                 }
             }
             Request::Frame {
@@ -1752,6 +1799,7 @@ impl Browser {
                 method: call.method,
                 body: call.body,
                 content_type: call.content_type,
+                referrer: url::referrer(&self.tabs[i].doc.url, &target),
             };
             host.fetch_with(fid, &target, &request);
         }
@@ -2035,9 +2083,11 @@ impl Browser {
                 self.set_status(None);
             }
             Event::MouseDown { x, y, button: 0 } => self.mouse_down(x as f32, y as f32, host),
+            Event::MouseDown { x, y, button: 2 } => self.context_menu(x as f32, y as f32, host),
             Event::MouseUp { x, y, button: 0 } => self.mouse_up(x as f32, y as f32, host),
             Event::MouseDown { .. } | Event::MouseUp { .. } => {}
             Event::Wheel { dy, .. } => {
+                self.close_menu();
                 let (t, lx, ly) = self.target_at(self.pointer.0, self.pointer.1);
                 // A frame under the pointer scrolls first.
                 let doc = &mut self.tabs[self.active].doc;
@@ -2077,6 +2127,30 @@ impl Browser {
 
     fn mouse_move(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         self.pointer = (x, y);
+        if self.menu.is_some() {
+            // Hover inside the menu (it is part of the chrome, above the page).
+            let hover = self.chrome.hit_test(x, y).element;
+            self.set_state(Target::Chrome, |s| s.hover = hover);
+            return;
+        }
+        // Dragging over page text selects it (after a few pixels: a click
+        // that wobbles is still a click).
+        if let Some(Press { select: Some((anchor, sx, sy)), selected, .. }) = self.press {
+            let vp = self.viewport_rect();
+            let (lx, ly) = (x - vp.x, y - vp.y);
+            if selected || (lx - sx).abs() > 3.0 || (ly - sy).abs() > 3.0 {
+                if let Some(p) = self.press.as_mut() {
+                    p.selected = true;
+                }
+                let doc = &mut self.tabs[self.active].doc;
+                let runs = doc.text_runs();
+                if let Some(focus) = doc.text_point_at(&runs, lx, ly, &self.fonts) {
+                    doc.set_selection(Some(crate::document::selection::Selection { anchor, focus }));
+                }
+                self.dirty = true;
+                return;
+            }
+        }
         if let Some(Press { range: Some(r), .. }) = self.press {
             let vp = self.viewport_rect();
             return self.slide(r, x - vp.x, host);
@@ -2190,6 +2264,16 @@ impl Browser {
 
     fn mouse_down(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         self.pointer = (x, y);
+        // An open context menu takes the click: an item runs, anywhere else closes it.
+        if self.menu.is_some() {
+            let action = self.menu_item_at(x, y);
+            let ctx = self.menu.take().unwrap_or_default();
+            self.show_menu(None);
+            if let Some(a) = action {
+                self.menu_command(&a, ctx, host);
+            }
+            return;
+        }
         let (t, lx, ly) = self.target_at(x, y);
         // An open <select> list takes the click first.
         if self.tabs[self.active].doc.forms.open_select.is_some() {
@@ -2265,11 +2349,40 @@ impl Browser {
         if let Some(e) = range {
             self.slide(e, lx, host);
         }
+        // Page text: a press starts a selection (shift extends it, a second
+        // press on the same spot selects the word).
+        let mut select = None;
+        let control = hit
+            .element
+            .is_some_and(|e| crate::document::control(&self.doc(t).dom, e).is_some());
+        if t == Target::Page && input.is_none() && range.is_none() && !control {
+            let double = self
+                .last_down
+                .is_some_and(|(px, py, at)| (px - lx).abs() < 4.0 && (py - ly).abs() < 4.0 && self.now - at < DOUBLE_CLICK_MS);
+            self.last_down = Some((lx, ly, self.now));
+            let shift = self.mods.shift;
+            let doc = &mut self.tabs[self.active].doc;
+            let runs = doc.text_runs();
+            let point = doc.text_point_at(&runs, lx, ly, &self.fonts);
+            match (point, doc.selection) {
+                (Some(p), _) if double => doc.select_word(&runs, p),
+                (Some(p), Some(sel)) if shift => {
+                    doc.set_selection(Some(crate::document::selection::Selection { focus: p, ..sel }));
+                    select = Some((sel.anchor, lx, ly));
+                }
+                (p, _) => {
+                    doc.set_selection(None);
+                    select = p.map(|p| (p, lx, ly));
+                }
+            }
+        }
         self.press = Some(Press {
             target: t,
             element: hit.element,
             input,
             range,
+            select,
+            selected: false,
         });
         self.dirty = true;
     }
@@ -2311,7 +2424,7 @@ impl Browser {
         {
             self.dispatch(e, "mouseup", EventInit::pointer(lx, ly, 0), host);
         }
-        if t != press.target || press.input.is_some() {
+        if t != press.target || press.input.is_some() || press.selected {
             return;
         }
         // A click: released on the pressed element or inside it.
@@ -2676,10 +2789,12 @@ impl Browser {
             // The body is sent once; going back to this entry reloads it
             // with GET.
             let target = base.split('#').next().unwrap_or("").to_string();
+            let referrer = url::referrer(&self.tabs[self.active].doc.url, &target);
             self.tabs[self.active].post = Some(crate::input::HttpRequest {
                 method: "POST".into(),
                 body,
                 content_type,
+                referrer,
             });
             return self.navigate(&target, host);
         }
@@ -2708,11 +2823,241 @@ impl Browser {
         }
     }
 
+    /// Opens the context menu at window point `(x, y)` (right click, or
+    /// Ctrl-click on macOS), after the page's `contextmenu` event (a page
+    /// that cancels it shows its own menu).
+    fn context_menu(&mut self, x: f32, y: f32, host: &mut dyn Host) {
+        self.close_menu();
+        self.pointer = (x, y);
+        let (t, lx, ly) = self.target_at(x, y);
+        let hit = self.doc(t).hit_test(lx, ly);
+        let mut ctx = MenuCtx::default();
+        if t == Target::Page {
+            if let Some(e) = hit.element
+                && self.dispatch(e, "contextmenu", EventInit::pointer(lx, ly, 2), host)
+            {
+                return;
+            }
+            let doc = &self.tabs[self.active].doc;
+            let base = doc.base_url();
+            let mut n = hit.element;
+            while let Some(e) = n {
+                match doc.dom.tag(e) {
+                    Some("a") if ctx.link.is_none() => {
+                        ctx.link = doc.dom.attr(e, "href").map(|h| crate::net::url::resolve(&base, h));
+                    }
+                    Some("img") if ctx.image.is_none() => {
+                        ctx.image = doc.dom.attr(e, "src").map(|h| crate::net::url::resolve(&base, h));
+                    }
+                    _ => {}
+                }
+                n = doc.dom.parent(e);
+            }
+        }
+        if let Some(f) = hit
+            .element
+            .and_then(|e| self.doc(t).focusable_ancestor(e))
+            .filter(|&f| self.doc(t).is_text_input(f))
+        {
+            ctx.field = Some((t, f));
+            // The menu acts on that field: focus it (keeping its selection).
+            if self.doc(t).state().focus != Some(f) {
+                if t == Target::Page {
+                    self.focus_page(Some(f), host);
+                } else {
+                    self.set_focus(t, Some(f));
+                }
+            }
+            self.keyboard = t;
+        }
+        let selected = match ctx.field {
+            Some((ft, f)) => !self.doc_mut(ft).input(f).selected_text().is_empty(),
+            None => self.tabs[self.active].doc.has_selection(),
+        };
+        // (label, action, enabled, shortcut); "" is a separator
+        let mut items: Vec<(&str, &str, bool, &str)> = Vec::new();
+        if ctx.link.is_some() {
+            items.extend([("開啟連結", "ctx-open-link", true, ""), ("在新分頁開啟連結", "ctx-open-link-tab", true, ""), ("複製連結網址", "ctx-copy-link", true, ""), ("下載連結的檔案", "ctx-save-link", true, ""), ("", "", false, "")]);
+        }
+        if ctx.image.is_some() {
+            items.extend([("在新分頁開啟圖片", "ctx-open-image-tab", true, ""), ("複製圖片網址", "ctx-copy-image", true, ""), ("下載圖片", "ctx-save-image", true, ""), ("", "", false, "")]);
+        }
+        let mac = cfg!(target_os = "macos");
+        let k = |c: &'static str, m: &'static str| if mac { m } else { c };
+        if ctx.field.is_some() {
+            items.extend([
+                ("剪下", "ctx-cut", selected, k("Ctrl+X", "⌘X")),
+                ("複製", "ctx-copy", selected, k("Ctrl+C", "⌘C")),
+                ("貼上", "ctx-paste", true, k("Ctrl+V", "⌘V")),
+                ("全選", "ctx-select-all", true, k("Ctrl+A", "⌘A")),
+            ]);
+        } else {
+            items.extend([("複製", "ctx-copy", selected, k("Ctrl+C", "⌘C")), ("全選", "ctx-select-all", t == Target::Page, k("Ctrl+A", "⌘A"))]);
+        }
+        let tab = &self.tabs[self.active];
+        items.extend([
+            ("", "", false, ""),
+            ("上一頁", "back", tab.index > 0, k("Alt+←", "⌘[")),
+            ("下一頁", "forward", tab.index + 1 < tab.history.len(), k("Alt+→", "⌘]")),
+            ("重新載入", "reload", true, k("Ctrl+R", "⌘R")),
+        ]);
+        let esc = |v: &str| v.replace('&', "&amp;").replace('<', "&lt;");
+        let mut html = String::new();
+        for (label, action, on, keys) in &items {
+            if label.is_empty() {
+                html.push_str("<div class=\"sep\"></div>");
+            } else {
+                html.push_str(&format!(
+                    "<div class=\"item{}\" data-menu=\"{}\"><span>{}</span><span class=\"key\">{}</span></div>",
+                    if *on { "" } else { " off" },
+                    if *on { action } else { "" },
+                    esc(label),
+                    esc(keys)
+                ));
+            }
+        }
+        // Inside the window: open up / left when there is no room.
+        let (w, h) = self.logical_size();
+        let height = items.iter().map(|i| if i.0.is_empty() { 9.0 } else { 26.0 }).sum::<f32>() + 10.0;
+        let width = 240.0;
+        let left = if x + width > w { (x - width).max(0.0) } else { x };
+        let top = if y + height > h { (y - height).max(0.0) } else { y };
+        self.menu = Some(ctx);
+        self.show_menu(Some((html, left, top)));
+    }
+
+    /// Shows the context menu element with `html` at `(left, top)`, or hides it.
+    fn show_menu(&mut self, content: Option<(String, f32, f32)>) {
+        let Some(m) = self.chrome_el("menu") else { return };
+        let dom = self.chrome.dom_mut();
+        match content {
+            Some((html, left, top)) => {
+                dom.set_inner_html(m, &html);
+                if let Some(e) = dom.element_mut(m) {
+                    e.set_attr("class", "show");
+                    e.set_attr("style", &format!("left:{left}px;top:{top}px"));
+                }
+            }
+            None => {
+                if let Some(e) = dom.element_mut(m) {
+                    e.set_attr("class", "");
+                }
+            }
+        }
+        self.chrome.dom_changed();
+        self.set_state(Target::Chrome, |s| s.hover = None);
+        self.dirty = true;
+    }
+
+    fn close_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.show_menu(None);
+        }
+    }
+
+    /// The action of the menu item at window point `(x, y)`.
+    fn menu_item_at(&self, x: f32, y: f32) -> Option<String> {
+        let dom = &self.chrome.dom;
+        let mut n = self.chrome.hit_test(x, y).element;
+        while let Some(e) = n {
+            if let Some(a) = dom.attr(e, "data-menu") {
+                return (!a.is_empty()).then(|| a.to_string());
+            }
+            n = dom.parent(e);
+        }
+        None
+    }
+
+    fn menu_command(&mut self, action: &str, ctx: MenuCtx, host: &mut dyn Host) {
+        let page_selection = |b: &Self| b.tabs[b.active].doc.selected_text();
+        match action {
+            "ctx-open-link" => {
+                if let Some(u) = ctx.link {
+                    self.navigate(&u, host);
+                }
+            }
+            "ctx-open-link-tab" | "ctx-open-image-tab" => {
+                if let Some(u) = if action == "ctx-open-link-tab" { ctx.link } else { ctx.image } {
+                    let back = self.active;
+                    self.new_tab(&u, host);
+                    // like other browsers: the new tab opens behind
+                    self.active = back;
+                    self.dirty = true;
+                }
+            }
+            "ctx-copy-link" => host.clipboard_set(ctx.link.as_deref().unwrap_or("")),
+            "ctx-copy-image" => host.clipboard_set(ctx.image.as_deref().unwrap_or("")),
+            "ctx-save-link" | "ctx-save-image" => {
+                if let Some(u) = if action == "ctx-save-link" { ctx.link } else { ctx.image } {
+                    self.download(self.active, &u, None, host);
+                }
+            }
+            "ctx-copy" | "ctx-cut" => match ctx.field {
+                Some((t, f)) => {
+                    let text = self.doc_mut(t).input(f).selected_text();
+                    host.clipboard_set(&text);
+                    if action == "ctx-cut" && !text.is_empty() {
+                        self.doc_mut(t).input(f).insert("");
+                        self.edited(t, f, host);
+                    }
+                }
+                None => {
+                    let text = page_selection(self);
+                    if !text.is_empty() {
+                        host.clipboard_set(&text);
+                    }
+                }
+            },
+            "ctx-paste" => {
+                if let (Some((t, f)), Some(text)) = (ctx.field, host.clipboard_get()) {
+                    self.doc_mut(t).input(f).insert(&text);
+                    self.edited(t, f, host);
+                }
+            }
+            "ctx-select-all" => match ctx.field {
+                Some((t, f)) => self.doc_mut(t).input(f).select_all(),
+                None => self.tabs[self.active].doc.select_all_text(),
+            },
+            other => self.command(other, None, host),
+        }
+        self.dirty = true;
+    }
+
+    /// Text field `f` changed from the menu: the page hears `input`.
+    fn edited(&mut self, t: Target, f: NodeId, host: &mut dyn Host) {
+        self.caret_epoch = self.now;
+        if t == Target::Page {
+            self.dispatch(f, "input", EventInit::default(), host);
+        }
+    }
+
     fn key_down(&mut self, code: i32, mods: Modifiers, host: &mut dyn Host) {
         self.caret_epoch = self.now;
         self.dirty = true;
+        if self.menu.is_some() {
+            self.close_menu();
+            if code == key::ESCAPE {
+                return;
+            }
+        }
         // Browser shortcuts.
         let cmd = mods.command();
+        // Copy and select-all of page text (text fields handle their own).
+        if self.focused_text_input().is_none() && self.keyboard == Target::Page {
+            let doc = &mut self.tabs[self.active].doc;
+            match code {
+                c if cmd && c == 'C' as i32 && doc.has_selection() => {
+                    host.clipboard_set(&doc.selected_text());
+                    return;
+                }
+                c if cmd && c == 'A' as i32 => {
+                    doc.select_all_text();
+                    return;
+                }
+                key::ESCAPE if doc.selection.is_some() => doc.set_selection(None),
+                _ => {}
+            }
+        }
         match code {
             c if cmd && c == 'L' as i32 => return self.focus_address(true),
             c if cmd && c == 'T' as i32 => return self.new_tab("about:home", host),
@@ -3111,13 +3456,16 @@ impl Browser {
         self.tabs[self.active]
             .doc
             .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
-        // The status bubble is part of the chrome but sits above the page.
-        if let Some(s) = self.chrome_el("status").and_then(|s| {
+        // The status bubble and the context menu are part of the chrome but
+        // sit above the page.
+        // (the menu is repainted exactly: around it the chrome would paint
+        // its viewport background over the page)
+        for (id, pad) in [("status", 12.0), ("menu", 1.0)] {
+        if let Some(s) = self.chrome_el(id).and_then(|s| {
             let st = self.chrome.style(s)?;
             (st.display != crate::css::style::Display::None).then_some(s)
         }) && let Some(r) = self.chrome.content_box(s)
         {
-            let pad = 12.0;
             let rect = crate::gfx::Rect::new(
                 ((r.x - pad) * scale) as i32,
                 ((r.y - pad) * scale) as i32,
@@ -3128,6 +3476,7 @@ impl Browser {
             self.chrome
                 .paint(&mut self.canvas, (0.0, 0.0), scale, &self.fonts);
             self.canvas.reset_clip();
+        }
         }
         self.dirty = false;
         &self.canvas
@@ -3301,6 +3650,8 @@ mod tests {
         requests: Vec<(String, String, String)>,
         title: String,
         clipboard: Option<String>,
+        /// (url, Referer) of requests that send one.
+        referrers: Vec<(String, String)>,
     }
 
     impl Host for TestHost {
@@ -3308,6 +3659,12 @@ mod tests {
             self.fetched.push((id, url.to_string()));
         }
         fn fetch_with(&mut self, id: u32, url: &str, r: &crate::input::HttpRequest) {
+            if !r.referrer.is_empty() {
+                self.referrers.push((url.to_string(), r.referrer.clone()));
+            }
+            if r.method.is_empty() {
+                return self.fetch(id, url);
+            }
             self.fetched.push((id, url.to_string()));
             let body = String::from_utf8_lossy(&r.body).into_owned();
             self.requests
@@ -3715,6 +4072,9 @@ mod tests {
         fn fetch(&mut self, id: u32, url: &str) {
             self.inner.fetch(id, url)
         }
+        fn fetch_with(&mut self, id: u32, url: &str, r: &crate::input::HttpRequest) {
+            self.inner.fetch_with(id, url, r)
+        }
         fn clipboard_get(&mut self) -> Option<String> {
             None
         }
@@ -3928,6 +4288,39 @@ mod tests {
         ] {
             assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
         }
+    }
+
+    #[test]
+    fn script_images_fire_load_and_send_a_referrer() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("http://map.test/page", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<script>
+              for (const src of ['https://tiles.test/1.png', 'https://tiles.test/broken.png']) {
+                const img = document.createElement('img');
+                img.onload = () => console.log('load ' + img.naturalWidth + 'x' + img.naturalHeight + ' ' + img.complete);
+                img.onerror = () => console.log('error ' + img.naturalWidth + ' ' + img.complete);
+                img.src = src;
+                document.body.appendChild(img);
+              }
+              console.log('before ' + document.images[0].complete);
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let mut png = Vec::new();
+        image::RgbaImage::new(3, 2).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let find = |h: &LogHost, u: &str| h.inner.fetched.iter().find(|(_, url)| url == u).map(|(id, _)| *id).unwrap();
+        let (ok, bad) = (find(&h, "https://tiles.test/1.png"), find(&h, "https://tiles.test/broken.png"));
+        b.fetch_done(ok, Ok(png), &mut h);
+        b.fetch_done(bad, Ok(b"not an image".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        for want in ["before false", "load 3x2 true", "error 0 true"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+        // cross-origin resources get the page's origin as Referer (strict-origin-when-cross-origin)
+        assert!(h.inner.referrers.iter().any(|(u, r)| u == "https://tiles.test/1.png" && r == "http://map.test/"), "{:?}", h.inner.referrers);
     }
 
     #[test]
@@ -4856,6 +5249,91 @@ mod tests {
         b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
         b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
         assert!(find(&h, "https://other.test/").is_some());
+    }
+
+    fn load(b: &mut Browser, h: &mut TestHost, url: &str, html: &str) {
+        b.navigate(url, h);
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(html.as_bytes().to_vec()), h);
+        b.render(0.0, h);
+    }
+
+    /// Window point of character `ch` of the text run containing `word`.
+    fn text_at(b: &Browser, word: &str, ch: usize) -> (i32, i32) {
+        let vp = b.viewport_rect();
+        let doc = &b.tabs[b.active].doc;
+        let r = doc.text_runs().into_iter().find(|r| r.text.contains(word)).unwrap();
+        let st = doc.style(r.key.0).unwrap();
+        let ch = r.text[..r.text.find(word).unwrap()].chars().count() + ch;
+        let end = r.text.char_indices().nth(ch).map_or(r.text.len(), |(i, _)| i);
+        let dx = b.fonts.measure(st.font(), st.font_size, &r.text[..end]);
+        ((vp.x + r.rect.x + dx) as i32, (vp.y + r.rect.y + r.rect.h / 2.0) as i32)
+    }
+
+    #[test]
+    fn dragging_selects_page_text_and_copy_takes_it() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://sel.test/", "<style>body{margin:20px;font-size:20px}</style><p>Hello <a href=/x>world</a> here</p><p>Second line</p>");
+        let (x0, y0) = text_at(&b, "Hello", 0);
+        let (x1, y1) = text_at(&b, "Second", 6);
+        b.event(Event::MouseDown { x: x0, y: y0, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseMove { x: x0 + 30, y: y0 }, 0.0, &mut h);
+        b.event(Event::MouseMove { x: x1, y: y1 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x: x1, y: y1, button: 0 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.selected_text(), "Hello world here\nSecond");
+        press(&mut b, &mut h, 'C' as i32, CMD);
+        assert_eq!(h.clipboard.as_deref(), Some("Hello world here\nSecond"));
+        // a drag that ends on a link does not follow it
+        assert_eq!(b.tabs[b.active].url(), "https://sel.test/");
+        // select all, then a click clears the selection
+        press(&mut b, &mut h, 'A' as i32, CMD);
+        assert_eq!(b.tabs[b.active].doc.selected_text(), "Hello world here\nSecond line");
+        b.event(Event::MouseDown { x: x1, y: y1 + 200, button: 0 }, 1000.0, &mut h);
+        b.event(Event::MouseUp { x: x1, y: y1 + 200, button: 0 }, 1000.0, &mut h);
+        assert!(!b.tabs[b.active].doc.has_selection());
+    }
+
+    #[test]
+    fn double_click_selects_a_word() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://sel.test/", "<p style='font-size:20px'>alpha beta 金門大學</p>");
+        let (x, y) = text_at(&b, "beta", 2);
+        for t in [0.0, 100.0] {
+            b.event(Event::MouseDown { x, y, button: 0 }, t, &mut h);
+            b.event(Event::MouseUp { x, y, button: 0 }, t, &mut h);
+        }
+        assert_eq!(b.tabs[b.active].doc.selected_text(), "beta");
+    }
+
+    #[test]
+    fn context_menu_on_a_link_copies_its_address() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://menu.test/a/", "<p style='font-size:20px'><a href='../next.html'>next page</a></p><p id=q oncontextmenu='event.preventDefault()'>quiet</p>");
+        let (x, y) = text_at(&b, "next", 1);
+        b.event(Event::MouseDown { x, y, button: 2 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        let menu = b.chrome_el("menu").unwrap();
+        assert_eq!(b.chrome.dom.attr(menu, "class"), Some("show"));
+        let text = b.chrome.dom.text_content(menu);
+        assert!(text.contains("複製連結網址") && text.contains("重新載入"), "{text}");
+        // click the item
+        let item = b.chrome.dom.descendants(menu).into_iter().find(|&n| b.chrome.dom.attr(n, "data-menu") == Some("ctx-copy-link")).unwrap();
+        let r = b.chrome.content_box(item).unwrap();
+        click_at(&mut b, &mut h, r);
+        assert_eq!(h.clipboard.as_deref(), Some("https://menu.test/next.html"));
+        assert_eq!(b.chrome.dom.attr(menu, "class"), Some(""));
+        assert_eq!(b.tabs[b.active].url(), "https://menu.test/a/", "clicking the menu does not click the page");
+        // a page that cancels contextmenu gets no menu
+        let (x, y) = text_at(&b, "quiet", 1);
+        b.event(Event::MouseDown { x, y, button: 2 }, 0.0, &mut h);
+        assert!(b.menu.is_none());
+        // Escape closes an open menu
+        let (x, y) = text_at(&b, "next", 1);
+        b.event(Event::MouseDown { x, y, button: 2 }, 0.0, &mut h);
+        assert!(b.menu.is_some());
+        press(&mut b, &mut h, key::ESCAPE, Modifiers::default());
+        assert!(b.menu.is_none());
     }
 
     #[test]
