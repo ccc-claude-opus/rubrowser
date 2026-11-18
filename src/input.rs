@@ -82,6 +82,23 @@ pub enum Event {
     },
     /// Typed text (already composed, without control characters).
     Text(String),
+    /// A finger on a touch screen; `id` stays the same from start to end.
+    Touch {
+        id: u64,
+        x: i32,
+        y: i32,
+        phase: TouchPhase,
+    },
+}
+
+/// The stage of a touch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TouchPhase {
+    Start,
+    Move,
+    End,
+    /// The system took the touch away (no tap, no click).
+    Cancel,
 }
 
 /// Mouse cursor shapes the browser asks for.

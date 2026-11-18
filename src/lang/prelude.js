@@ -566,6 +566,7 @@
     ['TransitionEvent', 'Event', { propertyName: '', elapsedTime: 0, pseudoElement: '' }],
     ['PageTransitionEvent', 'Event', { persisted: false }],
     ['ClipboardEvent', 'Event', { clipboardData: null }],
+    ['TouchEvent', 'UIEvent', { touches: [], targetTouches: [], changedTouches: [], ...keyMods }],
     ['BeforeUnloadEvent', 'Event', {}],
   ]) {
     const Base = parent === 'Event' ? Event : eventInterfaces[parent];
@@ -596,6 +597,7 @@
   function eventClass(type) {
     if (/^(click|dblclick|auxclick|contextmenu|mouse)/.test(type)) return eventInterfaces.MouseEvent;
     if (/^pointer/.test(type)) return eventInterfaces.PointerEvent;
+    if (/^touch/.test(type)) return eventInterfaces.TouchEvent;
     if (/^key/.test(type)) return eventInterfaces.KeyboardEvent;
     if (/^(focus|blur)/.test(type)) return eventInterfaces.FocusEvent;
     if (type === 'wheel') return eventInterfaces.WheelEvent;
@@ -625,6 +627,18 @@
       button: rb.eventInt(4),
     });
     if (e instanceof eventInterfaces.KeyboardEvent) e.repeat = rb.eventInt(5) === 1;
+    const touch = rb.eventString(2) || '';
+    if (e instanceof eventInterfaces.TouchEvent) {
+      // "<touches>|<changed>", each "id,x,y,target;…" (Touch Events)
+      const [all, changed] = touch.split('|').map((list) => (list ? list.split(';') : []).map((t) => {
+        const [id, x, y, target] = t.split(',').map(Number);
+        return new Touch({ identifier: id, target: wrap(target), clientX: x, clientY: y });
+      }));
+      e.touches = touchList(all);
+      e.changedTouches = touchList(changed);
+      e.targetTouches = touchList(all.filter((t) => t.target === e.target));
+      if (changed.length) Object.assign(e, { clientX: changed[0].clientX, clientY: changed[0].clientY });
+    }
     if (e instanceof eventInterfaces.WheelEvent) Object.assign(e, { deltaX: rb.eventPos(2), deltaY: rb.eventPos(3), deltaMode: 0 });
     if (!(e instanceof eventInterfaces.MouseEvent)) {
       e.pageX = e.clientX;
@@ -637,11 +651,41 @@
       if (type === 'mousedown' || type === 'pointerdown') pressedButtons |= bit;
       if (type === 'mouseup' || type === 'pointerup') pressedButtons &= ~bit;
       e.buttons = pressedButtons;
-      if (e instanceof eventInterfaces.PointerEvent) Object.assign(e, { pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: pressedButtons ? 0.5 : 0 });
+      const finger = /^touch (\d+) (\d)/.exec(touch);
+      if (finger) {
+        // a finger: pressed from pointerdown to pointerup, its own pointerId
+        const up = /(up|cancel)$/.test(type);
+        e.buttons = up ? 0 : 1;
+        if (e instanceof eventInterfaces.PointerEvent) Object.assign(e, { pointerId: 2 + Number(finger[1]), pointerType: 'touch', isPrimary: finger[2] === '1', pressure: up ? 0 : 0.5, width: 20, height: 20 });
+      } else if (e instanceof eventInterfaces.PointerEvent) Object.assign(e, { pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: pressedButtons ? 0.5 : 0 });
     }
     return e;
   }
   let pressedButtons = 0;
+
+  // Touch Events: a finger on the screen, and the lists of them
+  class Touch {
+    constructor(init) {
+      init = init || {};
+      this.identifier = init.identifier ?? 0;
+      this.target = init.target ?? null;
+      this.clientX = init.clientX ?? 0;
+      this.clientY = init.clientY ?? 0;
+      this.screenX = init.screenX ?? this.clientX;
+      this.screenY = init.screenY ?? this.clientY;
+      this.pageX = init.pageX ?? this.clientX + (global.scrollX || 0);
+      this.pageY = init.pageY ?? this.clientY + (global.scrollY || 0);
+      this.radiusX = init.radiusX ?? 10;
+      this.radiusY = init.radiusY ?? 10;
+      this.rotationAngle = init.rotationAngle ?? 0;
+      this.force = init.force ?? 0.5;
+    }
+  }
+  function touchList(list) {
+    const l = list.slice();
+    l.item = (i) => l[i] ?? null;
+    return l;
+  }
 
   function call(fn, self, args) {
     try {
@@ -3750,6 +3794,7 @@
     Document,
     Event,
     ...eventInterfaces,
+    Touch,
     EventTarget,
     URLSearchParams,
     URL,

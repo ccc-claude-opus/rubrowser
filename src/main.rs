@@ -1,8 +1,9 @@
 use std::time::Duration;
 
-const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [URL]
-       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] URL
-  --installer URL  an app installer (ruwebos's): pages declaring <link rel=\"ruwebos-app\"> get an Install button";
+const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [--keyboard auto|always|never] [URL]
+       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] [--keyboard MODE] URL
+  --installer URL  an app installer (ruwebos's): pages declaring <link rel=\"ruwebos-app\"> get an Install button
+  --keyboard MODE  the on-screen keyboard for text fields: auto (after a touch; default), always, never";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -15,6 +16,7 @@ fn main() {
         timeout: Duration::from_secs(30),
         javascript: true,
         installer: None,
+        keyboard: rubrowser::browser::KeyboardMode::Auto,
     };
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -34,6 +36,13 @@ fn main() {
             }
             "--no-js" => shot.javascript = false,
             "--installer" => shot.installer = Some(value("--installer")),
+            "--keyboard" => {
+                let v = value("--keyboard");
+                shot.keyboard = rubrowser::browser::KeyboardMode::parse(&v).unwrap_or_else(|| {
+                    eprintln!("rubrowser: --keyboard is auto, always or never\n{USAGE}");
+                    std::process::exit(2);
+                });
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 return;
@@ -49,7 +58,7 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        None => rubrowser::platform::native::run(url, shot.javascript, shot.installer),
+        None => rubrowser::platform::native::run(url, shot.javascript, shot.installer, shot.keyboard),
     };
     if let Err(e) = result {
         eprintln!("rubrowser: {e}");

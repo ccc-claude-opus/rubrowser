@@ -429,6 +429,10 @@ pub struct Style {
     /// `pointer-events: none` (inherited): the box is never the target of
     /// pointer events; they go to what is under it.
     pub pointer_events_none: bool,
+    /// `touch-action` allows the browser to scroll vertically on a drag
+    /// (`auto`, `manipulation`, `pan-y`); `none`, `pan-x` and `pinch-zoom`
+    /// leave vertical drags to the page. Not inherited.
+    pub touch_pan_y: bool,
     pub border_spacing: f32,
     pub border_collapse: bool,
     /// `table-layout: fixed` (not inherited).
@@ -551,6 +555,7 @@ impl Default for Style {
             text_transform: TextTransform::None,
             user_select_none: false,
             pointer_events_none: false,
+            touch_pan_y: true,
             border_spacing: 0.0,
             border_collapse: false,
             table_layout_fixed: false,
@@ -1249,6 +1254,9 @@ impl Style {
             "pointer-events" => {
                 // The SVG values other than `none` act as `auto` on HTML boxes.
                 self.pointer_events_none = v == "none";
+            }
+            "touch-action" => {
+                self.touch_pan_y = v.split_ascii_whitespace().any(|t| matches!(t, "auto" | "manipulation" | "pan-y" | "pan-up" | "pan-down"));
             }
             "user-select" | "-webkit-user-select" => {
                 self.user_select_none = match v {

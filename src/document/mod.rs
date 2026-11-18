@@ -1860,6 +1860,25 @@ impl Document {
         self.scroll.insert(None, y);
     }
 
+    /// Scrolls the page so that element `node` is in sight (with a margin),
+    /// moving as little as possible.
+    pub fn reveal(&mut self, node: NodeId) {
+        let Some((r, _)) = self.box_rects(node) else { return };
+        let vh = self.size.1;
+        let cur = self.scroll_of(None);
+        let margin = 12.0;
+        let delta = if r.y < margin {
+            r.y - margin
+        } else if r.y + r.h > vh - margin {
+            (r.y + r.h - (vh - margin)).min(r.y - margin)
+        } else {
+            return;
+        };
+        self.fragment = None;
+        self.restore = None;
+        self.scroll.insert(None, (cur + delta).clamp(0.0, self.max_scroll(None)));
+    }
+
     /// Scrolls the innermost scroller under `(x, y)` that can move by `dy`.
     /// Returns true if something scrolled.
     pub fn scroll_by(&mut self, x: f32, y: f32, dy: f32) -> bool {

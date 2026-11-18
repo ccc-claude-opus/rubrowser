@@ -166,6 +166,35 @@
   #menu .sep { height: 1px; margin: 4px 10px; background: #45474d; }
 
   /* Download bar: where the last download was saved. */
+  /* The on-screen keyboard (osk.rs): the page above gets shorter while it is up. */
+  #osk {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex-shrink: 0;
+    padding: 8px 4px 10px;
+    background: #2b2d31;
+  }
+  #osk[hidden] { display: none; }
+  .krow { display: flex; justify-content: center; gap: 5px; }
+  .key {
+    flex: 1;
+    max-width: 72px;
+    height: 46px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 7px;
+    background: #4a4d53;
+    color: #ffffff;
+    font-size: 20px;
+  }
+  .key.fn { background: #36383d; font-size: 15px; }
+  .key.on { background: #e8e8e8; color: #1e1f22; }
+  .key.lock { text-decoration: underline; }
+  .key.space { flex: 4; max-width: 320px; font-size: 14px; color: #c8c8c8; }
+  .key.enter { flex: 1.6; max-width: 120px; background: #2b6fdb; }
+
   #download {
     display: none;
     align-items: center;
@@ -197,6 +226,7 @@
     <button id="install" data-action="install" hidden>安裝</button>
   </div>
   <div id="viewport"></div>
+  <div id="osk" hidden></div>
   <div id="download"><span id="download-text"></span><button id="download-close" data-action="close-download">&#x2715;</button></div>
   <div id="status"></div>
   <div id="menu" role="menu"></div>

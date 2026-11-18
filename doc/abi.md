@@ -101,7 +101,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `unlisten(h, ev_ptr, ev_len, listener)` | 取消登記 |
 | `prevent_default()` | 在事件處理中呼叫，取消瀏覽器的預設動作（例如連結跳轉） |
 | `stop_propagation()` | 不再往祖先冒泡（同一節點上的其他 listener 仍會執行） |
-| `event_string(which, ptr, cap) -> i32` | 0 事件種類、1 key 名稱（`"a"`、`"Enter"`、`"ArrowLeft"`…） |
+| `event_string(which, ptr, cap) -> i32` | 0 事件種類、1 key 名稱（`"a"`、`"Enter"`、`"ArrowLeft"`…）、2 觸控資料：觸控事件是 `"<touches>\|<changed>"`（各為 `id,x,y,target` 以 `;` 分隔），手指產生的 pointer／滑鼠事件是 `"touch <id> <是否主要 0\|1>"` |
 | `event_int(which) -> i32` | 0 target、1 currentTarget、2 鍵碼、3 修飾鍵、4 滑鼠按鍵 |
 | `event_pos(which) -> f64` | 0 x、1 y（頁面座標） |
 

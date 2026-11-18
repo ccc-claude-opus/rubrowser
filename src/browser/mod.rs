@@ -5,6 +5,11 @@
 //! `data-action` attribute run browser commands, and the tab strip and
 //! address bar are kept in sync by editing the chrome DOM.
 
+mod osk;
+mod touch;
+
+pub use osk::KeyboardMode;
+
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -472,7 +477,7 @@ const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js.wasm");
 const MEDIA_FRAME_MS: f64 = 1000.0 / 60.0;
 
 /// Extra fields of a dispatched event.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct EventInit {
     /// Only at the target (`load` of a script or stylesheet).
     local: bool,
@@ -485,6 +490,8 @@ struct EventInit {
     repeat: bool,
     /// Wheel deltas in pixels.
     delta: (f32, f32),
+    /// Touch data (see [`crate::script::EventInfo::touch`]).
+    touch: String,
 }
 
 impl EventInit {
@@ -628,6 +635,20 @@ pub struct Browser {
     /// The (tab, document) the pointer's hover was last worked out for.
     hovered: (u64, u64),
     press: Option<Press>,
+    /// Fingers on the screen, and the page sliding on after a drag (touch.rs).
+    fingers: Vec<touch::Finger>,
+    fling: Option<touch::Fling>,
+    /// The mouse events being handled come from a tap (no pointer events).
+    from_touch: bool,
+    /// The last pointer input was a finger (the on-screen keyboard's cue).
+    touch_used: bool,
+    /// The on-screen keyboard (osk.rs); its keys are being typed; the focused
+    /// field must be scrolled into sight (the keyboard just came up).
+    osk: osk::Osk,
+    osk_typing: bool,
+    reveal_focus: bool,
+    /// The page's viewport size last laid out, to tell it about a `resize`.
+    shown_size: (u64, u64, f32, f32),
     mods: Modifiers,
     /// Time the caret last became visible (it blinks from there).
     caret_epoch: f64,
@@ -679,6 +700,14 @@ impl Browser {
             pointer: (-1.0, -1.0),
             hovered: (0, 0),
             press: None,
+            fingers: Vec::new(),
+            fling: None,
+            from_touch: false,
+            touch_used: false,
+            osk: Default::default(),
+            osk_typing: false,
+            reveal_focus: false,
+            shown_size: (0, 0, 0.0, 0.0),
             mods: Modifiers::default(),
             caret_epoch: 0.0,
             now: 0.0,
@@ -2076,6 +2105,7 @@ impl Browser {
             button: init.button,
             repeat: init.repeat,
             delta: (init.delta.0 as f64, init.delta.1 as f64),
+            touch: init.touch,
         };
         let mut prevented = false;
         let mut n = Some(node);
@@ -2226,6 +2256,7 @@ impl Browser {
         {
             self.chrome.set_input_value(a, &url);
         }
+        self.sync_osk();
         host.set_title(&format!("{title} - rubrowser"));
     }
 
@@ -2340,6 +2371,10 @@ impl Browser {
                 }
             }
             Event::KeyDown { key, mods, repeat } => {
+                if !self.osk_typing {
+                    // a physical keyboard: the on-screen one goes away (auto mode)
+                    self.touch_used = false;
+                }
                 self.mods = mods;
                 self.key_repeat = repeat;
                 self.key_down(key, mods, host);
@@ -2354,6 +2389,7 @@ impl Browser {
                     self.dispatch(target, "keyup", EventInit::key(key, mods.bits()), host);
                 }
             }
+            Event::Touch { id, x, y, phase } => self.touch(id, x as f32, y as f32, phase, host),
             Event::Text(text) => {
                 if let Some((t, n)) = self.focused()
                     && self.doc(t).is_text_input(n)
@@ -2386,7 +2422,7 @@ impl Browser {
                 && let Some(e) = self.doc(t).hit_test(lx, ly).element
             {
                 let at = EventInit::pointer(lx, ly, 0);
-                self.dispatch(e, "pointermove", at, host);
+                self.dispatch(e, "pointermove", at.clone(), host);
                 self.dispatch(e, "mousemove", at, host);
             }
         }
@@ -2472,7 +2508,7 @@ impl Browser {
         if old_page_hover != new_page_hover {
             let at = EventInit::pointer(lx, ly, 0);
             if let Some(o) = old_page_hover {
-                self.dispatch(o, "mouseout", at, host);
+                self.dispatch(o, "mouseout", at.clone(), host);
             }
             if let Some(n) = new_page_hover {
                 self.dispatch(n, "mouseover", at, host);
@@ -2548,6 +2584,17 @@ impl Browser {
             return;
         }
         let (t, lx, ly) = self.target_at(x, y);
+        // The on-screen keyboard's keys type into the focused field (focus stays).
+        if t == Target::Chrome
+            && let Some(k) = self.osk_key_at(self.chrome.hit_test(lx, ly).element)
+        {
+            self.osk_press(&k, host);
+            return;
+        }
+        if !self.from_touch {
+            // a mouse user: the keyboard waits for the next touch (auto mode)
+            self.touch_used = false;
+        }
         // An open <select> list takes the click first.
         if self.tabs[self.active].doc.forms.open_select.is_some() {
             let hit = (t == Target::Page)
@@ -2575,7 +2622,10 @@ impl Browser {
         if t == Target::Page
             && let Some(e) = hit.element
         {
-            canceled = self.dispatch(e, "pointerdown", EventInit::pointer(lx, ly, 0), host);
+            // a tap already sent its pointer events (touch.rs)
+            if !self.from_touch {
+                canceled = self.dispatch(e, "pointerdown", EventInit::pointer(lx, ly, 0), host);
+            }
             if !canceled {
                 canceled = self.dispatch(e, "mousedown", EventInit::pointer(lx, ly, 0), host);
             }
@@ -2702,7 +2752,9 @@ impl Browser {
         if t == Target::Page
             && let Some(e) = hit.element
         {
-            self.dispatch(e, "pointerup", EventInit::pointer(lx, ly, 0), host);
+            if !self.from_touch {
+                self.dispatch(e, "pointerup", EventInit::pointer(lx, ly, 0), host);
+            }
             self.dispatch(e, "mouseup", EventInit::pointer(lx, ly, 0), host);
         }
         if t != press.target || press.input.is_some() || press.selected {
@@ -3541,6 +3593,7 @@ impl Browser {
             }
         }
         self.run_timers(host);
+        self.touch_tick(host);
         for i in 0..self.tabs.len() {
             if std::mem::take(&mut self.tabs[i].kick) {
                 self.run_scripts(i, host);
@@ -3562,7 +3615,22 @@ impl Browser {
         if doc.media_playing() {
             self.media_drawn = self.now;
         }
+        if std::mem::take(&mut self.reveal_focus)
+            && let Some((Target::Page, n)) = self.focused()
+        {
+            self.tabs[self.active].doc.reveal(n);
+            self.dirty = true;
+        }
         let i = self.active;
+        // The page's viewport changed size (the keyboard, the window): `resize`.
+        let size = (self.tabs[i].id, self.tabs[i].page, vp.w, vp.h);
+        if size != self.shown_size {
+            let same_page = (self.shown_size.0, self.shown_size.1) == (size.0, size.1);
+            self.shown_size = size;
+            if same_page && self.tabs[i].loaded {
+                self.dispatch(crate::dom::Dom::ROOT, "resize", EventInit::default(), host);
+            }
+        }
         for (node, kind) in self.tabs[i].doc.take_media_events() {
             self.element_event(i, node, kind, host);
         }
@@ -3671,7 +3739,7 @@ impl Browser {
     /// running.
     pub fn animating(&self) -> bool {
         let doc = &self.tabs[self.active].doc;
-        doc.animating() || doc.media_playing() || doc.next_image_frame().is_some()
+        doc.animating() || doc.media_playing() || doc.next_image_frame().is_some() || self.fling.is_some()
     }
 
     /// Whether playing media is due for its next frame.
@@ -3690,6 +3758,7 @@ impl Browser {
     pub fn needs_redraw(&self, now: f64) -> bool {
         self.dirty
             || self.blocked_until().is_some_and(|t| t <= now)
+            || self.touch_wakeup().is_some_and(|t| t <= now)
             || self.media_due(now)
             || self.tabs[self.active]
                 .doc
@@ -3722,7 +3791,7 @@ impl Browser {
         });
         // The next frame of an animated image.
         let image = self.tabs[self.active].doc.next_image_frame();
-        [caret, self.next_timer(), image, self.blocked_until()]
+        [caret, self.next_timer(), image, self.blocked_until(), self.touch_wakeup()]
             .into_iter()
             .flatten()
             .min_by(f64::total_cmp)
@@ -4275,6 +4344,190 @@ mod tests {
         let css = h.fetched.iter().find(|(_, u)| u.ends_with("a.css")).unwrap().0;
         b.fetch_done(css, Ok(b"p{color:red}".to_vec()), &mut h);
         assert_eq!(b.blocked_until(), None, "loaded: shown");
+    }
+
+    /// A finger: down, moves, up at window points, `step` ms apart.
+    fn finger(b: &mut Browser, h: &mut dyn Host, t0: f64, step: f64, path: &[(i32, i32)]) -> f64 {
+        let mut t = t0;
+        for (i, &(x, y)) in path.iter().enumerate() {
+            let phase = match i {
+                0 => crate::input::TouchPhase::Start,
+                i if i == path.len() - 1 => crate::input::TouchPhase::End,
+                _ => crate::input::TouchPhase::Move,
+            };
+            b.event(Event::Touch { id: 1, x, y, phase }, t, h);
+            t += step;
+        }
+        t
+    }
+
+    #[test]
+    fn a_tap_is_a_click_with_touch_and_pointer_events() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(800, 600, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://touch.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0"><button id=b style="width:200px;height:80px">tap</button><input id=i style="width:200px"><script>
+              const b = document.getElementById('b');
+              for (const t of ['pointerdown', 'touchstart', 'pointerup', 'touchend', 'mousedown', 'mouseup', 'click'])
+                b.addEventListener(t, (e) => console.log(t + (e.pointerType ? ' ' + e.pointerType : '') + (e.changedTouches ? ' ' + e.changedTouches.length + ' ' + e.touches.length + ' ' + (e.changedTouches[0].target === b) : '')));
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + 50.0) as i32, (vp.y + 40.0) as i32);
+        finger(&mut b, &mut h, 10.0, 50.0, &[(x, y), (x, y)]);
+        let got: Vec<&String> = h.logs.iter().filter(|l| !l.starts_with('[')).collect();
+        assert_eq!(
+            got,
+            ["pointerdown touch", "touchstart 1 1 true", "pointerup touch", "touchend 1 0 true", "mousedown", "mouseup", "click"],
+            "{:?}",
+            h.logs
+        );
+        // a tap focuses a text field
+        let r = b.tabs[b.active].doc.content_box(page_el(&b, "i")).unwrap();
+        let (ix, iy) = ((vp.x + r.x + 10.0) as i32, (vp.y + r.y + r.h / 2.0) as i32);
+        finger(&mut b, &mut h, 200.0, 50.0, &[(ix, iy), (ix, iy)]);
+        assert_eq!(b.tabs[b.active].doc.state().focus, Some(page_el(&b, "i")));
+    }
+
+    #[test]
+    fn dragging_scrolls_and_keeps_sliding() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://touch.test/long", &mut h);
+        let page = r#"<body style="margin:0"><div style="height:20000px">long</div><div id=map style="touch-action:none;position:fixed;top:0;left:0;width:100px;height:100px"></div>"#;
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let x = (vp.x + 400.0) as i32;
+        let y0 = (vp.y + 400.0) as i32;
+        // 300 px up in 150 ms: the page scrolls with the finger
+        let path: Vec<(i32, i32)> = (0..=10).map(|i| (x, y0 - i * 30)).collect();
+        let t = finger(&mut b, &mut h, 0.0, 15.0, &path);
+        let after_drag = b.tabs[b.active].doc.scroll_y();
+        assert!((after_drag - 270.0).abs() < 31.0, "followed the finger: {after_drag}");
+        assert!(b.animating(), "a fling");
+        for i in 1..=60 {
+            b.render(t + i as f64 * 16.0, &mut h);
+        }
+        let after_fling = b.tabs[b.active].doc.scroll_y();
+        assert!(after_fling > after_drag + 200.0, "kept sliding: {after_drag} → {after_fling}");
+        // touch-action: none keeps the drag to the page
+        b.fling = None;
+        let before = b.tabs[b.active].doc.scroll_y();
+        let mx = (vp.x + 50.0) as i32;
+        let my = (vp.y + 80.0) as i32;
+        finger(&mut b, &mut h, 2000.0, 15.0, &[(mx, my), (mx, my - 30), (mx, my - 60)]);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), before, "touch-action: none");
+    }
+
+    #[test]
+    fn canceled_touches_and_long_presses() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(800, 600, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://touch.test/c", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0"><div id=d style="height:3000px">x</div><script>
+              const d = document.getElementById('d');
+              d.addEventListener('touchstart', (e) => { if (window.own) e.preventDefault(); });
+              d.addEventListener('click', () => console.log('click'));
+              d.addEventListener('contextmenu', () => console.log('contextmenu'));
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + 100.0) as i32, (vp.y + 100.0) as i32);
+        // a long press opens the context menu, and is not a click
+        b.event(Event::Touch { id: 3, x, y, phase: crate::input::TouchPhase::Start }, 0.0, &mut h);
+        assert!(b.next_wakeup(10.0).is_some_and(|t| t <= touch::LONG_PRESS_MS), "wakes for the long press");
+        b.render(touch::LONG_PRESS_MS + 1.0, &mut h);
+        b.event(Event::Touch { id: 3, x, y, phase: crate::input::TouchPhase::End }, 700.0, &mut h);
+        assert!(h.logs.iter().any(|l| l == "contextmenu") && !h.logs.iter().any(|l| l == "click"), "{:?}", h.logs);
+        b.close_menu();
+        // a page that cancels touchstart gets no click and no scrolling
+        b.run_script("window.own = true", &mut h);
+        h.logs.clear();
+        finger(&mut b, &mut h, 1000.0, 20.0, &[(x, y), (x, y)]);
+        finger(&mut b, &mut h, 1100.0, 15.0, &[(x, y), (x, y - 40), (x, y - 80)]);
+        assert!(!h.logs.iter().any(|l| l == "click"), "{:?}", h.logs);
+        assert_eq!(b.tabs[b.active].doc.scroll_y(), 0.0);
+    }
+
+    #[test]
+    fn the_on_screen_keyboard_comes_up_for_touched_fields() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(800, 600, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://osk.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<body style="margin:0"><input id=t style="width:300px;height:30px" enterkeyhint=send><br><input id=n type=tel style="width:300px;height:30px"><script>
+              const t = document.getElementById('t');
+              t.addEventListener('keydown', (e) => console.log('keydown ' + e.key));
+              t.addEventListener('input', () => console.log('input ' + t.value));
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let shown = |b: &Browser| b.chrome.dom.attr(b.chrome_el("osk").unwrap(), "hidden").is_none();
+        let keys = |b: &Browser| -> Vec<String> {
+            let dom = &b.chrome.dom;
+            dom.descendants(b.chrome_el("osk").unwrap()).into_iter().filter_map(|n| dom.attr(n, "data-key").map(String::from)).collect()
+        };
+        let label = |b: &Browser, k: &str| -> String {
+            let dom = &b.chrome.dom;
+            let n = dom.descendants(b.chrome_el("osk").unwrap()).into_iter().find(|&n| dom.attr(n, "data-key") == Some(k)).unwrap();
+            dom.text_content(n)
+        };
+        let at = |b: &Browser, id: &str| {
+            let r = b.tabs[b.active].doc.content_box(page_el(b, id)).unwrap();
+            let vp = b.viewport_rect();
+            ((vp.x + r.x + 5.0) as i32, (vp.y + r.y + r.h / 2.0) as i32)
+        };
+        // a mouse click: no keyboard (auto)
+        let (x, y) = at(&b, "t");
+        b.event(Event::MouseDown { x, y, button: 0 }, 10.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 20.0, &mut h);
+        b.render(30.0, &mut h);
+        assert!(!shown(&b), "a mouse user");
+        let full = b.viewport_rect().h;
+        // a tap: the keyboard comes up, the page gets shorter
+        finger(&mut b, &mut h, 100.0, 30.0, &[(x, y), (x, y)]);
+        b.render(200.0, &mut h);
+        assert!(shown(&b), "touched");
+        assert!(b.viewport_rect().h < full - 150.0, "the page is shorter");
+        assert_eq!(label(&b, "enter"), "傳送", "enterkeyhint");
+        assert!(keys(&b).contains(&"q".to_string()));
+        for k in ["shift", "h", "i", "page:symbols", "!", "backspace"] {
+            b.osk_press(k, &mut h);
+        }
+        b.render(300.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.input_value(page_el(&b, "t")), "Hi");
+        assert!(h.logs.iter().any(|l| l == "keydown H") && h.logs.iter().any(|l| l == "input Hi!"), "{:?}", h.logs);
+        // a phone field: the dial pad
+        let (nx, ny) = at(&b, "n");
+        finger(&mut b, &mut h, 400.0, 30.0, &[(nx, ny), (nx, ny)]);
+        b.render(500.0, &mut h);
+        assert!(keys(&b).contains(&"#".to_string()) && !keys(&b).contains(&"q".to_string()), "{:?}", keys(&b));
+        // hidden by the user until the focus moves
+        b.osk_press("hide", &mut h);
+        b.render(600.0, &mut h);
+        assert!(!shown(&b));
+        finger(&mut b, &mut h, 700.0, 30.0, &[(x, y), (x, y)]);
+        b.render(800.0, &mut h);
+        assert!(shown(&b), "another field");
+        // a physical key: the keyboard goes away
+        b.event(Event::KeyDown { key: 'A' as i32, mods: Modifiers::default(), repeat: false }, 900.0, &mut h);
+        b.render(950.0, &mut h);
+        assert!(!shown(&b), "a physical keyboard");
+        // never / always
+        b.set_keyboard_mode(KeyboardMode::Never);
+        finger(&mut b, &mut h, 1000.0, 30.0, &[(x, y), (x, y)]);
+        b.render(1100.0, &mut h);
+        assert!(!shown(&b), "never");
+        b.set_keyboard_mode(KeyboardMode::Always);
+        b.render(1200.0, &mut h);
+        assert!(shown(&b), "always");
     }
 
     #[test]

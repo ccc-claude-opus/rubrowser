@@ -16,9 +16,9 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::abi::key;
-use crate::browser::{Browser, ResponseInfo};
+use crate::browser::{Browser, KeyboardMode, ResponseInfo};
 use crate::document::FileData;
-use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers, WsEvent};
+use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers, TouchPhase, WsEvent};
 use crate::net::url;
 use crate::text::Fonts;
 
@@ -28,8 +28,9 @@ const MAX_BODY: u64 = 32 << 20;
 /// Opens the browser window (showing `url` if given) and runs until closed.
 /// Opens the browser window at `url` (or the home page). `javascript`:
 /// whether web pages may run scripts.
-/// `installer`: an app installer's URL (see [`Browser::set_installer`]).
-pub fn run(url: Option<String>, javascript: bool, installer: Option<String>) -> Result<(), Box<dyn Error>> {
+/// `installer`: an app installer's URL (see [`Browser::set_installer`]);
+/// `keyboard`: when the on-screen keyboard comes up.
+pub fn run(url: Option<String>, javascript: bool, installer: Option<String>, keyboard: KeyboardMode) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Fetched>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let mut app = App {
@@ -37,6 +38,7 @@ pub fn run(url: Option<String>, javascript: bool, installer: Option<String>) -> 
         url,
         javascript,
         installer,
+        keyboard,
         proxy,
         start: Instant::now(),
     };
@@ -109,6 +111,7 @@ struct App {
     url: Option<String>,
     javascript: bool,
     installer: Option<String>,
+    keyboard: KeyboardMode,
     proxy: EventLoopProxy<Fetched>,
     start: Instant,
 }
@@ -564,6 +567,8 @@ pub struct Shot {
     pub timeout: Duration,
     /// An app installer's URL (see [`Browser::set_installer`]).
     pub installer: Option<String>,
+    /// When the on-screen keyboard comes up.
+    pub keyboard: KeyboardMode,
 }
 
 /// Loads `url` without a window, waits for its resources, and writes the
@@ -632,6 +637,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     let mut browser = Browser::with_fonts(pw, ph, shot.scale, Fonts::with_system_fonts());
     browser.set_javascript(shot.javascript);
     browser.set_installer(shot.installer.clone());
+    browser.set_keyboard_mode(shot.keyboard);
     let start = Instant::now();
     let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
     browser.navigate(&url::from_input(url), &mut host);
@@ -725,6 +731,33 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 }
                 "wait" => std::thread::sleep(Duration::from_millis(num(1).max(0) as u64)),
                 "type" => browser.event(Event::Text(step[4..].trim_start().to_string()), t, &mut host),
+                // touch-down|touch-move|touch-up ID X Y, tap X Y, swipe X Y X2 Y2 MS (finger 1)
+                "touch-down" | "touch-move" | "touch-up" => {
+                    let phase = match w[0] {
+                        "touch-down" => TouchPhase::Start,
+                        "touch-move" => TouchPhase::Move,
+                        _ => TouchPhase::End,
+                    };
+                    let ev = Event::Touch { id: num(1) as u64, x: num(2), y: num(3), phase };
+                    browser.event(ev, t, &mut host);
+                }
+                "tap" => {
+                    for phase in [TouchPhase::Start, TouchPhase::End] {
+                        browser.event(Event::Touch { id: 1, x: num(1), y: num(2), phase }, now(&start), &mut host);
+                    }
+                }
+                "swipe" => {
+                    let (x0, y0, x1, y1, ms) = (num(1), num(2), num(3), num(4), num(5).max(16));
+                    let steps = (ms / 16).max(2);
+                    browser.event(Event::Touch { id: 1, x: x0, y: y0, phase: TouchPhase::Start }, now(&start), &mut host);
+                    for i in 1..=steps {
+                        std::thread::sleep(Duration::from_millis(16));
+                        let (x, y) = (x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps);
+                        browser.event(Event::Touch { id: 1, x, y, phase: TouchPhase::Move }, now(&start), &mut host);
+                        browser.render(now(&start), &mut host);
+                    }
+                    browser.event(Event::Touch { id: 1, x: x1, y: y1, phase: TouchPhase::End }, now(&start), &mut host);
+                }
                 "js" => browser.run_script(&step[2..], &mut host),
                 other => eprintln!("rubrowser: RUBROWSER_INPUT: unknown step {other}"),
             }
@@ -795,6 +828,7 @@ impl ApplicationHandler<Fetched> for App {
         );
         browser.set_javascript(self.javascript);
         browser.set_installer(self.installer.clone());
+        browser.set_keyboard_mode(self.keyboard);
         let mut host = NativeHost {
             window: window.clone(),
             proxy: self.proxy.clone(),
@@ -892,6 +926,17 @@ impl ApplicationHandler<Fetched> for App {
                 Some(Event::MouseMove { x, y })
             }
             WindowEvent::CursorLeft { .. } => Some(Event::MouseLeave),
+            WindowEvent::Touch(t) => Some(Event::Touch {
+                id: t.id,
+                x: (t.location.x / s.scale).round() as i32,
+                y: (t.location.y / s.scale).round() as i32,
+                phase: match t.phase {
+                    winit::event::TouchPhase::Started => TouchPhase::Start,
+                    winit::event::TouchPhase::Moved => TouchPhase::Move,
+                    winit::event::TouchPhase::Ended => TouchPhase::End,
+                    winit::event::TouchPhase::Cancelled => TouchPhase::Cancel,
+                },
+            }),
             WindowEvent::MouseInput { state, button, .. } => {
                 let button = match button {
                     // Ctrl-click is the secondary click on macOS (the button

@@ -156,6 +156,10 @@ pub struct EventInfo {
     pub repeat: bool,
     /// `WheelEvent.deltaX` / `deltaY` (pixels).
     pub delta: (f64, f64),
+    /// Touch data: for touch events `"<touches>|<changed>"`, each a `;`
+    /// separated list of `id,x,y,target`; for pointer and mouse events from
+    /// a finger `"touch <id> <primary 0|1>"`; empty otherwise.
+    pub touch: String,
 }
 
 struct State {
@@ -1493,9 +1497,10 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         "rb",
         "event_string",
         |mut c: C, which: i32, p: i32, cap: i32| -> Result<i32, Error> {
-            // which: 0 type, 1 key.
+            // which: 0 type, 1 key, 2 touch data.
             let v = c.data().event.as_ref().map(|e| match which {
                 0 => e.kind.clone(),
+                2 => e.touch.clone(),
                 _ => e.key.clone(),
             });
             match v {
