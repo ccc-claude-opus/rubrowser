@@ -107,11 +107,17 @@ impl Document {
                 started: false,
             };
             if !url.is_empty() {
-                el.player = media::open(&url);
+                // A media fragment (#t=30) is the initial playback position;
+                // the resource itself is fetched without the fragment.
+                let (resource, start) = temporal_fragment(&url);
+                el.player = media::open(resource);
                 match el.player.as_mut() {
                     Some(p) => {
                         p.set_volume(1.0, muted);
                         p.set_loop(self.dom.attr(n, "loop").is_some());
+                        if let Some(t) = start.filter(|&t| t > 0.0) {
+                            p.seek(t);
+                        }
                         // Autoplay is allowed muted (as in Chrome).
                         if self.dom.attr(n, "autoplay").is_some() && muted {
                             p.play();
@@ -258,5 +264,54 @@ impl Document {
     /// The media element of `n`, if any.
     pub fn media(&self, n: NodeId) -> Option<&MediaElement> {
         self.media.get(&n)
+    }
+}
+
+/// Media Fragments URI 1.0, temporal dimension: the start of `#t=` in
+/// normal play time (`t=10`, `t=npt:1:02.5`, `t=10,20`); the URL without
+/// the fragment and the start in seconds, if any.
+pub(crate) fn temporal_fragment(url: &str) -> (&str, Option<f64>) {
+    let Some((resource, fragment)) = url.split_once('#') else {
+        return (url, None);
+    };
+    let start = fragment
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("t="))
+        .and_then(|v| {
+            let v = v.strip_prefix("npt:").unwrap_or(v);
+            let begin = v.split(',').next().unwrap_or("");
+            if begin.is_empty() {
+                return Some(0.0);
+            }
+            // [[hh:]mm:]ss[.fraction]
+            let parts: Vec<&str> = begin.split(':').collect();
+            if parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
+                return None;
+            }
+            let mut secs = 0.0;
+            for (i, p) in parts.iter().enumerate() {
+                let last = i + 1 == parts.len();
+                let ok = p.chars().all(|c| c.is_ascii_digit() || (last && c == '.'));
+                if !ok {
+                    return None;
+                }
+                secs = secs * 60.0 + p.parse::<f64>().ok()?;
+            }
+            Some(secs)
+        });
+    (resource, start)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn media_fragments_give_the_start() {
+        use super::temporal_fragment as t;
+        assert_eq!(t("http://a/v.mp4#t=30"), ("http://a/v.mp4", Some(30.0)));
+        assert_eq!(t("v.mp4#t=npt:1:02.5,90"), ("v.mp4", Some(62.5)));
+        assert_eq!(t("v.mp4#t=1:00:00"), ("v.mp4", Some(3600.0)));
+        assert_eq!(t("v.mp4#xywh=1,2,3,4&t=5"), ("v.mp4", Some(5.0)));
+        assert_eq!(t("v.mp4#t=abc"), ("v.mp4", None));
+        assert_eq!(t("v.mp4"), ("v.mp4", None));
     }
 }

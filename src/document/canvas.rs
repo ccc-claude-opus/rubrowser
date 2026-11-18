@@ -1201,6 +1201,15 @@ impl Document {
         if let Some(c) = self.canvases.get(&source) {
             return Some(c.pixmap.clone());
         }
+        // A <video>: the frame it shows now (HTML's CanvasImageSource).
+        if let Some(m) = self.media.get(&source) {
+            let frame = m.player.as_ref()?.frame()?;
+            let mut pixmap = Pixmap::new(frame.width.max(1), frame.height.max(1))?;
+            for (dst, &p) in pixmap.pixels_mut().iter_mut().zip(frame.rgb.iter()) {
+                *dst = tiny_skia::ColorU8::from_rgba((p >> 16) as u8, (p >> 8) as u8, p as u8, 255).premultiply();
+            }
+            return Some(pixmap);
+        }
         let bitmap = self.images.get(source)?.bitmap()?;
         let (w, h) = (bitmap.width.max(1), bitmap.height.max(1));
         let px = self.images.scaled(source, w, h)?;

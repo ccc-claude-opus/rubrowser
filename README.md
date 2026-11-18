@@ -29,6 +29,8 @@ To play audio and video, build with the `media` feature, which uses FFmpeg (inst
 cargo install rubrowser --features media
 ```
 
+rubrowser's own code stays MIT either way; the `media` build links to the FFmpeg libraries installed on the machine, so a binary you *distribute* follows that FFmpeg's license: Homebrew's FFmpeg is built with `--enable-gpl` (x264), so such a binary must be distributed under the GPL's terms. To ship binaries under MIT, link against an LGPL build of FFmpeg (configured without `--enable-gpl` / `--enable-nonfree`; playback only needs FFmpeg's own decoders), keep it dynamically linked and include its license notice and source offer. `<video>` and `<audio>` play over HTTP with Range requests, start at a media fragment (`#t=30`, Media Fragments URI 1.0) and can be drawn into a canvas (`drawImage(video, …)`).
+
 Open a file or URL directly:
 
 ```bash

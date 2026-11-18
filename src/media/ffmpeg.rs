@@ -148,6 +148,7 @@ pub fn open(url: &str) -> Option<Box<dyn Player>> {
         since: None,
         queue: VecDeque::new(),
         current: None,
+        fresh: false,
         ended_stream: false,
         looping: false,
         last_update: None,
@@ -409,6 +410,9 @@ struct FfPlayer {
     /// Decoded frames not shown yet, by presentation time.
     queue: VecDeque<(f64, Rc<Frame>)>,
     current: Option<Rc<Frame>>,
+    /// After a seek: show the first frame decoded at the new position even
+    /// before its time (paused at 0:04, the picture is the one at 0:04).
+    fresh: bool,
     /// The decoder reached the end (of the current generation).
     ended_stream: bool,
     looping: bool,
@@ -472,6 +476,7 @@ impl Player for FfPlayer {
             generation: self.generation,
         });
         self.queue.clear();
+        self.fresh = true;
         self.ended_stream = false;
         self.info.ended = false;
         self.base = t;
@@ -535,11 +540,12 @@ impl Player for FfPlayer {
         let now = self.clock();
         // The frame due now (the first one even before playing).
         while let Some((pts, _)) = self.queue.front() {
-            if *pts > now && self.current.is_some() {
+            if *pts > now && self.current.is_some() && !self.fresh {
                 break;
             }
             let (_, f) = self.queue.pop_front().unwrap();
             self.current = Some(f);
+            self.fresh = false;
             if self.info.ready < 2 {
                 self.info.ready = 4;
                 self.events
