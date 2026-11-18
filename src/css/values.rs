@@ -477,8 +477,22 @@ pub fn px(s: &str, fc: FontContext) -> Option<f32> {
     }
 }
 
+/// A number: plain (`1.5`) or a unitless math function (`calc(2 / 1.5)`).
 pub fn number(s: &str) -> Option<f32> {
-    s.trim().parse().ok()
+    let s = s.trim();
+    if let Ok(n) = s.parse() {
+        return Some(n);
+    }
+    let lower = s.to_ascii_lowercase();
+    let math = ["calc(", "min(", "max(", "clamp("].iter().any(|f| lower.starts_with(f));
+    if !math || !lower.ends_with(')') {
+        return None;
+    }
+    let fc = FontContext { em: 16.0, rem: 16.0, vw: 0.0, vh: 0.0 };
+    match (Calc { s: lower.as_bytes(), i: 0, fc }).expr()? {
+        Expr::Lin(Lin { px, pct: 0.0, num: true }) => Some(px),
+        _ => None,
+    }
 }
 
 /// Splits a value on whitespace, keeping `rgb(…)`-style groups together.
@@ -527,6 +541,15 @@ mod tests {
         vw: 1000.0,
         vh: 500.0,
     };
+
+    #[test]
+    fn unitless_math_is_a_number() {
+        assert_eq!(number("calc(2 / 1.5)").map(|n| (n * 1000.0).round()), Some(1333.0));
+        assert_eq!(number("calc(1 + 0.5)"), Some(1.5));
+        assert_eq!(number("max(1, 2)"), Some(2.0));
+        assert_eq!(number("calc(10px / 2)"), None, "a length is not a number");
+        assert_eq!(number("1.25"), Some(1.25));
+    }
 
     #[test]
     fn calc_and_viewport_units() {

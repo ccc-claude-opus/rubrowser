@@ -135,6 +135,8 @@
     get textContent() { return rb.getText(this.__h); }
     set textContent(v) { rb.setText(this.__h, v === null || v === undefined ? '' : String(v)); }
     get nodeValue() { return this.nodeType === 3 ? this.textContent : null; }
+    // DOM: setting nodeValue replaces a text node's data; on other nodes it does nothing
+    set nodeValue(v) { if (this.nodeType === 3) this.textContent = v === null ? '' : String(v); }
 
     hasChildNodes() { return rb.childCount(this.__h) > 0; }
     contains(other) {

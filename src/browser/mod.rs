@@ -514,6 +514,10 @@ struct Timer {
     id: i32,
 }
 
+/// The longest a page waits for its render-blocking stylesheets before it
+/// is shown anyway (a slow or stuck server should not hide it forever).
+const BLOCKING_MS: f64 = 3000.0;
+
 struct Tab {
     id: u64,
     history: Vec<String>,
@@ -560,6 +564,10 @@ struct Tab {
     link_events: Vec<(NodeId, &'static str)>,
     /// Scripts inserted by scripts are queued: run them on the next update.
     kick: bool,
+    /// The page's own stylesheets (`<link rel=stylesheet>` in the parsed
+    /// document) still loading, and since when: they are render-blocking
+    /// (HTML), so the page is not shown unstyled meanwhile.
+    blocking: (std::collections::HashSet<NodeId>, f64),
 }
 
 impl Tab {
@@ -732,6 +740,7 @@ impl Browser {
             known: Default::default(),
             link_events: Vec::new(),
             kick: false,
+            blocking: (std::collections::HashSet::new(), 0.0),
         });
         self.active = self.tabs.len() - 1;
     }
@@ -1009,6 +1018,7 @@ impl Browser {
             .filter(|&n| tab.doc.dom.tag(n) == Some("script"))
             .chain(links.iter().map(|&(n, _)| n))
             .collect();
+        self.tabs[i].blocking = (links.iter().map(|&(n, _)| n).collect(), self.now);
         for (link, href) in links {
             let target = url::resolve(url, &href);
             let req = Request::Stylesheet {
@@ -1594,6 +1604,10 @@ impl Browser {
                     return;
                 };
                 let kind = if result.is_ok() { "load" } else { "error" };
+                if let Some(l) = link.filter(|_| frame.is_none()) {
+                    self.tabs[i].blocking.0.remove(&l);
+                    self.dirty = true;
+                }
                 if let Ok(bytes) = result
                     && let Some(doc) = self.tabs[i].doc_at(frame)
                 {
@@ -3666,8 +3680,16 @@ impl Browser {
     }
 
     /// Whether a new frame should be drawn at time `now`.
+    /// When the active page's render-blocking stylesheets stop holding it
+    /// back (at most [`BLOCKING_MS`] after it was parsed); `None` if none load.
+    fn blocked_until(&self) -> Option<f64> {
+        let (sheets, since) = &self.tabs[self.active].blocking;
+        (!sheets.is_empty()).then_some(since + BLOCKING_MS)
+    }
+
     pub fn needs_redraw(&self, now: f64) -> bool {
         self.dirty
+            || self.blocked_until().is_some_and(|t| t <= now)
             || self.media_due(now)
             || self.tabs[self.active]
                 .doc
@@ -3700,7 +3722,7 @@ impl Browser {
         });
         // The next frame of an animated image.
         let image = self.tabs[self.active].doc.next_image_frame();
-        [caret, self.next_timer(), image]
+        [caret, self.next_timer(), image, self.blocked_until()]
             .into_iter()
             .flatten()
             .min_by(f64::total_cmp)
@@ -3734,9 +3756,12 @@ impl Browser {
         self.canvas.reset_clip();
         self.chrome
             .paint(&mut self.canvas, (0.0, 0.0), scale, &self.fonts);
-        self.tabs[self.active]
-            .doc
-            .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
+        // Render-blocking stylesheets still loading: the viewport stays blank.
+        if self.blocked_until().is_none_or(|t| t <= now) {
+            self.tabs[self.active]
+                .doc
+                .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
+        }
         // The status bubble and the context menu are part of the chrome but
         // sit above the page.
         // (repainted exactly: around them the chrome would paint its
@@ -4235,6 +4260,21 @@ mod tests {
         b.fetch_done(h.fetched.last().unwrap().0, Ok(b"<p>installer</p>".to_vec()), &mut h);
         b.render(0.0, &mut h);
         assert!(hidden(&b), "the installer page declares nothing");
+    }
+
+    #[test]
+    fn pages_wait_for_their_stylesheets_before_showing() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://css.test/", &mut h);
+        let page = r#"<link rel=stylesheet href=a.css><p id=p style="font-size:30px">unstyled</p>"#;
+        b.fetch_done(h.fetched.last().unwrap().0, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(10.0, &mut h);
+        let until = b.blocked_until().expect("a.css is loading");
+        assert_eq!(until, BLOCKING_MS, "since the page was parsed");
+        assert!(b.next_wakeup(10.0).is_some_and(|t| t <= until), "wakes up to show it anyway");
+        let css = h.fetched.iter().find(|(_, u)| u.ends_with("a.css")).unwrap().0;
+        b.fetch_done(css, Ok(b"p{color:red}".to_vec()), &mut h);
+        assert_eq!(b.blocked_until(), None, "loaded: shown");
     }
 
     #[test]
