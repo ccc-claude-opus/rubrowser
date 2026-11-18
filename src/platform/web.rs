@@ -141,7 +141,7 @@ pub extern "C" fn rb_web_key(down: i32, key: i32, mods: i32) {
     with(|w| {
         let mods = Modifiers::from_bits(mods);
         let e = if down != 0 {
-            Event::KeyDown { key, mods }
+            Event::KeyDown { key, mods, repeat: false }
         } else {
             Event::KeyUp { key, mods }
         };

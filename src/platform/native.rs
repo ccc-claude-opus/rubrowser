@@ -602,7 +602,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     pump(&mut browser, &mut host);
     browser.render(now(&start), &mut host);
     // A debugging aid: input to play before the screenshot, e.g.
-    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; wait 500"
+    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; wait 500"
     // (window logical px; keys are letters or escape/enter/tab/left/right/up/down).
     if let Ok(script) = std::env::var("RUBROWSER_INPUT") {
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -619,7 +619,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                     browser.event(Event::MouseDown { x: num(1), y: num(2), button: 0 }, t, &mut host);
                     browser.event(Event::MouseUp { x: num(1), y: num(2), button: 0 }, t, &mut host);
                 }
-                "key" => {
+                "key" | "keydown" | "keyup" => {
                     let k = w.get(1).copied().unwrap_or("");
                     let code = match k {
                         "escape" => key::ESCAPE,
@@ -635,8 +635,12 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                     };
                     let has = |m: &str| w[2..].contains(&m);
                     let mods = Modifiers { shift: has("shift"), ctrl: has("ctrl"), alt: has("alt"), meta: has("cmd") };
-                    browser.event(Event::KeyDown { key: code, mods }, t, &mut host);
-                    browser.event(Event::KeyUp { key: code, mods }, t, &mut host);
+                    if w[0] != "keyup" {
+                        browser.event(Event::KeyDown { key: code, mods, repeat: false }, t, &mut host);
+                    }
+                    if w[0] != "keydown" {
+                        browser.event(Event::KeyUp { key: code, mods }, t, &mut host);
+                    }
                 }
                 "wait" => std::thread::sleep(Duration::from_millis(num(1).max(0) as u64)),
                 other => eprintln!("rubrowser: RUBROWSER_INPUT: unknown step {other}"),
@@ -842,6 +846,7 @@ impl ApplicationHandler<Fetched> for App {
                         let e = Event::KeyDown {
                             key: code,
                             mods: s.mods,
+                            repeat: event.repeat,
                         };
                         s.browser.event(e, now, &mut s.host);
                     }

@@ -73,6 +73,8 @@ pub enum Event {
     KeyDown {
         key: i32,
         mods: Modifiers,
+        /// Sent again while the key is held (`KeyboardEvent.repeat`).
+        repeat: bool,
     },
     KeyUp {
         key: i32,

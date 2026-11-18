@@ -139,6 +139,8 @@ pub struct EventInfo {
     pub x: f64,
     pub y: f64,
     pub button: i32,
+    /// A key held down (`KeyboardEvent.repeat`).
+    pub repeat: bool,
 }
 
 struct State {
@@ -1452,13 +1454,14 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         },
     )?;
     l.func_wrap("rb", "event_int", |c: C, which: i32| -> i32 {
-        // which: 0 target, 1 current target, 2 key code, 3 modifiers, 4 button.
+        // which: 0 target, 1 current target, 2 key code, 3 modifiers, 4 button, 5 repeat.
         c.data().event.as_ref().map_or(-1, |e| match which {
             0 => e.target as i32,
             1 => e.current as i32,
             2 => e.key_code,
             3 => e.mods,
             4 => e.button,
+            5 => e.repeat as i32,
             _ => -1,
         })
     })?;

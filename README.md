@@ -47,7 +47,7 @@ rubrowser --no-js https://en.wikipedia.org/wiki/Rust_(programming_language)
 rubrowser --screenshot out.png --width 1280 --height 900 https://github.com/rust-lang/rust
 ```
 
-Debugging aids for `--screenshot`: `RUBROWSER_DUMP=selector` prints the layout boxes under an element, `RUBROWSER_PROFILE=1` prints style and layout times. `RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; wait 500"` plays mouse and key input before the screenshot (`click`, `right`, `[`/`]` too; copied text is printed). In the window, `RUBROWSER_KEYS=1` prints each key as rubrowser reads it and `RUBROWSER_AUDIO=1` prints Web Audio commands.
+Debugging aids for `--screenshot`: `RUBROWSER_DUMP=selector` prints the layout boxes under an element, `RUBROWSER_PROFILE=1` prints style and layout times. `RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; wait 500"` plays mouse and key input before the screenshot (`click`, `right`, `keydown a` / `keyup a` to hold a key, `[`/`]` too; copied text is printed). In the window, `RUBROWSER_KEYS=1` prints each key as rubrowser reads it and `RUBROWSER_AUDIO=1` prints Web Audio commands.
 
 Built-in pages: `about:home`, `about:counter`, `about:todo`, `about:stopwatch`, `about:events` (Rust/wasm), `about:js-todo`, `about:calc` (JavaScript) and `about:form`.
 

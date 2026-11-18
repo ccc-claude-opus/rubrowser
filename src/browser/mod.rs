@@ -481,6 +481,8 @@ struct EventInit {
     x: f32,
     y: f32,
     button: i32,
+    /// A key held down (auto-repeat).
+    repeat: bool,
 }
 
 impl EventInit {
@@ -613,6 +615,8 @@ pub struct Browser {
     last_down: Option<(f32, f32, f64)>,
     /// Where the pointer was when page mouse events last went out.
     last_move: (f32, f32),
+    /// The key being handled is an auto-repeat.
+    key_repeat: bool,
     /// The open context menu.
     menu: Option<MenuCtx>,
     /// Status and headers of responses not delivered yet (by fetch id).
@@ -653,6 +657,7 @@ impl Browser {
             last_click: None,
             last_down: None,
             last_move: (-1.0, -1.0),
+            key_repeat: false,
             menu: None,
             javascript: true,
             responses: HashMap::new(),
@@ -1900,6 +1905,7 @@ impl Browser {
             x: init.x as f64,
             y: init.y as f64,
             button: init.button,
+            repeat: init.repeat,
         };
         let mut prevented = false;
         let mut n = Some(node);
@@ -2141,11 +2147,21 @@ impl Browser {
                     self.mouse_move(px, py, host);
                 }
             }
-            Event::KeyDown { key, mods } => {
+            Event::KeyDown { key, mods, repeat } => {
                 self.mods = mods;
+                self.key_repeat = repeat;
                 self.key_down(key, mods, host);
+                self.key_repeat = false;
             }
-            Event::KeyUp { mods, .. } => self.mods = mods,
+            Event::KeyUp { key, mods } => {
+                self.mods = mods;
+                // the page hears keyup at the focused element (or the body)
+                if self.keyboard == Target::Page {
+                    let doc = self.doc(Target::Page);
+                    let target = doc.state().focus.or_else(|| doc.dom.body()).unwrap_or(crate::dom::Dom::ROOT);
+                    self.dispatch(target, "keyup", EventInit::key(key, mods.bits()), host);
+                }
+            }
             Event::Text(text) => {
                 if let Some((t, n)) = self.focused()
                     && self.doc(t).is_text_input(n)
@@ -3174,7 +3190,8 @@ impl Browser {
             let target = focus
                 .or_else(|| self.doc(t).dom.body())
                 .unwrap_or(crate::dom::Dom::ROOT);
-            if self.dispatch(target, "keydown", EventInit::key(code, mods.bits()), host) {
+            let init = EventInit { repeat: self.key_repeat, ..EventInit::key(code, mods.bits()) };
+            if self.dispatch(target, "keydown", init, host) {
                 return;
             }
         }
@@ -3767,7 +3784,7 @@ mod tests {
     }
 
     fn press(b: &mut Browser, h: &mut TestHost, k: i32, mods: Modifiers) {
-        b.event(Event::KeyDown { key: k, mods }, 0.0, h);
+        b.event(Event::KeyDown { key: k, mods, repeat: false }, 0.0, h);
     }
 
     fn click_at(b: &mut Browser, h: &mut TestHost, r: RectF) {
@@ -4486,6 +4503,27 @@ mod tests {
     }
 
     #[test]
+    fn keyup_and_repeat_reach_the_page() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://keys.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<p>piano</p><script>
+              addEventListener('keydown', (e) => console.log('down ' + e.key + ' ' + e.repeat));
+              addEventListener('keyup', (e) => console.log('up ' + e.key + ' ' + e.repeat));
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let none = Modifiers::default();
+        b.event(Event::KeyDown { key: 'A' as i32, mods: none, repeat: false }, 0.0, &mut h);
+        b.event(Event::KeyDown { key: 'A' as i32, mods: none, repeat: true }, 0.0, &mut h);
+        b.event(Event::KeyUp { key: 'A' as i32, mods: none }, 0.0, &mut h);
+        let keys: Vec<&String> = h.logs.iter().filter(|l| l.starts_with("down") || l.starts_with("up")).collect();
+        assert_eq!(keys, ["down a false", "down a true", "up a false"], "{:?}", h.logs);
+    }
+
+    #[test]
     fn intl_formats_dates_numbers_and_lists() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);
@@ -4997,6 +5035,7 @@ mod tests {
                 Event::KeyDown {
                     key: code,
                     mods: Modifiers::default(),
+                    repeat: false,
                 },
                 0.0,
                 &mut h2,
@@ -5006,6 +5045,7 @@ mod tests {
             Event::KeyDown {
                 key: key::ENTER,
                 mods: Modifiers::default(),
+                repeat: false,
             },
             0.0,
             &mut h2,
@@ -5041,6 +5081,7 @@ mod tests {
             Event::KeyDown {
                 key: key::ENTER,
                 mods: Modifiers::default(),
+                repeat: false,
             },
             0.0,
             &mut h,
@@ -5115,6 +5156,7 @@ mod tests {
             Event::KeyDown {
                 key: key::UP,
                 mods: Modifiers::default(),
+                repeat: false,
             },
             0.0,
             &mut h,
@@ -5157,6 +5199,7 @@ mod tests {
             Event::KeyDown {
                 key: key::ENTER,
                 mods: Modifiers::default(),
+                repeat: false,
             },
             0.0,
             &mut h,

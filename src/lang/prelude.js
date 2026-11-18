@@ -620,6 +620,7 @@
       clientY: rb.eventPos(1),
       button: rb.eventInt(4),
     });
+    if (e instanceof eventInterfaces.KeyboardEvent) e.repeat = rb.eventInt(5) === 1;
     if (!(e instanceof eventInterfaces.MouseEvent)) {
       e.pageX = e.clientX;
       e.pageY = e.clientY;
