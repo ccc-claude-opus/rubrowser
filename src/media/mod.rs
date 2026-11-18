@@ -5,6 +5,7 @@
 
 #[cfg(feature = "media")]
 mod ffmpeg;
+pub mod webaudio;
 
 use std::rc::Rc;
 

@@ -355,6 +355,10 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
         ("rect", 2, |_, a, c| {
             Ok(unsafe { ffi::rect(int(a, 0, c)?, int(a, 1, c)?) }.into())
         }),
+        ("audio", 1, |_, a, c| {
+            let s = text(a, 0, c)?;
+            Ok(unsafe { ffi::audio(s.as_ptr(), s.len()) }.into())
+        }),
         ("imageInfo", 2, |_, a, c| {
             Ok(unsafe { ffi::image_info(int(a, 0, c)?, int(a, 1, c)?) }.into())
         }),

@@ -37,7 +37,12 @@ impl Rect {
         let y0 = self.y.max(o.y);
         let x1 = self.right().min(o.right());
         let y1 = self.bottom().min(o.bottom());
-        Rect::new(x0, y0, (x1 - x0).max(0), (y1 - y0).max(0))
+        if x1 <= x0 || y1 <= y0 {
+            // Nothing in common: an empty rectangle at the origin, so that
+            // pixel loops over it never index outside the canvas.
+            return Rect::new(0, 0, 0, 0);
+        }
+        Rect::new(x0, y0, x1 - x0, y1 - y0)
     }
 
     /// Shrinks the rectangle by `d` on every side.
@@ -456,6 +461,16 @@ impl Canvas {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drawing_wholly_outside_the_canvas_is_a_no_op() {
+        // a 2 px wide box just past the right edge, on the last row
+        let mut c = Canvas::new(10, 3);
+        c.fill_rect_alpha(12, 2, 2, 1, 0xff0000, 128);
+        c.fill_rect(12, 2, 2, 1, 0xff0000);
+        c.fill_rect_alpha(-5, 3, 20, 4, 0xff0000, 128);
+        assert!(c.pixels().iter().all(|&p| p == 0));
+    }
 
     #[test]
     fn fill_rect_is_clipped() {

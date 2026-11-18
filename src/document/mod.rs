@@ -137,6 +137,8 @@ pub struct Document {
     /// Selected page text, and the characters it covers in each run.
     pub selection: Option<selection::Selection>,
     pub highlights: selection::Highlights,
+    /// The page's Web Audio contexts.
+    pub audio: crate::media::webaudio::Engine,
     /// Option under the pointer in the open `<select>` list.
     pub popup_hover: Option<usize>,
     pub images: Images,
@@ -192,6 +194,7 @@ impl Document {
             caret_on: true,
             selection: None,
             highlights: Default::default(),
+            audio: Default::default(),
             popup_hover: None,
             images: Images::default(),
             forms: FormState::default(),

@@ -761,6 +761,14 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
             Ok(found.len() as i32)
         },
     )?;
+    // Web Audio: a command for the page's audio contexts (see media::webaudio).
+    l.func_wrap("rb", "audio", |mut c: C, p: i32, n: i32| -> Result<f64, Error> {
+        let cmd = read_str(&c, p, n)?;
+        let now = script_time(&mut c) + c.data().wall_offset;
+        let doc = &mut c.data_mut().doc;
+        let activated = doc.user_activated;
+        Ok(doc.audio.command(&cmd, now, activated))
+    })?;
     l.func_wrap("rb", "image_info", |c: C, h: i32, which: i32| -> f64 {
         // An <img>: 0 its state (0 loading, 1 loaded, 2 broken, 3 no
         // image requested), 1 its natural width, 2 its natural height.

@@ -415,6 +415,9 @@ pub struct Style {
     pub align_content: Align,
     // Inherited:
     pub text_transform: TextTransform,
+    /// `user-select: none` here or on an ancestor (CSS UI 4: `auto` takes the
+    /// parent's `none`): text here cannot start a selection.
+    pub user_select_none: bool,
     pub border_spacing: f32,
     pub border_collapse: bool,
     /// `table-layout: fixed` (not inherited).
@@ -535,6 +538,7 @@ impl Default for Style {
             justify_self: Align::Normal,
             align_content: Align::Normal,
             text_transform: TextTransform::None,
+            user_select_none: false,
             border_spacing: 0.0,
             border_collapse: false,
             table_layout_fixed: false,
@@ -637,6 +641,7 @@ impl Style {
             border_spacing: parent.border_spacing,
             border_collapse: parent.border_collapse,
             text_transform: parent.text_transform,
+            user_select_none: parent.user_select_none,
             text_shadow: parent.text_shadow.clone(),
             vars: parent.vars.clone(),
             ..Style::default()
@@ -1226,6 +1231,13 @@ impl Style {
             "outline-style" => set(&mut self.outline_style, border_style(v)),
             "outline-color" => set(&mut self.outline_color, values::color(value, self.color)),
             "outline-offset" => set(&mut self.outline_offset, px(v)),
+            "user-select" | "-webkit-user-select" => {
+                self.user_select_none = match v {
+                    "none" => true,
+                    "text" | "all" | "contain" => false,
+                    _ => return, // auto: as the parent
+                }
+            }
             "text-transform" => {
                 self.text_transform = match v {
                     "uppercase" => TextTransform::Uppercase,
@@ -1604,6 +1616,7 @@ impl Style {
             "background" | "background-color" => self.background = from.background,
             "opacity" => self.opacity = from.opacity,
             "text-transform" => self.text_transform = from.text_transform,
+            "user-select" | "-webkit-user-select" => self.user_select_none = from.user_select_none,
             "overflow" | "overflow-y" => self.overflow = from.overflow,
             "color" => self.color = from.color,
             "font-size" => self.font_size = from.font_size,

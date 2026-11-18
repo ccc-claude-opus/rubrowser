@@ -546,7 +546,9 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         fn clipboard_get(&mut self) -> Option<String> {
             None
         }
-        fn clipboard_set(&mut self, _: &str) {}
+        fn clipboard_set(&mut self, text: &str) {
+            eprintln!("[clipboard] {text}");
+        }
         fn set_cursor(&mut self, _: Cursor) {}
         fn set_title(&mut self, _: &str) {}
         fn log(&mut self, message: &str) {
@@ -571,8 +573,9 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
     browser.navigate(&url::from_input(url), &mut host);
     let deadline = start + shot.timeout;
-    loop {
-        browser.render(now(&start), &mut host);
+    // Loads until nothing is pending (or the deadline).
+    let pump = |browser: &mut Browser, host: &mut Headless| loop {
+        browser.render(now(&start), host);
         if host.pending == 0 {
             break;
         }
@@ -583,7 +586,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 let mut next = Some(first);
                 while let Some(f) = next {
                     host.pending -= 1;
-                    f.deliver(&mut browser, &mut host);
+                    f.deliver(browser, host);
                     next = rx.try_recv().ok();
                 }
             }
@@ -595,8 +598,53 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 break;
             }
         }
-    }
+    };
+    pump(&mut browser, &mut host);
     browser.render(now(&start), &mut host);
+    // A debugging aid: input to play before the screenshot, e.g.
+    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; wait 500"
+    // (window logical px; keys are letters or escape/enter/tab/left/right/up/down).
+    if let Ok(script) = std::env::var("RUBROWSER_INPUT") {
+        for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            let w: Vec<&str> = step.split_whitespace().collect();
+            let num = |i: usize| w.get(i).and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+            let t = now(&start);
+            match w[0] {
+                "down" => browser.event(Event::MouseDown { x: num(1), y: num(2), button: 0 }, t, &mut host),
+                "right" => browser.event(Event::MouseDown { x: num(1), y: num(2), button: 2 }, t, &mut host),
+                "up" => browser.event(Event::MouseUp { x: num(1), y: num(2), button: 0 }, t, &mut host),
+                "move" => browser.event(Event::MouseMove { x: num(1), y: num(2) }, t, &mut host),
+                "click" => {
+                    browser.event(Event::MouseMove { x: num(1), y: num(2) }, t, &mut host);
+                    browser.event(Event::MouseDown { x: num(1), y: num(2), button: 0 }, t, &mut host);
+                    browser.event(Event::MouseUp { x: num(1), y: num(2), button: 0 }, t, &mut host);
+                }
+                "key" => {
+                    let k = w.get(1).copied().unwrap_or("");
+                    let code = match k {
+                        "escape" => key::ESCAPE,
+                        "enter" => key::ENTER,
+                        "tab" => key::TAB,
+                        "left" => key::LEFT,
+                        "right" => key::RIGHT,
+                        "up" => key::UP,
+                        "down" => key::DOWN,
+                        "[" => key::LEFT_BRACKET,
+                        "]" => key::RIGHT_BRACKET,
+                        k => k.chars().next().map_or(0, |c| c.to_ascii_uppercase() as i32),
+                    };
+                    let has = |m: &str| w[2..].contains(&m);
+                    let mods = Modifiers { shift: has("shift"), ctrl: has("ctrl"), alt: has("alt"), meta: has("cmd") };
+                    browser.event(Event::KeyDown { key: code, mods }, t, &mut host);
+                    browser.event(Event::KeyUp { key: code, mods }, t, &mut host);
+                }
+                "wait" => std::thread::sleep(Duration::from_millis(num(1).max(0) as u64)),
+                other => eprintln!("rubrowser: RUBROWSER_INPUT: unknown step {other}"),
+            }
+            pump(&mut browser, &mut host);
+        }
+        browser.render(now(&start), &mut host);
+    }
     // Let animations that run on load (fade-ins) settle, as a person
     // looking at the page would.
     let settle = Instant::now() + std::time::Duration::from_secs(2);
@@ -785,7 +833,10 @@ impl ApplicationHandler<Fetched> for App {
                 Some(Event::Wheel { dx, dy })
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                let code = key_code(&event.logical_key);
+                let code = shortcut_code(&event.logical_key, &event.physical_key, s.mods);
+                if std::env::var_os("RUBROWSER_KEYS").is_some() && event.state == ElementState::Pressed {
+                    eprintln!("[keys] {:?} {:?} mods {:?} -> {code}", event.logical_key, event.physical_key, s.mods);
+                }
                 if event.state == ElementState::Pressed {
                     if code != 0 {
                         let e = Event::KeyDown {
@@ -815,6 +866,49 @@ impl ApplicationHandler<Fetched> for App {
         if s.browser.needs_redraw(now) {
             s.window.request_redraw();
         }
+    }
+}
+
+/// The `abi::key` code of a key press. Shortcuts with a non-Latin layout
+/// (Zhuyin, Pinyin, Cyrillic…): Cmd/Ctrl+C gives "ㄏ" or "с" as the
+/// character; like other browsers, take the key's place on a US keyboard.
+fn shortcut_code(logical: &Key, physical: &winit::keyboard::PhysicalKey, mods: Modifiers) -> i32 {
+    let code = key_code(logical);
+    if mods.command()
+        && !(65..=90).contains(&code)
+        && !(48..=57).contains(&code)
+        && let Some(c) = physical_code(physical)
+    {
+        return c;
+    }
+    code
+}
+
+/// The `abi::key` code of a letter, digit or bracket key by its position
+/// (US layout), for shortcuts typed with another layout.
+fn physical_code(k: &winit::keyboard::PhysicalKey) -> Option<i32> {
+    use winit::keyboard::{KeyCode, PhysicalKey};
+    let PhysicalKey::Code(c) = k else { return None };
+    let letters = [
+        KeyCode::KeyA, KeyCode::KeyB, KeyCode::KeyC, KeyCode::KeyD, KeyCode::KeyE, KeyCode::KeyF, KeyCode::KeyG,
+        KeyCode::KeyH, KeyCode::KeyI, KeyCode::KeyJ, KeyCode::KeyK, KeyCode::KeyL, KeyCode::KeyM, KeyCode::KeyN,
+        KeyCode::KeyO, KeyCode::KeyP, KeyCode::KeyQ, KeyCode::KeyR, KeyCode::KeyS, KeyCode::KeyT, KeyCode::KeyU,
+        KeyCode::KeyV, KeyCode::KeyW, KeyCode::KeyX, KeyCode::KeyY, KeyCode::KeyZ,
+    ];
+    let digits = [
+        KeyCode::Digit0, KeyCode::Digit1, KeyCode::Digit2, KeyCode::Digit3, KeyCode::Digit4,
+        KeyCode::Digit5, KeyCode::Digit6, KeyCode::Digit7, KeyCode::Digit8, KeyCode::Digit9,
+    ];
+    if let Some(i) = letters.iter().position(|k| k == c) {
+        return Some('A' as i32 + i as i32);
+    }
+    if let Some(i) = digits.iter().position(|k| k == c) {
+        return Some('0' as i32 + i as i32);
+    }
+    match c {
+        KeyCode::BracketLeft => Some(key::LEFT_BRACKET),
+        KeyCode::BracketRight => Some(key::RIGHT_BRACKET),
+        _ => None,
     }
 }
 
@@ -867,5 +961,27 @@ impl State {
         let n = buffer.len().min(canvas.pixels().len());
         buffer[..n].copy_from_slice(&canvas.pixels()[..n]);
         buffer.present().expect("present surface");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::keyboard::{KeyCode, PhysicalKey};
+
+    #[test]
+    fn shortcuts_work_with_any_keyboard_layout() {
+        let cmd = Modifiers { meta: true, ..Default::default() };
+        let ch = |s: &str| Key::Character(s.into());
+        // US layout
+        assert_eq!(shortcut_code(&ch("c"), &PhysicalKey::Code(KeyCode::KeyC), cmd), 'C' as i32);
+        // Zhuyin: the C key types ㄏ; Cmd+C is still copy
+        assert_eq!(shortcut_code(&ch("ㄏ"), &PhysicalKey::Code(KeyCode::KeyC), cmd), 'C' as i32);
+        assert_eq!(shortcut_code(&ch("ㄐ"), &PhysicalKey::Code(KeyCode::KeyR), cmd), 'R' as i32);
+        assert_eq!(shortcut_code(&ch("」"), &PhysicalKey::Code(KeyCode::BracketRight), cmd), key::RIGHT_BRACKET);
+        // without Cmd/Ctrl the character stays what it is
+        assert_eq!(shortcut_code(&ch("ㄏ"), &PhysicalKey::Code(KeyCode::KeyC), Modifiers::default()), key::CHAR_BASE + 'ㄏ' as i32);
+        // a Dvorak-style layout keeps its own letters (the logical key wins)
+        assert_eq!(shortcut_code(&ch("j"), &PhysicalKey::Code(KeyCode::KeyC), cmd), 'J' as i32);
     }
 }

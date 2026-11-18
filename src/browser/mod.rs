@@ -611,6 +611,8 @@ pub struct Browser {
     last_click: Option<(NodeId, f64)>,
     /// The last page mouse press (point and time), for double-clicking a word.
     last_down: Option<(f32, f32, f64)>,
+    /// Where the pointer was when page mouse events last went out.
+    last_move: (f32, f32),
     /// The open context menu.
     menu: Option<MenuCtx>,
     /// Status and headers of responses not delivered yet (by fetch id).
@@ -650,6 +652,7 @@ impl Browser {
             local: Vec::new(),
             last_click: None,
             last_down: None,
+            last_move: (-1.0, -1.0),
             menu: None,
             javascript: true,
             responses: HashMap::new(),
@@ -730,6 +733,20 @@ impl Browser {
         if self.active > i || self.active >= self.tabs.len() {
             self.active = self.active.saturating_sub(1);
         }
+        self.tab_switched();
+    }
+
+    /// Another tab became the active one: the address bar shows its URL
+    /// (dropping what was being typed for the old tab) and keys go to it.
+    fn tab_switched(&mut self) {
+        if let Some(a) = self.chrome_el("address") {
+            let url = self.tabs[self.active].url().to_string();
+            if self.chrome.state().focus == Some(a) {
+                self.set_focus(Target::Chrome, None);
+            }
+            self.chrome.set_input_value(a, &url);
+        }
+        self.keyboard = Target::Page;
         self.dirty = true;
     }
 
@@ -743,8 +760,10 @@ impl Browser {
         tab.history.truncate(tab.index + 1);
         tab.history.push(url.to_string());
         tab.index += 1;
+        let before = tab.doc.url.clone();
         if self.same_document(self.active) {
             self.tabs[self.active].post = None;
+            self.fragment_changed(&before, false, host);
         } else {
             self.load(self.active, host);
         }
@@ -757,9 +776,26 @@ impl Browser {
         let next = tab.index as isize + delta;
         if next >= 0 && (next as usize) < tab.history.len() {
             tab.index = next as usize;
-            if !self.same_document(self.active) {
+            let before = tab.doc.url.clone();
+            if self.same_document(self.active) {
+                self.fragment_changed(&before, true, host);
+            } else {
                 self.load(self.active, host);
             }
+        }
+    }
+
+    /// The active page moved to another fragment of itself (a `#…` link,
+    /// `location.hash = …`, back / forward): it hears `popstate` (when going
+    /// through history) and `hashchange` if the fragment differs.
+    fn fragment_changed(&mut self, before: &str, traversal: bool, host: &mut dyn Host) {
+        let after = self.tabs[self.active].doc.url.clone();
+        let frag = |u: &str| u.split_once('#').map_or(String::new(), |(_, f)| f.to_string());
+        if traversal {
+            self.dispatch(crate::dom::Dom::ROOT, "popstate", EventInit::default(), host);
+        }
+        if frag(before) != frag(&after) {
+            self.dispatch(crate::dom::Dom::ROOT, "hashchange", EventInit::default(), host);
         }
     }
 
@@ -2133,8 +2169,37 @@ impl Browser {
             self.set_state(Target::Chrome, |s| s.hover = hover);
             return;
         }
+        // pointermove and mousemove at the element under the pointer (only
+        // for real moves, not for hover refreshes after scrolling).
+        if (x, y) != self.last_move {
+            self.last_move = (x, y);
+            let (t, lx, ly) = self.target_at(x, y);
+            if t == Target::Page
+                && let Some(e) = self.doc(t).hit_test(lx, ly).element
+            {
+                let at = EventInit::pointer(lx, ly, 0);
+                self.dispatch(e, "pointermove", at, host);
+                self.dispatch(e, "mousemove", at, host);
+            }
+        }
         // Dragging over page text selects it (after a few pixels: a click
-        // that wobbles is still a click).
+        // that wobbles is still a click), unless the page cancels
+        // `selectstart` (a map or a slider that drags things itself).
+        if let Some(Press { select: Some((_, sx, sy)), selected, element, .. }) = self.press {
+            let vp = self.viewport_rect();
+            let (lx, ly) = (x - vp.x, y - vp.y);
+            if !selected && ((lx - sx).abs() > 3.0 || (ly - sy).abs() > 3.0) {
+                let target = element.unwrap_or(crate::dom::Dom::ROOT);
+                let doc = &self.tabs[self.active].doc;
+                let no_select = doc.style(target).is_some_and(|s| s.user_select_none);
+                if no_select || self.dispatch(target, "selectstart", EventInit::default(), host) {
+                    if let Some(p) = self.press.as_mut() {
+                        p.select = None;
+                    }
+                    return;
+                }
+            }
+        }
         if let Some(Press { select: Some((anchor, sx, sy)), selected, .. }) = self.press {
             let vp = self.viewport_rect();
             let (lx, ly) = (x - vp.x, y - vp.y);
@@ -2296,11 +2361,18 @@ impl Browser {
         if t == Target::Page {
             self.tabs[self.active].doc.user_activated = true;
         }
+        // pointerdown, then mousedown (Pointer Events §11); a page that
+        // cancels them keeps the press to itself (no text selection).
+        let mut canceled = false;
         if t == Target::Page
             && let Some(e) = hit.element
         {
-            self.dispatch(e, "mousedown", EventInit::pointer(lx, ly, 0), host);
+            canceled = self.dispatch(e, "pointerdown", EventInit::pointer(lx, ly, 0), host);
+            if !canceled {
+                canceled = self.dispatch(e, "mousedown", EventInit::pointer(lx, ly, 0), host);
+            }
         }
+        self.last_move = (x, y);
         self.set_state(t, |s| s.active = hit.element);
         let focus = hit.element.and_then(|e| self.doc(t).focusable_ancestor(e));
         let was_focused = self.doc(t).state().focus;
@@ -2355,7 +2427,7 @@ impl Browser {
         let control = hit
             .element
             .is_some_and(|e| crate::document::control(&self.doc(t).dom, e).is_some());
-        if t == Target::Page && input.is_none() && range.is_none() && !control {
+        if t == Target::Page && input.is_none() && range.is_none() && !control && !canceled {
             let double = self
                 .last_down
                 .is_some_and(|(px, py, at)| (px - lx).abs() < 4.0 && (py - ly).abs() < 4.0 && self.now - at < DOUBLE_CLICK_MS);
@@ -2422,6 +2494,7 @@ impl Browser {
         if t == Target::Page
             && let Some(e) = hit.element
         {
+            self.dispatch(e, "pointerup", EventInit::pointer(lx, ly, 0), host);
             self.dispatch(e, "mouseup", EventInit::pointer(lx, ly, 0), host);
         }
         if t != press.target || press.input.is_some() || press.selected {
@@ -2460,10 +2533,9 @@ impl Browser {
                             return self.command(&action, tab, host);
                         }
                         (None, Some(i)) => {
-                            if i < self.tabs.len() {
+                            if i < self.tabs.len() && i != self.active {
                                 self.active = i;
-                                self.keyboard = Target::Page;
-                                self.dirty = true;
+                                self.tab_switched();
                             }
                             return;
                         }
@@ -3079,6 +3151,7 @@ impl Browser {
                 } else {
                     (self.active + 1) % n
                 };
+                self.tab_switched();
                 return;
             }
             _ => {}
@@ -3458,9 +3531,9 @@ impl Browser {
             .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
         // The status bubble and the context menu are part of the chrome but
         // sit above the page.
-        // (the menu is repainted exactly: around it the chrome would paint
-        // its viewport background over the page)
-        for (id, pad) in [("status", 12.0), ("menu", 1.0)] {
+        // (repainted exactly: around them the chrome would paint its
+        // viewport background over the page)
+        for (id, pad) in [("status", 1.0), ("menu", 1.0)] {
         if let Some(s) = self.chrome_el(id).and_then(|s| {
             let st = self.chrome.style(s)?;
             (st.display != crate::css::style::Display::None).then_some(s)
@@ -4321,6 +4394,95 @@ mod tests {
         }
         // cross-origin resources get the page's origin as Referer (strict-origin-when-cross-origin)
         assert!(h.inner.referrers.iter().any(|(u, r)| u == "https://tiles.test/1.png" && r == "http://map.test/"), "{:?}", h.inner.referrers);
+    }
+
+    #[test]
+    fn mouse_and_pointer_events_drag_and_hash_navigation() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://drag.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r##"<style>body{margin:0} #d{width:300px;height:200px;font-size:20px}</style>
+            <div id=d>drag me, not my text</div><a id=cat href="#cat=2">分類</a>
+            <script>
+              const d = document.getElementById('d');
+              const log = (s) => console.log(s);
+              d.addEventListener('pointerdown', (e) => log('pointerdown ' + e.pointerType + ' ' + e.isPrimary + ' ' + e.buttons));
+              d.addEventListener('mousedown', (e) => {
+                log('down ' + e.clientX + ',' + e.clientY + ' ' + e.buttons);
+                document.addEventListener('mousemove', (m) => log('move ' + m.clientX + ',' + m.clientY + ' ' + m.buttons));
+                document.addEventListener('mouseup', () => log('up'), { once: true });
+              });
+              window.addEventListener('selectstart', (e) => e.preventDefault());
+              window.onhashchange = () => log('hashchange ' + location.hash);
+              document.getElementById('cat').addEventListener('click', (e) => { e.preventDefault(); location.hash = e.currentTarget.getAttribute('href'); });
+            </script>"##;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + 50.0) as i32, (vp.y + 20.0) as i32);
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseMove { x: x + 40, y: y + 30 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x: x + 40, y: y + 30, button: 0 }, 0.0, &mut h);
+        for want in ["pointerdown mouse true 1", "down 50,20 1", "move 90,50 1", "up"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
+        assert!(!b.tabs[b.active].doc.has_selection(), "selectstart was canceled");
+        // a #fragment change by script: no reload, hashchange
+        let fetched = h.inner.fetched.len();
+        let (cx, cy) = text_at(&b, "分類", 1);
+        b.event(Event::MouseDown { x: cx, y: cy, button: 0 }, 1000.0, &mut h);
+        b.event(Event::MouseUp { x: cx, y: cy, button: 0 }, 1000.0, &mut h);
+        b.render(1000.0, &mut h);
+        assert!(h.logs.iter().any(|l| l == "hashchange #cat=2"), "{:?}", h.logs);
+        assert_eq!(b.tabs[b.active].url(), "https://drag.test/#cat=2");
+        assert_eq!(h.inner.fetched.len(), fetched, "no reload");
+        // back: popstate and hashchange to the empty fragment
+        b.go(-1, &mut h);
+        assert!(h.logs.iter().any(|l| l == "hashchange "), "{:?}", h.logs);
+    }
+
+    #[test]
+    fn web_audio_oscillators_play_and_end() {
+        let mut h = LogHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate("https://audio.test/", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        let page = r#"<button id=play style="width:200px;height:50px">play</button><script>
+              const log = (s) => console.log(s);
+              const ac = new (window.AudioContext || window.webkitAudioContext)();
+              log('state ' + ac.state + ' ' + ac.sampleRate);
+              document.getElementById('play').onclick = () => {
+                ac.resume();
+                log('resumed ' + ac.state);
+                const t = ac.currentTime;
+                const o = ac.createOscillator(), g = ac.createGain();
+                o.type = 'triangle'; o.frequency.value = 440;
+                g.gain.setValueAtTime(0, t);
+                g.gain.linearRampToValueAtTime(0.5, t + 0.1);
+                o.connect(g); g.connect(ac.destination);
+                o.onended = () => log('ended ' + (ac.currentTime >= t + 0.2));
+                o.start(); o.stop(t + 0.2);
+                log('type ' + o.type + ' freq ' + o.frequency.value + ' gain ' + (g.gain.value < 0.01));
+                try { g.gain.exponentialRampToValueAtTime(0, t + 1); } catch (e) { log(e.name); }
+              };
+            </script>"#;
+        b.fetch_done(id, Ok(page.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let vp = b.viewport_rect();
+        let r = b.tabs[b.active].doc.content_box(b.tabs[b.active].doc.dom.element_by_id("play").unwrap()).unwrap();
+        let (x, y) = ((vp.x + r.x + 10.0) as i32, (vp.y + r.y + 10.0) as i32);
+        b.event(Event::MouseDown { x, y, button: 0 }, 100.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 100.0, &mut h);
+        for t in [200.0, 400.0, 600.0, 800.0] {
+            b.render(t, &mut h);
+        }
+        for want in ["state suspended 48000", "resumed running", "type triangle freq 440 gain true", "RangeError", "ended true"] {
+            assert!(h.logs.iter().any(|l| l == want), "{want}: {:?}", h.logs);
+        }
     }
 
     #[test]

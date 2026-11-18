@@ -623,9 +623,19 @@
     if (!(e instanceof eventInterfaces.MouseEvent)) {
       e.pageX = e.clientX;
       e.pageY = e.clientY;
+    } else {
+      // legacy `which` of mouse events is the button + 1 (UI Events §8.1)
+      e.which = e.button + 1;
+      // which buttons are held (the browser reports presses and releases)
+      const bit = [1, 4, 2][e.button] || 0;
+      if (type === 'mousedown' || type === 'pointerdown') pressedButtons |= bit;
+      if (type === 'mouseup' || type === 'pointerup') pressedButtons &= ~bit;
+      e.buttons = pressedButtons;
+      if (e instanceof eventInterfaces.PointerEvent) Object.assign(e, { pointerId: 1, pointerType: 'mouse', isPrimary: true, pressure: pressedButtons ? 0.5 : 0 });
     }
     return e;
   }
+  let pressedButtons = 0;
 
   function call(fn, self, args) {
     try {
@@ -795,6 +805,12 @@
     get pathname() { return parseUrl().pathname; },
     get search() { return parseUrl().search; },
     get hash() { return parseUrl().hash; },
+    // A new fragment of this document (no reload; the page hears hashchange).
+    set hash(v) {
+      let h = String(v);
+      if (h && h[0] !== '#') h = '#' + h;
+      rb.navigate(rb.location().split('#')[0] + h);
+    },
     get origin() { const u = parseUrl(); return u.host ? u.protocol + '//' + u.host : 'null'; },
     get href() { return rb.location(); },
     set href(v) { rb.navigate(String(v)); },
@@ -1734,6 +1750,155 @@
     if (typeof target['on' + type] === 'function') call(target['on' + type], target, [e]);
     target.dispatchEvent(e);
   }
+
+  // ----- Web Audio (a subset: oscillators, gain, AudioParam automation) -----
+  // The graph renders in the browser (media::webaudio); here each call is a
+  // command, fields separated by U+0001.
+  const audioCmd = (...f) => rb.audio(f.join('\u0001'));
+
+  class AudioParam {
+    constructor(node, name, value, min, max) {
+      Object.defineProperties(this, {
+        _n: { value: node }, _name: { value: name },
+        defaultValue: { value, enumerable: true }, minValue: { value: min, enumerable: true }, maxValue: { value: max, enumerable: true },
+      });
+      this._value = value;
+    }
+    _send(op, value, time, tau) {
+      const n = this._n;
+      audioCmd('param', n.context.__id, n.__id, this._name, op, Number(value), Number(time) || 0, Number(tau) || 0);
+      return this;
+    }
+    get value() {
+      const v = audioCmd('param-value', this._n.context.__id, this._n.__id, this._name);
+      return Number.isFinite(v) ? v : this._value;
+    }
+    set value(v) { this._value = Number(v); this._send('value', v); }
+    setValueAtTime(v, t) { return this._send('set', v, t); }
+    linearRampToValueAtTime(v, t) { return this._send('linear', v, t); }
+    exponentialRampToValueAtTime(v, t) {
+      if (!Number(v)) throw new RangeError('exponentialRampToValueAtTime: the value must not be 0');
+      return this._send('exponential', v, t);
+    }
+    setTargetAtTime(v, t, tau) { return this._send('target', v, t, tau); }
+    cancelScheduledValues(t) { return this._send('cancel', 0, t); }
+    cancelAndHoldAtTime(t) { return this._send('hold', 0, t); }
+  }
+
+  class AudioNode extends EventTarget {
+    constructor(context, id) {
+      super();
+      Object.defineProperties(this, { context: { value: context, enumerable: true }, __id: { value: id } });
+    }
+    get numberOfInputs() { return 1; }
+    get numberOfOutputs() { return 1; }
+    connect(dest) {
+      // (connections into an AudioParam are not supported)
+      if (dest instanceof AudioNode) audioCmd('connect', this.context.__id, this.__id, dest.__id);
+      return dest;
+    }
+    disconnect(dest) { audioCmd('disconnect', this.context.__id, this.__id, dest instanceof AudioNode ? dest.__id : ''); }
+  }
+  class AudioDestinationNode extends AudioNode {
+    get maxChannelCount() { return 2; }
+    get numberOfOutputs() { return 0; }
+  }
+  class GainNode extends AudioNode {
+    constructor(context, options) {
+      super(context, audioCmd('gain', context.__id));
+      Object.defineProperty(this, 'gain', { value: new AudioParam(this, 'gain', 1, -3.4e38, 3.4e38), enumerable: true });
+      if (options && options.gain !== undefined) this.gain.value = options.gain;
+    }
+  }
+  const endedOscillators = new Map(); // `${context}:${id}` -> node, until it ends
+  class OscillatorNode extends AudioNode {
+    constructor(context, options) {
+      super(context, audioCmd('oscillator', context.__id));
+      Object.defineProperties(this, {
+        frequency: { value: new AudioParam(this, 'frequency', 440, -24000, 24000), enumerable: true },
+        detune: { value: new AudioParam(this, 'detune', 0, -153600, 153600), enumerable: true },
+      });
+      this._type = 'sine';
+      this.onended = null;
+      const o = options || {};
+      if (o.type) this.type = o.type;
+      if (o.frequency !== undefined) this.frequency.value = o.frequency;
+      if (o.detune !== undefined) this.detune.value = o.detune;
+    }
+    get numberOfInputs() { return 0; }
+    get type() { return this._type; }
+    set type(t) {
+      t = String(t);
+      if (!['sine', 'square', 'sawtooth', 'triangle'].includes(t)) return;
+      this._type = t;
+      audioCmd('type', this.context.__id, this.__id, t);
+    }
+    start(when) {
+      if (this._started) throw new DOMException('start() was called already', 'InvalidStateError');
+      this._started = true;
+      audioCmd('start', this.context.__id, this.__id, Number(when) || 0);
+      endedOscillators.set(this.context.__id + ':' + this.__id, this);
+      watchEnded();
+    }
+    stop(when) {
+      if (!this._started) throw new DOMException('stop() before start()', 'InvalidStateError');
+      audioCmd('stop', this.context.__id, this.__id, Number(when) || 0);
+    }
+    setPeriodicWave() {}
+  }
+  // `ended` of oscillators: asked while some are playing.
+  let endedTimer = 0;
+  function watchEnded() {
+    if (endedTimer) return;
+    endedTimer = setInterval(() => {
+      const contexts = new Set([...endedOscillators.values()].map((n) => n.context.__id));
+      for (const c of contexts) {
+        for (let id; (id = audioCmd('ended', c)) > 0;) {
+          const node = endedOscillators.get(c + ':' + id);
+          endedOscillators.delete(c + ':' + id);
+          if (!node) continue;
+          const e = Object.assign(new Event('ended'), { target: node, currentTarget: node });
+          if (typeof node.onended === 'function') call(node.onended, node, [e]);
+          node.dispatchEvent(e);
+        }
+      }
+      if (!endedOscillators.size) {
+        clearInterval(endedTimer);
+        endedTimer = 0;
+      }
+    }, 50);
+  }
+
+  class BaseAudioContext extends EventTarget {
+    constructor() {
+      super();
+      Object.defineProperty(this, '__id', { value: audioCmd('context') });
+      Object.defineProperty(this, 'destination', { value: new AudioDestinationNode(this, 1), enumerable: true });
+      this.onstatechange = null;
+    }
+    get currentTime() { return audioCmd('time', this.__id) || 0; }
+    get sampleRate() { return audioCmd('rate', this.__id) || 48000; }
+    get state() { return this._closed ? 'closed' : audioCmd('running', this.__id) === 1 ? 'running' : 'suspended'; }
+    get baseLatency() { return 0.01; }
+    get listener() { return {}; }
+    createOscillator() { return new OscillatorNode(this); }
+    createGain() { return new GainNode(this); }
+    _state(cmd) {
+      const before = this.state;
+      if (!this._closed) audioCmd(cmd, this.__id);
+      if (this.state !== before) {
+        const e = Object.assign(new Event('statechange'), { target: this, currentTarget: this });
+        if (typeof this.onstatechange === 'function') call(this.onstatechange, this, [e]);
+        this.dispatchEvent(e);
+      }
+      return Promise.resolve();
+    }
+    // (sound starts only after the user interacted with the page)
+    resume() { return this._state('resume'); }
+    suspend() { return this._state('suspend'); }
+    close() { this._state('close'); this._closed = true; return Promise.resolve(); }
+  }
+  class AudioContext extends BaseAudioContext {}
 
   class FileReader extends EventTarget {
     constructor() {
@@ -3209,7 +3374,7 @@
       cookieJar = [...rest, pair.trim()].join('; ');
     },
   });
-  for (const name of ['load', 'domcontentloaded', 'keydown', 'click', 'message']) handlerProperty(global, name);
+  for (const name of ['load', 'domcontentloaded', 'keydown', 'click', 'message', 'hashchange', 'popstate', 'selectstart']) handlerProperty(global, name);
 
   // window.postMessage: a `message` event at this window, later. (There
   // are no other windows to talk to: frames run no scripts.)
@@ -3298,7 +3463,7 @@
   }
 
   // `element.onclick = …` and friends.
-  for (const name of ['load', 'error', 'click', 'dblclick', 'contextmenu', 'input', 'change', 'submit',
+  for (const name of ['load', 'error', 'click', 'dblclick', 'contextmenu', 'selectstart', 'input', 'change', 'submit',
     'reset', 'keydown', 'keyup', 'keypress', 'focus', 'blur', 'mousedown', 'mouseup', 'mousemove',
     'mouseover', 'mouseout', 'mouseenter', 'mouseleave', 'wheel', 'scroll', 'pointerdown', 'pointerup',
     'animationend', 'transitionend', 'play', 'pause', 'playing', 'ended', 'timeupdate',
@@ -3442,6 +3607,7 @@
     HTMLTextAreaElement: Element,
     SVGElement: Element,
     ShadowRoot: DocumentFragment,
+    AudioContext, webkitAudioContext: AudioContext, BaseAudioContext, AudioNode, AudioParam, AudioDestinationNode, GainNode, OscillatorNode,
     Image: function Image(w, h) { const i = document.createElement('img'); if (w) i.width = w; if (h) i.height = h; return i; },
     Option: function Option(text, value) { const o = document.createElement('option'); o.textContent = text || ''; if (value !== undefined) o.value = value; return o; },
     requestIdleCallback: (fn) => addTimer(() => fn({ didTimeout: false, timeRemaining: () => 50 }), 1, [], false),
