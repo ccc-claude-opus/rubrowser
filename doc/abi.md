@@ -47,6 +47,7 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `rect(h, which) -> f64` | 上次排版的幾何（邏輯像素、相對於視窗）：0 x、1 y、2 寬、3 高（border box），4 寬、5 高（padding box）；`h = 0` 是視窗 |
 | `http(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, type_ptr, type_len) -> i32` | 發出 HTTP 請求（只限同源），回傳請求編號；完成時瀏覽器呼叫匯出的 `rb_http(id, status)`（`status` 0 表示失敗） |
 | `http_body(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應內容，回傳總長度 |
+| `http_headers(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應標頭：每行 `name: value\r\n`（名稱小寫）；`status` 為真正的 HTTP 狀態碼 |
 | `parent(h) -> i32` | 父元素 |
 | `relative(h, which) -> i32` | `which`：0 父節點、1 第一個子節點、2 最後一個子節點、3 下一個兄弟、4 上一個兄弟（含文字節點） |
 | `child_count(h) -> i32` / `child_at(h, i) -> i32` | 子節點數與第 `i` 個子節點 |
@@ -182,6 +183,15 @@ JavaScript 等直譯式語言以「runtime 模組」執行：一個額外匯出�
 |---|---|
 | `get_checked(h) -> i32` / `set_checked(h, v)` | checkbox / radio 是否勾選（radio 會取消同組其他項） |
 | `get_selected(h) -> i32` / `set_selected(h, i)` | `<select>` 選中的 option 索引（-1 表示沒有） |
-| `form_action(h, op)` | 對 `<form>`：0 送出（不觸發 submit 事件）、1 重設 |
+| `form_action(h, op)` | 對 `<form>`：0 送出（不觸發 submit 事件，依 method / enctype 編碼）、1 重設；對任何元素：2 執行它的 activation behavior（`click()` / `showPicker()`）：`<input type=file>` 開選檔對話框、連結換頁或下載、送出 / 重設按鈕 |
+| `files(h, ptr, cap) -> i32` | `<input type=file>` 選的檔案：第一行是這次選擇的序號（選擇改變就變），之後每檔一行 `name\ttype\tsize\tlastModified`；不是 file input 回傳 -1 |
+| `file_data(h, i, ptr, cap) -> i32` | 第 `i` 個檔案的內容（位元組），回傳總長度 |
+
+### 檔案與 `blob:` 網址
+
+| 函式 | 說明 |
+|---|---|
+| `blob_url(url_ptr, url_len, type_ptr, type_len, data_ptr, data_len)` | 登記 `blob:` 網址的內容與型別（`URL.createObjectURL`），讓 `<img>`、連結與下載使用；網址屬於這份文件 |
+| `blob_revoke(url_ptr, url_len)` | 撤銷 `blob:` 網址 |
 
 `get_value` / `set_value` 也適用於 `<select>`（option 的 value）與 `<textarea>`。

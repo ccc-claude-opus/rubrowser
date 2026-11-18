@@ -536,7 +536,7 @@ impl Painter<'_> {
                 }
                 Control::Range => self.range(c, b, node, r),
                 Control::Color => self.color_swatch(c, b, node, r),
-                Control::File => self.file_input(c, b, style, r),
+                Control::File => self.file_input(c, b, node, style, r),
                 Control::Hidden => {}
             }
         }
@@ -1244,8 +1244,14 @@ impl Painter<'_> {
     }
 
     /// A file input: a "Choose File" button and the (empty) file name.
-    fn file_input(&self, c: &mut Canvas, b: &LBox, style: &Style, r: RectF) {
+    fn file_input(&self, c: &mut Canvas, b: &LBox, node: NodeId, style: &Style, r: RectF) {
         use crate::document::{FILE_BUTTON, NO_FILE};
+        // The chosen file's name, or how many were chosen.
+        let label = match self.forms.files(node) {
+            [] => NO_FILE.to_string(),
+            [one] => one.name.clone(),
+            many => format!("{} files", many.len()),
+        };
         let area = Self::content_area(b, r);
         let s = self.scale;
         let w = self
@@ -1264,7 +1270,10 @@ impl Painter<'_> {
         c.fill_rounded(button, Some(edge), 0x767676, 255);
         let baseline = self.centered_baseline(style, area);
         self.text(c, style, area.x + 6.0, baseline, FILE_BUTTON, style.color);
-        self.text(c, style, area.x + w + 6.0, baseline, NO_FILE, style.color);
+        let saved = c.clip();
+        c.set_clip(self.phys(area).intersect(&saved));
+        self.text(c, style, area.x + w + 6.0, baseline, &label, style.color);
+        c.set_clip(saved);
     }
 
     /// A video's current frame (once it was started, or when it has no

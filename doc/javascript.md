@@ -55,7 +55,8 @@ flowchart LR
 
 | CSSOM | `<style>` / `<link>` 的 `sheet`、`document.styleSheets`、`CSSStyleSheet`（`cssRules`、`insertRule`、`deleteRule`、`addRule`、`replace` / `replaceSync`）、`CSSStyleRule`（`selectorText`、`style` 的 `getPropertyValue` / `setProperty` / `cssText`）、`CSSMediaRule` / `CSSSupportsRule` 等群組規則（`cssRules`、`insertRule`）、`CSSImportRule`、`CSSFontFaceRule`、`CSSKeyframesRule`（以文字保存）；修改會套用到頁面，元素的文字不變；跨來源 `<link>` 的 `cssRules` 丟 `SecurityError` |
 | Canvas | `getContext('2d')` 的 `CanvasRenderingContext2D`（路徑、漸層、圖樣、變形、裁切、文字、圖片、像素讀寫、`toDataURL` / `toBlob`）、`Path2D`、`ImageData`；每個呼叫以 `canvas` import 交給瀏覽器以 tiny-skia 繪製 |
-| 網路 | `fetch`（含 `Request`、`Headers`、`URLSearchParams` / `FormData` 本文）、`XMLHttpRequest`；只允許與頁面同源的網址（還沒有 CORS 檢查），GET 與 POST |
+| 網路 | `fetch`（`Request`、`Response` 的 `text` / `json` / `arrayBuffer` / `blob` / `bytes`、`Headers`；本文可以是字串、`URLSearchParams`、`FormData`（以 `multipart/form-data` 送出）、`Blob`、`ArrayBuffer` / typed array）、`XMLHttpRequest`（`responseType` 為 `arraybuffer` / `blob` / `json`、`upload` 的進度事件、回應標頭）；回應有真正的狀態碼與標頭；只允許與頁面同源的網址（還沒有 CORS 檢查），GET 與 POST；`blob:` 與 `data:` 網址在 runtime 裡直接回應 |
+| 檔案 | `Blob`（`size`、`type`、`slice`、`text`、`arrayBuffer`、`bytes`、`stream`）、`File`、`FileList`、`FileReader`（`readAsText` / `readAsDataURL` / `readAsArrayBuffer` / `readAsBinaryString`、`abort`、進度事件）、`<input type=file>` 的 `files`、`showPicker()`、`URL.createObjectURL` / `revokeObjectURL`（`blob:` 網址可用於 `<img>`、`<a>`、`fetch`）；詳見 [files.md](files.md) |
 
 尚未支援：跨來源請求、canvas 的陰影與 WebGL、真正執行的 Web Worker、WebSocket、shadow DOM 的繪製。
 

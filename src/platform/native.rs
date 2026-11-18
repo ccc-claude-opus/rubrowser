@@ -1,5 +1,6 @@
 //! Native window: winit for the window and input, softbuffer to show pixels,
-//! ureq and the file system for loading, arboard for the clipboard.
+//! ureq and the file system for loading, arboard for the clipboard, rfd for
+//! the file dialog of `<input type=file>`.
 
 use std::error::Error;
 use std::num::NonZeroU32;
@@ -15,7 +16,8 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 use crate::abi::key;
-use crate::browser::Browser;
+use crate::browser::{Browser, ResponseInfo};
+use crate::document::FileData;
 use crate::input::{Cursor, Event, Host, HttpRequest, Modifiers};
 use crate::net::url;
 use crate::text::Fonts;
@@ -46,6 +48,47 @@ struct Fetched {
     result: Result<Vec<u8>, String>,
     /// The URL after redirects, if it changed.
     final_url: Option<String>,
+    /// Status and headers (HTTP responses).
+    info: Option<ResponseInfo>,
+}
+
+impl Fetched {
+    fn new(id: u32, loaded: Result<Loaded, String>) -> Fetched {
+        match loaded {
+            Ok(l) => Fetched {
+                id,
+                result: Ok(l.body),
+                final_url: l.final_url,
+                info: l.info,
+            },
+            Err(e) => Fetched {
+                id,
+                result: Err(e),
+                final_url: None,
+                info: None,
+            },
+        }
+    }
+
+    /// Hands the fetch to `browser`.
+    fn deliver(self, browser: &mut Browser, host: &mut dyn Host) {
+        if let Some(u) = &self.final_url {
+            browser.fetch_redirected(self.id, u);
+        }
+        if let Some(info) = self.info {
+            browser.fetch_response(self.id, info);
+        }
+        browser.fetch_done(self.id, self.result, host);
+    }
+}
+
+/// A loaded resource.
+pub struct Loaded {
+    pub body: Vec<u8>,
+    /// The URL after redirects, if it changed.
+    pub final_url: Option<String>,
+    /// Status and headers of an HTTP response.
+    pub info: Option<ResponseInfo>,
 }
 
 struct App {
@@ -85,16 +128,26 @@ impl Host for NativeHost {
         let url = url.to_string();
         let request = (!request.method.is_empty()).then(|| request.clone());
         std::thread::spawn(move || {
-            let (result, final_url) = match load_with(&url, request.as_ref()) {
-                Ok((bytes, f)) => (Ok(bytes), f),
-                Err(e) => (Err(e), None),
-            };
-            let _ = proxy.send_event(Fetched {
-                id,
-                result,
-                final_url,
-            });
+            let _ = proxy.send_event(Fetched::new(id, load_full(&url, request.as_ref())));
         });
+    }
+
+    fn pick_files(&mut self, multiple: bool, accept: &str) -> Option<Vec<FileData>> {
+        let mut dialog = rfd::FileDialog::new().set_parent(&*self.window);
+        let exts = accept_extensions(accept);
+        if !exts.is_empty() {
+            dialog = dialog.add_filter("Accepted files", &exts);
+        }
+        let paths = if multiple {
+            dialog.pick_files().unwrap_or_default()
+        } else {
+            dialog.pick_file().into_iter().collect()
+        };
+        Some(paths.iter().filter_map(|p| read_file(p, self)).collect())
+    }
+
+    fn save_download(&mut self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        save_download(name, bytes)
     }
 
     fn clipboard_get(&mut self) -> Option<String> {
@@ -215,6 +268,114 @@ impl Drop for HostSlot {
     }
 }
 
+/// Extensions for an `accept` attribute (`.png`, `image/*`, `text/csv`),
+/// for the file dialog's filter; empty when anything goes.
+fn accept_extensions(accept: &str) -> Vec<String> {
+    let mut exts = Vec::new();
+    for token in accept.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let found: Vec<String> = match token.strip_prefix('.') {
+            Some(ext) => vec![ext.to_ascii_lowercase()],
+            None => crate::document::extensions_for_mime(token)
+                .into_iter()
+                .map(String::from)
+                .collect(),
+        };
+        if found.is_empty() {
+            // A type this browser has no extensions for: do not hide files.
+            return Vec::new();
+        }
+        exts.extend(found);
+    }
+    exts.dedup();
+    exts
+}
+
+/// Reads a file chosen in the file dialog.
+fn read_file(path: &std::path::Path, host: &mut dyn Host) -> Option<FileData> {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) => {
+            host.log(&format!("{}: {e}", path.display()));
+            return None;
+        }
+    };
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0, |d| d.as_millis() as f64);
+    let name = path.file_name()?.to_string_lossy();
+    Some(FileData::new(&name, bytes, modified))
+}
+
+/// The folder downloads are saved in: `RUBROWSER_DOWNLOAD_DIR`, else the
+/// user's download folder (XDG's on Linux), else `~/Downloads`.
+pub fn download_dir() -> std::path::PathBuf {
+    use std::path::PathBuf;
+    if let Some(d) = std::env::var_os("RUBROWSER_DOWNLOAD_DIR").filter(|d| !d.is_empty()) {
+        return PathBuf::from(d);
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "linux") {
+        if let Some(d) = std::env::var_os("XDG_DOWNLOAD_DIR").filter(|d| !d.is_empty()) {
+            return PathBuf::from(d);
+        }
+        // user-dirs.dirs: XDG_DOWNLOAD_DIR="$HOME/Downloads"
+        let config = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".config")));
+        if let (Some(config), Some(home)) = (config, &home)
+            && let Ok(text) = std::fs::read_to_string(config.join("user-dirs.dirs"))
+        {
+            for line in text.lines() {
+                if let Some(v) = line.trim().strip_prefix("XDG_DOWNLOAD_DIR=") {
+                    let v = v.trim().trim_matches('"');
+                    let v = v.replace("$HOME", &home.to_string_lossy());
+                    if !v.is_empty() {
+                        return PathBuf::from(v);
+                    }
+                }
+            }
+        }
+    }
+    home.map_or_else(|| PathBuf::from("."), |h| h.join("Downloads"))
+}
+
+/// Writes a download named `name` (a safe file name) into
+/// [`download_dir`] without replacing a file: `name (1).ext` and so on.
+/// Returns the path.
+pub fn save_download(name: &str, bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write;
+    let dir = download_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, format!(".{e}")),
+        _ => (name, String::new()),
+    };
+    for n in 0..1000 {
+        let file = if n == 0 {
+            name.to_string()
+        } else {
+            format!("{stem} ({n}){ext}")
+        };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                return Ok(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err(format!("too many files named {name}"))
+}
+
 /// Loads `url` over HTTP(S) or from the file system. Returns the bytes and,
 /// if redirects led elsewhere, the final URL.
 pub fn load(url: &str) -> Result<(Vec<u8>, Option<String>), String> {
@@ -226,6 +387,16 @@ pub fn load_with(
     url: &str,
     request: Option<&HttpRequest>,
 ) -> Result<(Vec<u8>, Option<String>), String> {
+    load_full(url, request).map(|l| (l.body, l.final_url))
+}
+
+/// Like [`load_with`], with the response's status and headers.
+pub fn load_full(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
+    let file = |b: Vec<u8>| Loaded {
+        body: b,
+        final_url: None,
+        info: None,
+    };
     // The fragment is for the browser, not the server.
     let url = url.split('#').next().unwrap_or(url);
     match url::scheme(url) {
@@ -244,12 +415,12 @@ pub fn load_with(
             let path = path.split('?').next().unwrap_or(path);
             let path = String::from_utf8_lossy(&url::percent_decode(path)).into_owned();
             std::fs::read(&path)
-                .map(|b| (b, None))
+                .map(file)
                 .map_err(|e| format!("{path}: {e}"))
         }
         Some(other) => Err(format!("unsupported scheme `{other}:`")),
         None => std::fs::read(url)
-            .map(|b| (b, None))
+            .map(file)
             .map_err(|e| format!("{url}: {e}")),
     }
 }
@@ -261,7 +432,7 @@ fn is_transport_error(e: &str) -> bool {
 }
 
 /// One HTTP(S) request.
-fn http(url: &str, request: Option<&HttpRequest>) -> Result<(Vec<u8>, Option<String>), String> {
+fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
     use ureq::ResponseExt;
     {
         {
@@ -289,6 +460,19 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<(Vec<u8>, Option<Str
             .map_err(|e| e.to_string())?;
             let status = resp.status();
             let final_url = resp.get_uri().to_string();
+            let info = ResponseInfo {
+                status: status.as_u16(),
+                headers: resp
+                    .headers()
+                    .iter()
+                    .map(|(n, v)| {
+                        (
+                            n.as_str().to_string(),
+                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                        )
+                    })
+                    .collect(),
+            };
             let body = resp
                 .body_mut()
                 .with_config()
@@ -301,7 +485,11 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<(Vec<u8>, Option<Str
                     return Err(format!("HTTP {status}"));
                 }
             }
-            Ok((body, (final_url != url).then_some(final_url)))
+            Ok(Loaded {
+                body,
+                final_url: (final_url != url).then_some(final_url),
+                info: Some(info),
+            })
         }
     }
 }
@@ -335,16 +523,12 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
             let url = url.to_string();
             let request = (!request.method.is_empty()).then(|| request.clone());
             std::thread::spawn(move || {
-                let (result, final_url) = match load_with(&url, request.as_ref()) {
-                    Ok((b, f)) => (Ok(b), f),
-                    Err(e) => (Err(e), None),
-                };
-                let _ = tx.send(Fetched {
-                    id,
-                    result,
-                    final_url,
-                });
+                let _ = tx.send(Fetched::new(id, load_full(&url, request.as_ref())));
             });
+        }
+        // No window: file inputs stay empty (the default `pick_files`).
+        fn save_download(&mut self, name: &str, bytes: &[u8]) -> Result<String, String> {
+            save_download(name, bytes)
         }
         fn clipboard_get(&mut self) -> Option<String> {
             None
@@ -386,10 +570,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 let mut next = Some(first);
                 while let Some(f) = next {
                     host.pending -= 1;
-                    if let Some(u) = &f.final_url {
-                        browser.fetch_redirected(f.id, u);
-                    }
-                    browser.fetch_done(f.id, f.result, &mut host);
+                    f.deliver(&mut browser, &mut host);
                     next = rx.try_recv().ok();
                 }
             }
@@ -488,10 +669,7 @@ impl ApplicationHandler<Fetched> for App {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, f: Fetched) {
         if let Some(s) = self.state.as_mut() {
-            if let Some(u) = &f.final_url {
-                s.browser.fetch_redirected(f.id, u);
-            }
-            s.browser.fetch_done(f.id, f.result, &mut s.host);
+            f.deliver(&mut s.browser, &mut s.host);
             s.window.request_redraw();
         }
     }

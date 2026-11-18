@@ -115,6 +115,22 @@ pub trait Host {
     fn set_title(&mut self, title: &str);
     /// A console message from a page script or the browser.
     fn log(&mut self, _message: &str) {}
+    /// Shows the platform's dialog for choosing files to upload
+    /// (`<input type=file>`). `accept` is the input's `accept` attribute
+    /// (a hint). Returns the chosen files (empty when the user cancelled),
+    /// or `None` when there is no dialog to show (no window).
+    fn pick_files(
+        &mut self,
+        _multiple: bool,
+        _accept: &str,
+    ) -> Option<Vec<crate::document::FileData>> {
+        None
+    }
+    /// Saves a download named `name` (already a safe file name) to the
+    /// user's download folder; returns the path it was written to.
+    fn save_download(&mut self, _name: &str, _bytes: &[u8]) -> Result<String, String> {
+        Err("this platform cannot save downloads".into())
+    }
     /// Wall-clock time in milliseconds since the Unix epoch, if known.
     fn wall_clock(&mut self) -> Option<f64> {
         None

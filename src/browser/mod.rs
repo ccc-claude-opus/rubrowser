@@ -124,6 +124,45 @@ enum Request {
         slot: usize,
         url: String,
     },
+    /// A file to save in the download folder (`<a download>`), named
+    /// `name` unless the server names it.
+    Download {
+        tab: u64,
+        url: String,
+        name: Option<String>,
+    },
+}
+
+impl Request {
+    fn tab(&self) -> u64 {
+        match self {
+            Request::Page { tab, .. }
+            | Request::Stylesheet { tab, .. }
+            | Request::Script { tab, .. }
+            | Request::Image { tab, .. }
+            | Request::Font { tab, .. }
+            | Request::Frame { tab, .. }
+            | Request::Http { tab, .. }
+            | Request::Module { tab, .. }
+            | Request::Download { tab, .. } => *tab,
+        }
+    }
+}
+
+/// The status and headers of an HTTP response (header names lowercase).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ResponseInfo {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+}
+
+impl ResponseInfo {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Languages a `<script>` can be written in. Every one runs as wasm: Rust
@@ -557,6 +596,8 @@ pub struct Browser {
     local: Vec<(u32, Result<Vec<u8>, String>)>,
     /// Last page click (element, time), to detect double clicks.
     last_click: Option<(NodeId, f64)>,
+    /// Status and headers of responses not delivered yet (by fetch id).
+    responses: HashMap<u32, ResponseInfo>,
 }
 
 impl Browser {
@@ -592,6 +633,7 @@ impl Browser {
             local: Vec::new(),
             last_click: None,
             javascript: true,
+            responses: HashMap::new(),
         };
         b.push_tab("about:home");
         b.tabs[0].doc = Document::from_html(HOME_HTML, "about:home");
@@ -767,9 +809,25 @@ impl Browser {
         } else if url.starts_with("data:") {
             let result = url::decode_data_url(url).ok_or_else(|| "bad data: URL".to_string());
             self.local.push((id, result));
+        } else if url.starts_with("blob:") {
+            let result = self.blob(self.requests[&id].tab(), url);
+            if let Ok(f) = &result {
+                self.responses.insert(id, blob_response(f));
+            }
+            self.local
+                .push((id, result.map(|f| f.bytes.to_vec()).map_err(String::from)));
         } else {
             host.fetch(id, url);
         }
+    }
+
+    /// The contents of `blob:` URL `url` created in tab `tab` (blob URLs
+    /// belong to the document that made them).
+    fn blob(&self, tab: u64, url: &str) -> Result<crate::document::FileData, &'static str> {
+        let url = url.split('#').next().unwrap_or(url);
+        self.tab_index(tab)
+            .and_then(|i| self.tabs[i].doc.blobs.get(url).cloned())
+            .ok_or("blob: URL not found (revoked, or made by another page)")
     }
 
     fn set_page(&mut self, i: usize, html: &str, url: &str, host: &mut dyn Host) {
@@ -1325,8 +1383,17 @@ impl Browser {
         }
     }
 
+    /// Called by the platform with the status and headers of HTTP fetch
+    /// `id` (before [`Browser::fetch_done`]).
+    pub fn fetch_response(&mut self, id: u32, info: ResponseInfo) {
+        if self.requests.contains_key(&id) {
+            self.responses.insert(id, info);
+        }
+    }
+
     /// Called by the platform when fetch `id` completes.
     pub fn fetch_done(&mut self, id: u32, result: Result<Vec<u8>, String>, host: &mut dyn Host) {
+        let info = self.responses.remove(&id);
         let Some(req) = self.requests.remove(&id) else {
             return;
         };
@@ -1338,6 +1405,20 @@ impl Browser {
                 else {
                     return;
                 };
+                // A response the server marks as an attachment, or one
+                // the browser cannot show, is saved instead (HTML:
+                // "navigate", handling as a download); the page stays.
+                if let (Ok(bytes), Some(info)) = (&result, &info) {
+                    let disposition = info.header("content-disposition");
+                    let attachment =
+                        disposition.is_some_and(|d| crate::net::content_disposition(d).attachment);
+                    let shown = crate::net::displayable(info.header("content-type").unwrap_or(""));
+                    if attachment || !shown {
+                        let name = crate::net::download_name(&url, disposition, None);
+                        self.cancel_navigation(i);
+                        return self.save(&name, bytes, host);
+                    }
+                }
                 let html = match result {
                     Ok(bytes) => as_html(&url, &bytes),
                     Err(e) => error_page(&url, &e),
@@ -1480,16 +1561,22 @@ impl Browser {
                     return;
                 };
                 let (status, body) = match result {
-                    Ok(b) => (200, b),
+                    Ok(b) => (info.as_ref().map_or(200, |r| r.status as i32), b),
                     Err(e) => {
                         host.log(&e);
                         (0, Vec::new())
                     }
                 };
+                // Headers as `name: value` lines, for the script.
+                let headers: String = info
+                    .iter()
+                    .flat_map(|r| &r.headers)
+                    .map(|(n, v)| format!("{n}: {v}\r\n"))
+                    .collect();
                 let now = self.now;
                 let t = &mut self.tabs[i];
                 if let Some(Some(rt)) = t.scripts.get_mut(script) {
-                    match rt.http_done(&mut t.doc, id, status, body, now) {
+                    match rt.http_done(&mut t.doc, id, status, body, &headers, now) {
                         Ok(()) => {
                             self.after_script(i, script, host);
                         }
@@ -1510,6 +1597,99 @@ impl Browser {
                     self.module_loaded(i, slot, &url, result, host);
                 }
             }
+            Request::Download { url, name, .. } => match result {
+                Ok(bytes) => {
+                    let disposition = info.as_ref().and_then(|r| r.header("content-disposition"));
+                    let name = crate::net::download_name(&url, disposition, name.as_deref());
+                    self.save(&name, &bytes, host);
+                }
+                Err(e) => self.show_download(&format!("Download failed: {e}"), host),
+            },
+        }
+    }
+
+    // ----- downloads ---------------------------------------------------------
+
+    /// Undoes the history entry of tab `i`'s navigation that turned out to
+    /// be a download, keeping its current page.
+    fn cancel_navigation(&mut self, i: usize) {
+        let tab = &mut self.tabs[i];
+        tab.loading = false;
+        if tab.index > 0 && tab.history[tab.index] != tab.doc.url {
+            tab.history.remove(tab.index);
+            tab.index -= 1;
+        }
+        self.dirty = true;
+    }
+
+    /// Downloads `url` (already resolved) from page tab `i`: `blob:` and
+    /// `data:` URLs at once, others with a request. `name`: the page's
+    /// suggested file name (`<a download=…>`).
+    fn download(&mut self, i: usize, url: &str, name: Option<&str>, host: &mut dyn Host) {
+        let tab = self.tabs[i].id;
+        if url.starts_with("blob:") {
+            match self.blob(tab, url) {
+                Ok(f) => {
+                    let name = crate::net::download_name(url, None, name);
+                    self.save(&name, &f.bytes, host);
+                }
+                Err(e) => self.show_download(&format!("Download failed: {e}"), host),
+            }
+            return;
+        }
+        if url.starts_with("data:") {
+            match url::decode_data_url(url) {
+                Some(bytes) => {
+                    let name = crate::net::download_name(url, None, name);
+                    self.save(&name, &bytes, host);
+                }
+                None => self.show_download("Download failed: bad data: URL", host),
+            }
+            return;
+        }
+        let req = Request::Download {
+            tab,
+            url: url.to_string(),
+            name: name.map(String::from),
+        };
+        self.fetch(req, url, host);
+    }
+
+    /// Saves a download and tells the user where it went.
+    fn save(&mut self, name: &str, bytes: &[u8], host: &mut dyn Host) {
+        let msg = match host.save_download(name, bytes) {
+            Ok(path) => format!("Downloaded {name} to {path}"),
+            Err(e) => format!("Could not save {name}: {e}"),
+        };
+        self.show_download(&msg, host);
+    }
+
+    /// Shows `msg` in the download bar at the bottom of the window.
+    fn show_download(&mut self, msg: &str, host: &mut dyn Host) {
+        host.log(msg);
+        let Some(bar) = self.chrome_el("download") else {
+            return;
+        };
+        let text = self.chrome_el("download-text");
+        let dom = self.chrome.dom_mut();
+        if let Some(e) = dom.element_mut(bar) {
+            e.set_attr("class", "show");
+        }
+        if let Some(t) = text {
+            dom.set_text_content(t, msg);
+        }
+        self.chrome.dom_changed();
+        self.dirty = true;
+    }
+
+    /// The download bar's text (empty when hidden).
+    pub fn download_notice(&self) -> String {
+        let shown = self
+            .chrome_el("download")
+            .is_some_and(|b| self.chrome.dom.attr(b, "class") == Some("show"));
+        match self.chrome_el("download-text") {
+            Some(t) if shown => self.chrome.dom.text_content(t),
+            _ => String::new(),
         }
     }
 
@@ -1587,22 +1767,11 @@ impl Browser {
             self.go(out.history as isize, host);
         } else if let Some(form) = out.submit.filter(|_| i == self.active) {
             // form.submit() skips the submit event, as in browsers.
-            let doc = &self.tabs[i].doc;
-            let data = doc.form_data(form, None);
-            let action = doc
-                .dom
-                .attr(form, "action")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            let base = if action.is_empty() {
-                doc.url.clone()
-            } else {
-                url::resolve(&doc.base_url(), &action)
-            };
-            let base = base.split(['?', '#']).next().unwrap_or("").to_string();
-            let target = format!("{base}?{}", crate::document::urlencode(&data));
-            self.navigate(&target, host);
+            self.send_form(form, None, host);
+        } else if i == self.active {
+            for node in out.activate {
+                self.script_activate(node, host);
+            }
         }
         (out.prevent_default, out.stop_propagation)
     }
@@ -2255,6 +2424,15 @@ impl Browser {
             }
             if let Some(href) = doc.link(id) {
                 let target = url::resolve(&doc.base_url(), &href);
+                // `download`: save instead of navigating (HTML: only for
+                // same-origin, blob: and data: URLs; others navigate).
+                if let Some(name) = doc.dom.attr(id, "download") {
+                    let local = target.starts_with("blob:") || target.starts_with("data:");
+                    if local || (origin(&target).is_some() && origin(&target) == origin(&doc.url)) {
+                        let name = name.to_string();
+                        return self.download(self.active, &target, Some(&name), host);
+                    }
+                }
                 // target=_blank (and named targets) open a new tab.
                 let new_tab = doc
                     .dom
@@ -2266,6 +2444,25 @@ impl Browser {
                 return self.navigate(&target, host);
             }
             n = doc.dom.parent(id);
+        }
+    }
+
+    /// The activation behavior of `node` after a script's `click()` (or
+    /// `showPicker()`): opens a file input's dialog, follows (or
+    /// downloads) a link, submits or resets a form. Other elements have
+    /// none here.
+    fn script_activate(&mut self, node: NodeId, host: &mut dyn Host) {
+        use crate::document::{Control, control};
+        let doc = &self.tabs[self.active].doc;
+        if doc.dom.get(node).is_none() || doc.dom.attr(node, "disabled").is_some() {
+            return;
+        }
+        match control(&doc.dom, node) {
+            Some(k @ (Control::File | Control::Submit | Control::Reset)) => {
+                self.activate_control(node, k, host)
+            }
+            None if doc.link(node).is_some() => self.activate(node, host),
+            _ => {}
         }
     }
 
@@ -2376,6 +2573,7 @@ impl Browser {
                 }
                 return;
             }
+            Control::File => return self.choose_files(node, host),
             _ => return,
         }
         doc.dom_changed();
@@ -2401,40 +2599,91 @@ impl Browser {
         }
     }
 
-    /// Submits `form` with a GET request (after its `submit` event).
+    /// Shows the file dialog for `<input type=file>` `node`; fires `input`
+    /// and `change` once files are chosen, `cancel` if the user cancels.
+    /// Without a dialog (no window) the input stays as it is.
+    fn choose_files(&mut self, node: NodeId, host: &mut dyn Host) {
+        let doc = &self.tabs[self.active].doc;
+        let multiple = doc.dom.attr(node, "multiple").is_some();
+        let accept = doc.dom.attr(node, "accept").unwrap_or("").to_string();
+        let Some(files) = host.pick_files(multiple, &accept) else {
+            return;
+        };
+        if files.is_empty() {
+            self.dispatch(node, "cancel", EventInit::default(), host);
+            return;
+        }
+        let files = if multiple {
+            files
+        } else {
+            files.into_iter().take(1).collect()
+        };
+        let doc = &mut self.tabs[self.active].doc;
+        doc.forms.set_files(node, files);
+        doc.dom_changed();
+        self.dirty = true;
+        self.dispatch(node, "input", EventInit::default(), host);
+        self.dispatch(node, "change", EventInit::default(), host);
+    }
+
+    /// Submits `form` (after its `submit` event).
     fn submit_form(&mut self, form: NodeId, submitter: Option<NodeId>, host: &mut dyn Host) {
         if self.dispatch(form, "submit", EventInit::default(), host) {
             return;
         }
+        self.send_form(form, submitter, host);
+    }
+
+    /// The HTML standard's form submission algorithm (without the
+    /// `submit` event): the entry list encoded as the form's (or the
+    /// submitter's) method and enctype say, sent by navigating.
+    fn send_form(&mut self, form: NodeId, submitter: Option<NodeId>, host: &mut dyn Host) {
         let doc = &self.tabs[self.active].doc;
-        let data = doc.form_data(form, submitter);
-        let action = doc
-            .dom
-            .attr(form, "action")
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let method = doc
-            .dom
-            .attr(form, "method")
-            .unwrap_or("get")
-            .to_ascii_lowercase();
+        // formaction / formmethod / formenctype on the submit button win.
+        let attr = |name: &str| {
+            submitter
+                .and_then(|s| doc.dom.attr(s, &format!("form{name}")))
+                .or_else(|| doc.dom.attr(form, name))
+                .unwrap_or("")
+                .trim()
+                .to_string()
+        };
+        let (action, method, enctype) = (
+            attr("action"),
+            attr("method").to_ascii_lowercase(),
+            attr("enctype").to_ascii_lowercase(),
+        );
+        let entries = doc.form_entries(form, submitter);
         let base = if action.is_empty() {
             doc.url.clone()
         } else {
             url::resolve(&doc.base_url(), &action)
         };
         if method == "post" {
+            let (body, content_type) = match enctype.as_str() {
+                "multipart/form-data" => crate::document::multipart(&entries),
+                "text/plain" => (
+                    crate::document::text_plain(&crate::document::entry_pairs(&entries))
+                        .into_bytes(),
+                    "text/plain".to_string(),
+                ),
+                _ => (
+                    crate::document::urlencode(&crate::document::entry_pairs(&entries))
+                        .into_bytes(),
+                    "application/x-www-form-urlencoded".to_string(),
+                ),
+            };
             // The body is sent once; going back to this entry reloads it
             // with GET.
             let target = base.split('#').next().unwrap_or("").to_string();
             self.tabs[self.active].post = Some(crate::input::HttpRequest {
                 method: "POST".into(),
-                body: crate::document::urlencode(&data).into_bytes(),
-                content_type: "application/x-www-form-urlencoded".into(),
+                body,
+                content_type,
             });
             return self.navigate(&target, host);
         }
+        let data = crate::document::entry_pairs(&entries);
         let base = base.split(['?', '#']).next().unwrap_or("").to_string();
         let target = format!("{base}?{}", crate::document::urlencode(&data));
         self.navigate(&target, host);
@@ -2447,6 +2696,14 @@ impl Browser {
             "back" => self.go(-1, host),
             "forward" => self.go(1, host),
             "reload" => self.load(self.active, host),
+            "close-download" => {
+                if let Some(bar) = self.chrome_el("download")
+                    && let Some(e) = self.chrome.dom_mut().element_mut(bar)
+                {
+                    e.set_attr("class", "");
+                }
+                self.dirty = true;
+            }
             _ => {}
         }
     }
@@ -2999,6 +3256,17 @@ fn error_page(url: &str, message: &str) -> String {
         escape(url),
         escape(message)
     )
+}
+
+/// The response for a `blob:` URL: its type and size.
+fn blob_response(f: &crate::document::FileData) -> ResponseInfo {
+    ResponseInfo {
+        status: 200,
+        headers: vec![
+            ("content-type".into(), f.mime.clone()),
+            ("content-length".into(), f.bytes.len().to_string()),
+        ],
+    }
 }
 
 /// Turns fetched bytes into HTML: plain text files are wrapped in `<pre>`.
@@ -4772,5 +5040,398 @@ mod tests {
         b.render(0.0, &mut h);
         assert_eq!(b.next_wakeup(0.0), Some(CARET_BLINK_MS), "caret blinks");
         assert!(b.needs_redraw(CARET_BLINK_MS + 1.0));
+    }
+
+    // ----- files: <input type=file>, Blob/File/FileReader, multipart, downloads
+
+    /// A host with a file dialog that returns `picks`, a download folder
+    /// in memory, and a record of requests.
+    #[derive(Default)]
+    struct FileHost {
+        /// (id, url, method, content type, body).
+        requests: Vec<(u32, String, String, String, Vec<u8>)>,
+        /// What the next file dialog returns.
+        picks: Option<Vec<crate::document::FileData>>,
+        /// (multiple, accept) of each dialog shown.
+        dialogs: Vec<(bool, String)>,
+        saved: Vec<(String, Vec<u8>)>,
+        logs: Vec<String>,
+    }
+
+    impl Host for FileHost {
+        fn fetch(&mut self, id: u32, url: &str) {
+            self.requests
+                .push((id, url.into(), "GET".into(), String::new(), Vec::new()));
+        }
+        fn fetch_with(&mut self, id: u32, url: &str, r: &crate::input::HttpRequest) {
+            let method = if r.method.is_empty() { "GET" } else { &r.method };
+            self.requests.push((
+                id,
+                url.into(),
+                method.into(),
+                r.content_type.clone(),
+                r.body.clone(),
+            ));
+        }
+        fn clipboard_get(&mut self) -> Option<String> {
+            None
+        }
+        fn clipboard_set(&mut self, _: &str) {}
+        fn set_cursor(&mut self, _: Cursor) {}
+        fn set_title(&mut self, _: &str) {}
+        fn log(&mut self, m: &str) {
+            self.logs.push(m.to_string());
+        }
+        fn pick_files(
+            &mut self,
+            multiple: bool,
+            accept: &str,
+        ) -> Option<Vec<crate::document::FileData>> {
+            self.dialogs.push((multiple, accept.into()));
+            self.picks.clone()
+        }
+        fn save_download(&mut self, name: &str, bytes: &[u8]) -> Result<String, String> {
+            self.saved.push((name.into(), bytes.to_vec()));
+            Ok(format!("/downloads/{name}"))
+        }
+    }
+
+    /// A browser showing `html` at `url` (scripts run).
+    fn file_page(url: &str, html: &str) -> (Browser, FileHost) {
+        let mut h = FileHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        b.render(0.0, &mut h);
+        b.navigate(url, &mut h);
+        let id = h.requests.last().unwrap().0;
+        b.fetch_done(id, Ok(html.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        (b, h)
+    }
+
+    fn click_file_host(b: &mut Browser, h: &mut FileHost, id: &str) {
+        let n = page_el(b, id);
+        let r = b.tabs[b.active].doc.content_box(n).unwrap();
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + r.x + 4.0) as i32, (vp.y + r.y + r.h / 2.0) as i32);
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, h);
+        b.render(0.0, h);
+    }
+
+    /// Splits a multipart body into (headers, content) parts.
+    fn multipart_parts(ctype: &str, body: &[u8]) -> Vec<(String, Vec<u8>)> {
+        let b = ctype.split("boundary=").nth(1).unwrap();
+        let delim = format!("--{b}");
+        let text = body.to_vec();
+        let mut parts = Vec::new();
+        let mut rest = &text[..];
+        assert!(rest.starts_with(delim.as_bytes()), "starts with the boundary");
+        loop {
+            rest = &rest[delim.len()..];
+            if rest.starts_with(b"--") {
+                break;
+            }
+            rest = &rest[2..]; // CRLF
+            let end = rest
+                .windows(delim.len() + 2)
+                .position(|w| w == [b"\r\n", delim.as_bytes()].concat())
+                .unwrap();
+            let part = &rest[..end];
+            let split = part.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+            parts.push((
+                String::from_utf8_lossy(&part[..split]).into_owned(),
+                part[split + 4..].to_vec(),
+            ));
+            rest = &rest[end + 2..];
+        }
+        parts
+    }
+
+    #[test]
+    fn file_input_chooses_files_and_scripts_read_them() {
+        let page = r#"<input type=file id=f name=up multiple accept=".txt,image/*">
+            <script>
+              const f = document.getElementById('f');
+              console.log('before', f.files.length, JSON.stringify(f.value));
+              f.addEventListener('input', () => console.log('input event'));
+              f.addEventListener('change', async () => {
+                const files = f.files;
+                console.log('same list', files === f.files, files instanceof FileList);
+                console.log('files', files.length, files[0].name, files[0].type, files[0].size,
+                  files[1].name, files[1].lastModified, f.value);
+                console.log('text', await files[0].text());
+                const r = new FileReader();
+                r.onload = () => console.log('dataurl', r.result);
+                r.readAsDataURL(files[1]);
+                const buf = await files[1].slice(1, 3).arrayBuffer();
+                console.log('slice', [...new Uint8Array(buf)].join(','));
+              });
+            </script>"#;
+        let (mut b, mut h) = file_page("https://files.test/", page);
+        h.picks = Some(vec![
+            crate::document::FileData::new("notes.txt", "héllo".as_bytes().to_vec(), 1000.0),
+            crate::document::FileData::new("dot.png", vec![0x89, 0x50, 0x4e, 0x47], 2000.0),
+        ]);
+        click_file_host(&mut b, &mut h, "f");
+        b.render(10.0, &mut h);
+        assert_eq!(h.dialogs, vec![(true, ".txt,image/*".to_string())]);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("before 0 \"\""), "{logs}");
+        assert!(logs.contains("input event"), "{logs}");
+        assert!(logs.contains("same list true true"), "{logs}");
+        assert!(
+            logs.contains("files 2 notes.txt text/plain 6 dot.png 2000 C:\\fakepath\\notes.txt"),
+            "{logs}"
+        );
+        assert!(logs.contains("text héllo"), "{logs}");
+        assert!(logs.contains("dataurl data:image/png;base64,iVBORw=="), "{logs}");
+        assert!(logs.contains("slice 80,78"), "{logs}");
+        // The input shows how many files were chosen.
+        let n = page_el(&b, "f");
+        assert_eq!(b.tabs[b.active].doc.forms.files(n).len(), 2);
+    }
+
+    #[test]
+    fn file_dialog_cancelled_or_missing_leaves_the_input_empty() {
+        let page = r#"<input type=file id=f><button id=open>Open</button>
+            <script>
+              const f = document.getElementById('f');
+              f.addEventListener('change', () => console.log('change'));
+              f.addEventListener('cancel', () => console.log('cancel'));
+              document.getElementById('open').onclick = () => f.click();
+            </script>"#;
+        // No window (screenshots): nothing happens.
+        let (mut b, mut h) = file_page("https://files.test/", page);
+        click_file_host(&mut b, &mut h, "f");
+        assert_eq!(h.dialogs.len(), 1);
+        assert!(!h.logs.iter().any(|l| l == "change" || l == "cancel"));
+        // The user cancels: `cancel`.
+        h.picks = Some(Vec::new());
+        click_file_host(&mut b, &mut h, "f");
+        assert!(h.logs.iter().any(|l| l == "cancel"), "{:?}", h.logs);
+        // A script's click() opens the dialog too (a styled button).
+        h.picks = Some(vec![crate::document::FileData::new(
+            "a.csv",
+            b"x".to_vec(),
+            0.0,
+        )]);
+        click_file_host(&mut b, &mut h, "open");
+        assert_eq!(h.dialogs.len(), 3);
+        assert!(h.logs.iter().any(|l| l == "change"), "{:?}", h.logs);
+        // Not `multiple`: only one file is kept.
+        assert_eq!(h.dialogs[2], (false, String::new()));
+    }
+
+    #[test]
+    fn multipart_form_submission_sends_files() {
+        let page = r#"<form id=form method=post action="/upload" enctype="multipart/form-data">
+              <input name=title value="My pic">
+              <input type=file name=pic id=pic>
+              <input type=file name=none>
+              <input type=checkbox name=skip>
+              <button id=send>Send</button>
+              <button id=plain formenctype="text/plain" formaction="/plain">Plain</button>
+            </form>"#;
+        let (mut b, mut h) = file_page("https://files.test/form", page);
+        h.picks = Some(vec![crate::document::FileData::new(
+            "cat \"1\".png",
+            vec![1, 2, 13, 10, 3],
+            0.0,
+        )]);
+        click_file_host(&mut b, &mut h, "pic");
+        click_file_host(&mut b, &mut h, "send");
+        let (_, url, method, ctype, body) = h.requests.last().unwrap().clone();
+        assert_eq!((url.as_str(), method.as_str()), ("https://files.test/upload", "POST"));
+        assert!(ctype.starts_with("multipart/form-data; boundary="), "{ctype}");
+        let parts = multipart_parts(&ctype, &body);
+        assert_eq!(parts.len(), 3, "{parts:?}");
+        assert_eq!(parts[0].0, "Content-Disposition: form-data; name=\"title\"");
+        assert_eq!(parts[0].1, b"My pic");
+        assert_eq!(
+            parts[1].0,
+            "Content-Disposition: form-data; name=\"pic\"; filename=\"cat %221%22.png\"\r\nContent-Type: image/png"
+        );
+        assert_eq!(parts[1].1, vec![1, 2, 13, 10, 3]);
+        assert_eq!(
+            parts[2].0,
+            "Content-Disposition: form-data; name=\"none\"; filename=\"\"\r\nContent-Type: application/octet-stream"
+        );
+        assert!(parts[2].1.is_empty());
+
+        // The submitter's formenctype / formaction win.
+        let (mut b, mut h) = file_page("https://files.test/form", page);
+        click_file_host(&mut b, &mut h, "plain");
+        let (_, url, _, ctype, body) = h.requests.last().unwrap().clone();
+        assert_eq!(url, "https://files.test/plain");
+        assert_eq!(ctype, "text/plain");
+        assert_eq!(String::from_utf8(body).unwrap(), "title=My pic\r\npic=\r\nnone=\r\n");
+    }
+
+    #[test]
+    fn fetch_and_xhr_send_form_data_as_multipart() {
+        let page = r#"<form id=form><input name=a value=1><input type=file name=f></form><script>
+              const fd = new FormData(document.getElementById('form'));
+              fd.append('blob', new Blob(['ab', new Uint8Array([0, 255])], { type: 'application/x-test' }), 'b.bin');
+              fd.append('text', 'x\ny');
+              console.log('entries', [...fd.keys()].join(','), fd.get('f') instanceof File, fd.get('f').name === '');
+              fetch('/api', { method: 'POST', body: fd }).then(async (r) => {
+                console.log('status', r.status, r.ok, r.headers.get('content-type'));
+                const bytes = new Uint8Array(await r.arrayBuffer());
+                console.log('bytes', bytes.join(','));
+              });
+              const x = new XMLHttpRequest();
+              x.open('POST', '/xhr');
+              x.responseType = 'blob';
+              x.upload.onload = (e) => console.log('upload', e.loaded);
+              x.onload = async () => console.log('xhr', x.status, x.response.type, await x.response.text(), x.getResponseHeader('X-Test'));
+              x.send(new Blob(['hello'], { type: 'text/plain' }));
+            </script>"#;
+        let (mut b, mut h) = file_page("https://files.test/", page);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("entries a,f,blob,text true true"), "{logs}");
+        let api = h.requests.iter().find(|r| r.1.ends_with("/api")).unwrap().clone();
+        assert_eq!(api.2, "POST");
+        let parts = multipart_parts(&api.3, &api.4);
+        assert_eq!(parts.len(), 4, "{parts:?}");
+        assert_eq!(parts[0].1, b"1");
+        assert!(parts[1].0.contains("filename=\"\""), "{:?}", parts[1]);
+        assert_eq!(
+            parts[2].0,
+            "Content-Disposition: form-data; name=\"blob\"; filename=\"b.bin\"\r\nContent-Type: application/x-test"
+        );
+        assert_eq!(parts[2].1, vec![b'a', b'b', 0, 255]);
+        assert_eq!(parts[3].1, b"x\r\ny");
+        let xhr = h.requests.iter().find(|r| r.1.ends_with("/xhr")).unwrap().clone();
+        assert_eq!((xhr.3.as_str(), &xhr.4[..]), ("text/plain", &b"hello"[..]));
+
+        let headers = |ct: &str| ResponseInfo {
+            status: 201,
+            headers: vec![
+                ("content-type".into(), ct.into()),
+                ("x-test".into(), "yes".into()),
+            ],
+        };
+        b.fetch_response(api.0, headers("application/octet-stream"));
+        b.fetch_done(api.0, Ok(vec![0, 1, 254]), &mut h);
+        b.fetch_response(xhr.0, headers("text/plain"));
+        b.fetch_done(xhr.0, Ok(b"ok".to_vec()), &mut h);
+        b.render(10.0, &mut h);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("status 201 true application/octet-stream"), "{logs}");
+        assert!(logs.contains("bytes 0,1,254"), "{logs}");
+        assert!(logs.contains("upload 5"), "{logs}");
+        assert!(logs.contains("xhr 201 text/plain ok yes"), "{logs}");
+    }
+
+    #[test]
+    fn blob_urls_serve_images_fetch_and_downloads() {
+        let png = png_data_url(2, 2, [255, 0, 0, 255]);
+        let page = format!(
+            r#"<img id=img><a id=save download="report.csv" style="display: block">Save</a><script>
+              const png = atob('{}'.split(',')[1]);
+              const bytes = Uint8Array.from(png, (c) => c.charCodeAt(0));
+              const url = URL.createObjectURL(new Blob([bytes], {{ type: 'image/png' }}));
+              console.log('url', url.startsWith('blob:https://files.test/'));
+              document.getElementById('img').src = url;
+              const csv = URL.createObjectURL(new File(['a,b\n1,2\n'], 'x.csv', {{ type: 'text/csv' }}));
+              document.getElementById('save').href = csv;
+              fetch(csv).then((r) => r.text()).then((t) => console.log('fetched', JSON.stringify(t), 'gone'));
+              const gone = URL.createObjectURL(new Blob(['x']));
+              URL.revokeObjectURL(gone);
+              fetch(gone).catch((e) => console.log('revoked', e.name));
+              // A script-made link, as apps export files.
+              setTimeout(() => {{
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(new Blob(['{{"k":1}}'], {{ type: 'application/json' }}));
+                a.download = 'data.json';
+                a.click();
+              }}, 5);
+            </script>"#,
+            png
+        );
+        let (mut b, mut h) = file_page("https://files.test/", &page);
+        b.render(1.0, &mut h);
+        b.render(20.0, &mut h);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("url true"), "{logs}");
+        assert!(logs.contains("fetched \"a,b\\n1,2\\n\""), "{logs}");
+        assert!(logs.contains("revoked TypeError"), "{logs}");
+        // The image loaded from its blob: URL.
+        let img = page_el(&b, "img");
+        assert!(
+            matches!(
+                b.tabs[b.active].doc.images.get(img),
+                Some(crate::document::ImageState::Ready(..))
+            ),
+            "image from a blob: URL"
+        );
+        assert_eq!(h.saved, vec![("data.json".to_string(), b"{\"k\":1}".to_vec())]);
+        // Clicking a download link saves its blob under the page's name.
+        click_file_host(&mut b, &mut h, "save");
+        assert_eq!(h.saved[1], ("report.csv".to_string(), b"a,b\n1,2\n".to_vec()));
+        assert_eq!(
+            b.download_notice(),
+            "Downloaded report.csv to /downloads/report.csv"
+        );
+        assert_eq!(b.tabs[b.active].url(), "https://files.test/");
+    }
+
+    #[test]
+    fn attachments_are_saved_not_shown() {
+        let page = r#"<style>a { display: block }</style>
+            <p id=p>stay</p><a id=get href="/files/report.pdf">Get</a>
+            <a id=named href="/export?id=1" download="ignored.txt">Export</a>"#;
+        let (mut b, mut h) = file_page("https://files.test/", page);
+        // A type the browser cannot show (no Content-Disposition).
+        click_file_host(&mut b, &mut h, "get");
+        let id = h.requests.last().unwrap().0;
+        b.fetch_response(
+            id,
+            ResponseInfo {
+                status: 200,
+                headers: vec![("content-type".into(), "application/pdf".into())],
+            },
+        );
+        b.fetch_done(id, Ok(b"%PDF".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(h.saved.last().unwrap().0, "report.pdf");
+        assert_eq!(b.tabs[b.active].url(), "https://files.test/");
+        assert!(page_el(&b, "p") > 0, "the page stays");
+        assert_eq!(b.tabs[b.active].history.len(), 2, "no history entry added");
+        // `download` on a same-origin link: the server's name wins.
+        click_file_host(&mut b, &mut h, "named");
+        let id = h.requests.last().unwrap().0;
+        b.fetch_response(
+            id,
+            ResponseInfo {
+                status: 200,
+                headers: vec![
+                    ("content-type".into(), "text/csv".into()),
+                    (
+                        "content-disposition".into(),
+                        "attachment; filename*=UTF-8''%E5%A0%B1%E8%A1%A8.csv".into(),
+                    ),
+                ],
+            },
+        );
+        b.fetch_done(id, Ok(b"a,b".to_vec()), &mut h);
+        assert_eq!(h.saved.last().unwrap(), &("報表.csv".to_string(), b"a,b".to_vec()));
+        // A page served as an attachment is saved too.
+        b.navigate("https://files.test/page.html", &mut h);
+        let id = h.requests.last().unwrap().0;
+        b.fetch_response(
+            id,
+            ResponseInfo {
+                status: 200,
+                headers: vec![
+                    ("content-type".into(), "text/html".into()),
+                    ("content-disposition".into(), "attachment".into()),
+                ],
+            },
+        );
+        b.fetch_done(id, Ok(b"<p>x".to_vec()), &mut h);
+        assert_eq!(h.saved.last().unwrap().0, "page.html");
+        assert_eq!(b.tabs[b.active].url(), "https://files.test/");
+        assert!(b.download_notice().contains("/downloads/page.html"));
     }
 }

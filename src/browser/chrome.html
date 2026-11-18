@@ -131,6 +131,24 @@
     overflow: hidden;
   }
   #status.show { display: block; }
+
+  /* Download bar: where the last download was saved. */
+  #download {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    height: 32px;
+    padding: 0 8px 0 14px;
+    flex-shrink: 0;
+    background: #3c3f45;
+  }
+  #download.show { display: flex; }
+  #download-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -145,6 +163,7 @@
     <input id="address" placeholder="Enter an address">
   </div>
   <div id="viewport"></div>
+  <div id="download"><span id="download-text"></span><button id="download-close" data-action="close-download">&#x2715;</button></div>
   <div id="status"></div>
 </body>
 </html>

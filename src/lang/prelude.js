@@ -404,7 +404,21 @@
         case 'afterend': this.after(...nodes); break;
       }
     }
-    click() { dispatchSynthetic(this, 'click'); }
+    click() {
+      if (this.hasAttribute('disabled') && /^(input|button|select|textarea)$/.test(this.localName)) return;
+      const e = new eventInterfaces.MouseEvent('click', { bubbles: true, cancelable: true, composed: true, detail: 1 });
+      dispatchSynthetic(this, 'click', e);
+      // The activation behavior (a link, a file input's dialog, a submit
+      // button) is the browser's.
+      if (!e.defaultPrevented) rb.formAction(this.__h, 2);
+    }
+    // <input type=file>: the chosen files (null for other elements).
+    get files() { return this.localName === 'input' ? inputFiles(this) : undefined; }
+    set files(v) {}
+    showPicker() {
+      if (this.localName === 'input' && this.type === 'file') rb.formAction(this.__h, 2);
+      else if (this.localName !== 'input' && this.localName !== 'select') throw new DOMException('showPicker() needs an input', 'NotSupportedError');
+    }
     focus() {}
     blur() {}
   }
@@ -1380,40 +1394,28 @@
     toString() { return this.href; }
     toJSON() { return this.href; }
   }
-  URL.createObjectURL = () => 'blob:';
-  URL.revokeObjectURL = () => {};
 
   class TextEncoder {
     get encoding() { return 'utf-8'; }
-    encode(s = '') {
-      const bytes = [];
-      for (const ch of String(s)) {
-        let c = ch.codePointAt(0);
-        if (c < 0x80) bytes.push(c);
-        else if (c < 0x800) bytes.push(0xc0 | (c >> 6), 0x80 | (c & 63));
-        else if (c < 0x10000) bytes.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-        else bytes.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
-      }
-      return new Uint8Array(bytes);
+    encode(s = '') { return rb.encodeUtf8(String(s)); }
+    encodeInto(s, dest) {
+      const b = rb.encodeUtf8(String(s));
+      const n = Math.min(b.length, dest.length);
+      // Whole characters only.
+      let end = n;
+      if (end < b.length) while (end > 0 && (b[end] & 0xc0) === 0x80) end--;
+      dest.set(b.subarray(0, end));
+      return { read: rb.decodeUtf8(b.subarray(0, end)).length, written: end };
     }
   }
   class TextDecoder {
-    get encoding() { return 'utf-8'; }
+    constructor(label) { this._label = label === undefined ? 'utf-8' : String(label).trim().toLowerCase(); }
+    get encoding() { return this._label === 'utf8' || this._label === 'unicode-1-1-utf-8' ? 'utf-8' : this._label; }
     decode(buf) {
       if (!buf) return '';
-      const b = buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer || buf);
-      let out = '';
-      for (let i = 0; i < b.length;) {
-        const c = b[i];
-        let cp, n;
-        if (c < 0x80) { cp = c; n = 1; }
-        else if (c >= 0xf0) { cp = ((c & 7) << 18) | ((b[i + 1] & 63) << 12) | ((b[i + 2] & 63) << 6) | (b[i + 3] & 63); n = 4; }
-        else if (c >= 0xe0) { cp = ((c & 15) << 12) | ((b[i + 1] & 63) << 6) | (b[i + 2] & 63); n = 3; }
-        else { cp = ((c & 31) << 6) | (b[i + 1] & 63); n = 2; }
-        out += String.fromCodePoint(cp);
-        i += n;
-      }
-      return out;
+      const b = sourceBytes(buf);
+      if (!b) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': parameter 1 is not of type 'ArrayBuffer'.");
+      return decodeText(b, this._label);
     }
   }
 
@@ -1601,96 +1603,501 @@
     abort(reason) { this.signal._abort(reason); }
   }
 
+  // ----- Blob, File, FileList, FileReader (File API) -------------------------
+  // Contents are Uint8Arrays; the browser has the chosen files' bytes and
+  // those of blob: URLs (for <img>, links and downloads).
+
+  function concatBytes(chunks) {
+    let n = 0;
+    for (const c of chunks) n += c.length;
+    const out = new Uint8Array(n);
+    let at = 0;
+    for (const c of chunks) { out.set(c, at); at += c.length; }
+    return out;
+  }
+  // A BufferSource's bytes (a view of them), or null.
+  function sourceBytes(v) {
+    if (v instanceof ArrayBuffer) return new Uint8Array(v);
+    if (ArrayBuffer.isView(v)) return new Uint8Array(v.buffer, v.byteOffset, v.byteLength);
+    return null;
+  }
+  class Blob {
+    constructor(parts, opts) {
+      if (parts !== undefined && (parts === null || typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function')) {
+        throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+      }
+      const chunks = [];
+      for (const p of parts || []) {
+        if (p instanceof Blob) chunks.push(p._data);
+        else chunks.push(sourceBytes(p) || rb.encodeUtf8(String(p)));
+      }
+      this._data = chunks.length === 1 ? chunks[0].slice() : concatBytes(chunks);
+      const t = opts && opts.type !== undefined ? String(opts.type) : '';
+      this._type = /^[\x20-\x7e]*$/.test(t) ? t.toLowerCase() : '';
+    }
+    get size() { return this._data.length; }
+    get type() { return this._type; }
+    slice(start, end, contentType) {
+      const size = this.size;
+      const rel = (v, d) => {
+        if (v === undefined) return d;
+        v = Math.trunc(Number(v)) || 0;
+        return v < 0 ? Math.max(size + v, 0) : Math.min(v, size);
+      };
+      const from = rel(start, 0), to = rel(end, size);
+      const b = new Blob([], { type: contentType === undefined ? '' : contentType });
+      b._data = this._data.slice(from, Math.max(from, to));
+      return b;
+    }
+    text() { return Promise.resolve(rb.decodeUtf8(this._data)); }
+    arrayBuffer() { return Promise.resolve(this._data.slice().buffer); }
+    bytes() { return Promise.resolve(this._data.slice()); }
+    stream() {
+      let done = false;
+      const data = this._data;
+      return {
+        locked: false,
+        getReader() {
+          return {
+            read: () => Promise.resolve(done ? { done: true, value: undefined } : (done = true, { done: false, value: data.slice() })),
+            cancel: () => { done = true; return Promise.resolve(); },
+            releaseLock() {},
+            closed: Promise.resolve(),
+          };
+        },
+      };
+    }
+    get [Symbol.toStringTag]() { return 'Blob'; }
+  }
+  class File extends Blob {
+    constructor(bits, name, opts) {
+      if (arguments.length < 2) throw new TypeError("Failed to construct 'File': 2 arguments required, but only " + arguments.length + ' present.');
+      super(bits, opts);
+      this._name = String(name);
+      this._modified = opts && opts.lastModified !== undefined ? Math.trunc(Number(opts.lastModified)) || 0 : Date.now();
+    }
+    get name() { return this._name; }
+    get lastModified() { return this._modified; }
+    get lastModifiedDate() { return new Date(this._modified); }
+    get webkitRelativePath() { return ''; }
+    get [Symbol.toStringTag]() { return 'File'; }
+  }
+  class FileList {
+    constructor(files) {
+      Object.defineProperty(this, '_f', { value: files });
+      files.forEach((f, i) => Object.defineProperty(this, i, { value: f, enumerable: true }));
+    }
+    get length() { return this._f.length; }
+    item(i) { return this._f[i] || null; }
+    [Symbol.iterator]() { return this._f[Symbol.iterator](); }
+    get [Symbol.toStringTag]() { return 'FileList'; }
+  }
+  // <input type=file>.files: the same FileList until the selection changes.
+  const fileLists = new Map(); // handle -> [serial, FileList]
+  function inputFiles(el) {
+    const info = rb.files(el.__h);
+    if (info === null) return null;
+    const lines = info.split('\n');
+    const serial = lines.shift();
+    const cached = fileLists.get(el.__h);
+    if (cached && cached[0] === serial) return cached[1];
+    const files = lines.map((line, i) => {
+      const [name, type, , modified] = line.split('\t');
+      const f = new File([], name, { type, lastModified: Number(modified) });
+      f._data = rb.fileData(el.__h, i) || new Uint8Array(0);
+      return f;
+    });
+    const list = new FileList(files);
+    fileLists.set(el.__h, [serial, list]);
+    return list;
+  }
+
+  // Single-byte decodings FileReader.readAsText accepts besides UTF-8.
+  function decodeText(bytes, label) {
+    const enc = String(label || 'utf-8').trim().toLowerCase();
+    if (/^(iso-8859-1|latin1|l1|us-ascii|ascii|windows-1252|cp1252)$/.test(enc)) {
+      let s = '';
+      for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+      return s;
+    }
+    return rb.decodeUtf8(bytes);
+  }
+  function binaryString(bytes) {
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+    return s;
+  }
+
+  // Fires `type` at a non-DOM target: its on<type> handler, then listeners.
+  function fireAt(target, type, fields) {
+    const e = Object.assign(new eventInterfaces.ProgressEvent(type, fields), { target, currentTarget: target });
+    if (typeof target['on' + type] === 'function') call(target['on' + type], target, [e]);
+    target.dispatchEvent(e);
+  }
+
+  class FileReader extends EventTarget {
+    constructor() {
+      super();
+      this.readyState = 0;
+      this.result = null;
+      this.error = null;
+      for (const t of ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']) this['on' + t] = null;
+    }
+    _read(blob, kind, label) {
+      if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
+      if (this.readyState === 1) throw new DOMException('The object is already busy reading Blobs.', 'InvalidStateError');
+      this.readyState = 1;
+      this.result = null;
+      this.error = null;
+      const token = this._token = {};
+      const total = blob.size;
+      addTimer(() => {
+        if (this._token !== token) return;
+        fireAt(this, 'loadstart', { lengthComputable: true, loaded: 0, total });
+        const bytes = blob._data;
+        let result;
+        if (kind === 'text') result = decodeText(bytes, label);
+        else if (kind === 'url') result = 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + rb.base64(bytes);
+        else if (kind === 'buffer') result = bytes.slice().buffer;
+        else result = binaryString(bytes);
+        if (this._token !== token) return;
+        this.readyState = 2;
+        this.result = result;
+        const done = { lengthComputable: true, loaded: total, total };
+        fireAt(this, 'progress', done);
+        fireAt(this, 'load', done);
+        if (this.readyState === 2) fireAt(this, 'loadend', done);
+      }, 0, [], false);
+    }
+    readAsText(blob, encoding) { this._read(blob, 'text', encoding); }
+    readAsDataURL(blob) { this._read(blob, 'url'); }
+    readAsArrayBuffer(blob) { this._read(blob, 'buffer'); }
+    readAsBinaryString(blob) { this._read(blob, 'binary'); }
+    abort() {
+      if (this.readyState !== 1) return;
+      this._token = null;
+      this.readyState = 2;
+      this.result = null;
+      fireAt(this, 'abort', {});
+      fireAt(this, 'loadend', {});
+    }
+  }
+  Object.assign(FileReader, { EMPTY: 0, LOADING: 1, DONE: 2 });
+
+  // blob: URLs (File API): the Blob for fetch here, its bytes in the
+  // browser for everything else.
+  const blobUrls = new Map();
+  URL.createObjectURL = (obj) => {
+    const origin = location.origin;
+    const url = 'blob:' + (origin && origin !== 'null' ? origin : 'null') + '/' + crypto.randomUUID();
+    if (obj instanceof Blob) {
+      blobUrls.set(url, obj);
+      rb.blobUrl(url, obj.type, obj._data);
+    }
+    return url;
+  };
+  URL.revokeObjectURL = (url) => {
+    url = String(url);
+    if (blobUrls.delete(url)) rb.blobRevoke(url);
+  };
+
+  // ----- FormData ------------------------------------------------------------
+
+  // An entry value (XHR standard: "create an entry").
+  function formEntry(value, filename) {
+    if (!(value instanceof Blob)) return String(value);
+    if (value instanceof File && filename === undefined) return value;
+    const f = new File([], filename !== undefined ? String(filename) : value instanceof File ? value.name : 'blob',
+      { type: value.type, lastModified: value instanceof File ? value.lastModified : undefined });
+    f._data = value._data;
+    return f;
+  }
+  // The entry list of a form (HTML: "constructing the entry list").
+  function formEntries(form, submitter) {
+    const out = [];
+    for (const el of form.elements) {
+      const name = el.getAttribute('name');
+      if (!name || el.hasAttribute('disabled')) continue;
+      const tag = el.localName, type = el.type;
+      if (tag === 'button' || (tag === 'input' && ['submit', 'image', 'reset', 'button'].includes(type))) {
+        if (el === submitter && type === 'submit') out.push([name, el.value]);
+        continue;
+      }
+      if ((type === 'checkbox' || type === 'radio') && !el.checked) continue;
+      if (tag === 'input' && type === 'file') {
+        const files = el.files;
+        if (!files || !files.length) out.push([name, new File([], '', { type: 'application/octet-stream' })]);
+        else for (const f of files) out.push([name, f]);
+        continue;
+      }
+      out.push([name, tag === 'input' && (type === 'checkbox' || type === 'radio') && !el.hasAttribute('value') ? 'on' : el.value]);
+    }
+    return out;
+  }
+  class FormData {
+    constructor(form, submitter) {
+      this._p = form ? formEntries(form, submitter) : [];
+    }
+    append(k, v, filename) { this._p.push([String(k), formEntry(v, filename)]); }
+    set(k, v, filename) {
+      k = String(k);
+      const entry = [k, formEntry(v, filename)];
+      const i = this._p.findIndex(([n]) => n === k);
+      this._p = this._p.filter(([n], j) => n !== k || j === i);
+      if (i < 0) this._p.push(entry);
+      else this._p[this._p.findIndex(([n]) => n === k)] = entry;
+    }
+    get(k) { const p = this._p.find(([n]) => n === String(k)); return p ? p[1] : null; }
+    getAll(k) { return this._p.filter(([n]) => n === String(k)).map(([, v]) => v); }
+    has(k) { return this._p.some(([n]) => n === String(k)); }
+    delete(k) { this._p = this._p.filter(([n]) => n !== String(k)); }
+    entries() { return this._p.map(([n, v]) => [n, v])[Symbol.iterator](); }
+    keys() { return this._p.map(([n]) => n)[Symbol.iterator](); }
+    values() { return this._p.map(([, v]) => v)[Symbol.iterator](); }
+    forEach(fn, thisArg) { for (const [n, v] of this._p) fn.call(thisArg, v, n, this); }
+    [Symbol.iterator]() { return this.entries(); }
+    get [Symbol.toStringTag]() { return 'FormData'; }
+  }
+
+  // multipart/form-data (RFC 7578, as the HTML standard encodes it).
+  function multipartBody(fd) {
+    const crlf = (s) => s.replace(/\r\n|\r|\n/g, '\r\n');
+    const esc = (s) => s.replace(/\r/g, '%0D').replace(/\n/g, '%0A').replace(/"/g, '%22');
+    let boundary = '----RubrowserFormBoundary';
+    for (let i = 0; i < 16; i++) boundary += 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'[Math.floor(Math.random() * 62)];
+    const chunks = [];
+    for (const [name, value] of fd._p) {
+      let head = '--' + boundary + '\r\nContent-Disposition: form-data; name="' + esc(crlf(name)) + '"';
+      if (value instanceof File) {
+        head += '; filename="' + esc(value.name) + '"\r\nContent-Type: ' + (value.type || 'application/octet-stream') + '\r\n\r\n';
+        chunks.push(rb.encodeUtf8(head), value._data, rb.encodeUtf8('\r\n'));
+      } else {
+        chunks.push(rb.encodeUtf8(head + '\r\n\r\n' + crlf(value) + '\r\n'));
+      }
+    }
+    chunks.push(rb.encodeUtf8('--' + boundary + '--\r\n'));
+    return { body: concatBytes(chunks), type: 'multipart/form-data; boundary=' + boundary };
+  }
+
+  // Fetch standard "extract a body": bytes (or a string, sent as UTF-8)
+  // and the Content-Type it implies.
+  function extractBody(body) {
+    if (body === undefined || body === null) return { body: '', type: null };
+    if (body instanceof URLSearchParams) return { body: body.toString(), type: 'application/x-www-form-urlencoded;charset=UTF-8' };
+    if (body instanceof FormData) return multipartBody(body);
+    if (body instanceof Blob) return { body: body._data, type: body.type || null };
+    const bytes = sourceBytes(body);
+    if (bytes) return { body: bytes, type: null };
+    return { body: String(body), type: 'text/plain;charset=UTF-8' };
+  }
+  function bodyBytes(b) { return typeof b === 'string' ? rb.encodeUtf8(b) : b; }
+
+  // ----- fetch, XMLHttpRequest -----------------------------------------------
   // HTTP from scripts goes through the browser (same origin only); the
-  // response arrives in __rb_http.
+  // response arrives in __rb_http. blob: and data: URLs are answered here.
   class Headers {
-    constructor(init) { this._m = new Map(); if (init) for (const [k, v] of Object.entries(init)) this.set(k, v); }
+    constructor(init) {
+      this._m = new Map();
+      if (init instanceof Headers) init.forEach((v, k) => this.append(k, v));
+      else if (Array.isArray(init)) for (const [k, v] of init) this.append(k, v);
+      else if (init) for (const [k, v] of Object.entries(init)) this.append(k, v);
+    }
     get(k) { return this._m.get(String(k).toLowerCase()) ?? null; }
     set(k, v) { this._m.set(String(k).toLowerCase(), String(v)); }
-    append(k, v) { this.set(k, v); }
+    append(k, v) { k = String(k).toLowerCase(); this._m.set(k, this._m.has(k) ? this._m.get(k) + ', ' + String(v) : String(v)); }
     has(k) { return this._m.has(String(k).toLowerCase()); }
     delete(k) { this._m.delete(String(k).toLowerCase()); }
     forEach(fn) { this._m.forEach((v, k) => fn(v, k, this)); }
-    [Symbol.iterator]() { return this._m.entries(); }
+    entries() { return [...this._m.entries()].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))[Symbol.iterator](); }
+    keys() { return [...this.entries()].map(([k]) => k)[Symbol.iterator](); }
+    values() { return [...this.entries()].map(([, v]) => v)[Symbol.iterator](); }
+    [Symbol.iterator]() { return this.entries(); }
   }
-  class Request { constructor(url, init) { this.url = String(url); this.method = (init && init.method) || 'GET'; this.headers = new Headers(init && init.headers); } }
+  // Headers from the browser's `name: value` lines.
+  function parseHeaders(text) {
+    const h = new Headers();
+    for (const line of String(text || '').split('\r\n')) {
+      const i = line.indexOf(':');
+      if (i > 0) h.append(line.slice(0, i).trim(), line.slice(i + 1).trim());
+    }
+    return h;
+  }
+  class Request {
+    constructor(input, init) {
+      init = init || {};
+      const from = input instanceof Request ? input : null;
+      this.url = from ? from.url : new URL(String(input instanceof URL ? input.href : input), location.href).href;
+      this.method = String(init.method || (from ? from.method : 'GET')).toUpperCase();
+      this.headers = new Headers(init.headers || (from ? from.headers : undefined));
+      this._body = init.body !== undefined ? init.body : from ? from._body : null;
+      this.signal = init.signal || (from ? from.signal : null);
+    }
+    clone() { return new Request(this); }
+  }
   class Response {
-    constructor(body, init) { this._body = body == null ? '' : String(body); this.status = (init && init.status) || 200; this.ok = this.status < 300; this.headers = new Headers(init && init.headers); }
-    text() { return Promise.resolve(this._body); }
-    json() { return Promise.resolve(JSON.parse(this._body)); }
+    constructor(body, init) {
+      init = init || {};
+      const x = extractBody(body);
+      this._bytes = bodyBytes(x.body);
+      this.status = init.status === undefined ? 200 : init.status;
+      this.statusText = init.statusText || '';
+      this.ok = this.status >= 200 && this.status < 300;
+      this.headers = new Headers(init.headers);
+      if (x.type && !this.headers.has('content-type')) this.headers.set('content-type', x.type);
+      this.type = 'basic';
+      this.redirected = false;
+      this.url = '';
+      this.bodyUsed = false;
+    }
+    _consume() {
+      if (this.bodyUsed) return Promise.reject(new TypeError('Body has already been consumed.'));
+      this.bodyUsed = true;
+      return Promise.resolve(this._bytes);
+    }
+    text() { return this._consume().then((b) => rb.decodeUtf8(b)); }
+    json() { return this.text().then((t) => JSON.parse(t)); }
+    arrayBuffer() { return this._consume().then((b) => b.slice().buffer); }
+    bytes() { return this._consume().then((b) => b.slice()); }
+    blob() { return this._consume().then((b) => new Blob([b], { type: this.headers.get('content-type') || '' })); }
+    clone() {
+      const r = new Response(this._bytes, { status: this.status, statusText: this.statusText, headers: this.headers });
+      r.url = this.url;
+      return r;
+    }
+    static json(data, init) {
+      const r = new Response(JSON.stringify(data), init);
+      r.headers.set('content-type', 'application/json');
+      return r;
+    }
+    static error() { const r = new Response(null, { status: 0 }); r.type = 'error'; return r; }
   }
-  const httpPending = new Map(); // id -> (status, body) => void
+  const httpPending = new Map(); // id -> (status, bytes, headers) => void
   global.__rb_http = function (id, status) {
     const done = httpPending.get(id);
     httpPending.delete(id);
-    if (done) done(status, status ? rb.httpBody(id) : '');
+    if (done) done(status, status ? rb.httpBytes(id) : new Uint8Array(0), status ? rb.httpHeaders(id) : '');
   };
   function httpRequest(method, url, body, contentType, done) {
-    const id = rb.http(String(url), String(method || 'GET'), body == null ? '' : String(body), contentType || '');
+    const href = new URL(String(url), location.href).href;
+    const local = localResponse(href, method);
+    if (local) { addTimer(() => done(...local), 0, [], false); return; }
+    const id = rb.http(href, String(method || 'GET'), body, contentType || '');
     httpPending.set(id, done);
   }
+  // [status, bytes, headers] for blob: and data: URLs (Fetch: "scheme
+  // fetch"), [0, …] when they fail; null for other URLs.
+  function localResponse(url, method) {
+    const failed = [0, new Uint8Array(0), ''];
+    if (url.startsWith('blob:')) {
+      const blob = blobUrls.get(url.split('#')[0]);
+      if (!blob || String(method).toUpperCase() !== 'GET') return failed;
+      return [200, blob._data, 'content-type: ' + blob.type + '\r\ncontent-length: ' + blob.size + '\r\n'];
+    }
+    if (url.startsWith('data:')) {
+      const m = /^data:([^,]*?)(;base64)?,([\s\S]*)$/.exec(url.split('#')[0]);
+      if (!m) return failed;
+      let bytes;
+      if (m[2]) {
+        const bin = atob(decodeURIComponent(m[3]));
+        bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      } else {
+        bytes = rb.encodeUtf8(decodeURIComponent(m[3]));
+      }
+      return [200, bytes, 'content-type: ' + (m[1] || 'text/plain;charset=US-ASCII') + '\r\n'];
+    }
+    return null;
+  }
   function fetch(input, init) {
-    init = init || {};
-    const url = input instanceof Request ? input.url : String(input instanceof URL ? input.href : input);
-    const method = init.method || (input instanceof Request ? input.method : 'GET');
-    let body = init.body;
-    let ctype = '';
-    if (body instanceof URLSearchParams) { ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; body = body.toString(); }
-    else if (body instanceof FormData) { ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; body = new URLSearchParams(Object.fromEntries(body)).toString(); }
-    const headers = new Headers(init.headers && !(init.headers instanceof Headers) ? init.headers : undefined);
-    if (init.headers instanceof Headers) init.headers.forEach((v, k) => headers.set(k, v));
-    if (headers.has('content-type')) ctype = headers.get('content-type');
+    let req;
+    try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
+    const x = extractBody(req._body);
+    const ctype = req.headers.get('content-type') || x.type || '';
     return new Promise((resolve, reject) => {
-      if (init.signal && init.signal.aborted) { reject(init.signal.reason); return; }
-      httpRequest(method, url, body, ctype, (status, text) => {
-        if (!status) reject(new TypeError('Failed to fetch'));
-        else { const r = new Response(text, { status }); r.url = new URL(url, location.href).href; resolve(r); }
+      const signal = req.signal;
+      if (signal && signal.aborted) { reject(signal.reason); return; }
+      httpRequest(req.method, req.url, x.body, ctype, (status, bytes, headers) => {
+        if (signal && signal.aborted) { reject(signal.reason); return; }
+        if (!status) { reject(new TypeError('Failed to fetch')); return; }
+        const r = new Response(bytes, { status, headers: parseHeaders(headers) });
+        r.url = req.url;
+        resolve(r);
       });
     });
   }
   class XMLHttpRequest extends EventTarget {
-    constructor() { super(); this.readyState = 0; this.status = 0; this.responseText = ''; this.response = null; this.responseType = ''; this._headers = {}; }
-    open(method, url) { this._method = method; this._url = url; this.readyState = 1; }
+    constructor() {
+      super();
+      this.readyState = 0;
+      this.status = 0;
+      this.statusText = '';
+      this.responseText = '';
+      this.response = '';
+      this.responseType = '';
+      this.responseURL = '';
+      this.timeout = 0;
+      this.withCredentials = false;
+      this._headers = {};
+      this._resp = '';
+      this.upload = new EventTarget();
+    }
+    open(method, url) {
+      this._method = String(method).toUpperCase();
+      this._url = new URL(String(url), location.href).href;
+      this._aborted = false;
+      this.readyState = 1;
+      fireAt(this, 'readystatechange', {});
+    }
     setRequestHeader(k, v) { this._headers[String(k).toLowerCase()] = String(v); }
-    getResponseHeader() { return null; }
-    getAllResponseHeaders() { return ''; }
-    abort() { this._aborted = true; }
+    overrideMimeType() {}
+    getResponseHeader(k) { return this.readyState >= 2 ? parseHeaders(this._resp).get(k) : null; }
+    getAllResponseHeaders() {
+      if (this.readyState < 2) return '';
+      return [...parseHeaders(this._resp)].map(([k, v]) => k + ': ' + v + '\r\n').join('');
+    }
+    abort() {
+      if (this._aborted || this.readyState === 4 || this.readyState === 0) return;
+      this._aborted = true;
+      this.readyState = 4;
+      fireAt(this, 'readystatechange', {});
+      fireAt(this, 'abort', {});
+      fireAt(this, 'loadend', {});
+      this.readyState = 0;
+    }
     send(body) {
-      httpRequest(this._method, this._url, body, this._headers['content-type'], (status, text) => {
+      const x = extractBody(this._method === 'GET' || this._method === 'HEAD' ? null : body);
+      const sent = typeof x.body === 'string' ? rb.encodeUtf8(x.body).length : x.body.length;
+      const ctype = this._headers['content-type'] || x.type || '';
+      fireAt(this, 'loadstart', { loaded: 0, total: 0 });
+      if (sent) fireAt(this.upload, 'loadstart', { lengthComputable: true, loaded: 0, total: sent });
+      httpRequest(this._method, this._url, x.body, ctype, (status, bytes, headers) => {
         if (this._aborted) return;
-        this.readyState = 4;
+        if (sent && status) {
+          const up = { lengthComputable: true, loaded: sent, total: sent };
+          for (const t of ['progress', 'load', 'loadend']) fireAt(this.upload, t, up);
+        }
         this.status = status;
-        this.responseText = text;
-        try { this.response = this.responseType === 'json' ? JSON.parse(text) : text; } catch (_) { this.response = null; }
-        const fire = (name) => {
-          const e = { type: name, target: this, currentTarget: this };
-          if (typeof this['on' + name] === 'function') call(this['on' + name], this, [e]);
-          this.dispatchEvent(Object.assign(new Event(name), e));
-        };
-        fire('readystatechange');
-        fire(status ? 'load' : 'error');
-        fire('loadend');
+        this.statusText = status === 200 ? 'OK' : '';
+        this.responseURL = status ? this._url : '';
+        this._resp = headers;
+        const type = parseHeaders(headers).get('content-type') || '';
+        const text = () => decodeText(bytes, (/charset=([^;]+)/i.exec(type) || [])[1]);
+        switch (this.responseType) {
+          case 'arraybuffer': this.response = bytes.slice().buffer; break;
+          case 'blob': this.response = new Blob([bytes], { type }); break;
+          case 'json': try { this.response = JSON.parse(text()); } catch (_) { this.response = null; } break;
+          default: this.responseText = text(); this.response = this.responseText;
+        }
+        this.readyState = 4;
+        const done = { lengthComputable: true, loaded: bytes.length, total: bytes.length };
+        fireAt(this, 'readystatechange', {});
+        if (status) fireAt(this, 'progress', done);
+        fireAt(this, status ? 'load' : 'error', done);
+        fireAt(this, 'loadend', done);
       });
     }
   }
-  class FormData {
-    constructor(form) {
-      this._p = [];
-      if (form && form.elements) for (const el of form.elements) if (el.name) this._p.push([el.name, el.value]);
-    }
-    append(k, v) { this._p.push([String(k), v]); }
-    set(k, v) { this.delete(k); this.append(k, v); }
-    get(k) { const p = this._p.find(([n]) => n === k); return p ? p[1] : null; }
-    getAll(k) { return this._p.filter(([n]) => n === k).map(([, v]) => v); }
-    has(k) { return this._p.some(([n]) => n === k); }
-    delete(k) { this._p = this._p.filter(([n]) => n !== k); }
-    entries() { return this._p[Symbol.iterator](); }
-    [Symbol.iterator]() { return this.entries(); }
-  }
-  class Blob {
-    constructor(parts, opts) { this._t = (parts || []).join(''); this.type = (opts && opts.type) || ''; this.size = this._t.length; }
-    text() { return Promise.resolve(this._t); }
-  }
+  Object.assign(XMLHttpRequest, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
 
   // ----- <canvas> ------------------------------------------------------------
   // The 2D context sends each call to the browser, which draws (see the
@@ -2910,6 +3317,9 @@
     XMLHttpRequest,
     FormData,
     Blob,
+    File,
+    FileList,
+    FileReader,
     DOMParser,
     Intl: typeof global.Intl === 'object' ? global.Intl : Intl,
     PerformanceObserver,

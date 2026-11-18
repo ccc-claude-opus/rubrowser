@@ -22,7 +22,7 @@ use boa_engine::error::RuntimeLimitError;
 use boa_engine::job::SimpleJobExecutor;
 use boa_engine::module::{ModuleLoader, ModuleRequest, Referrer};
 use boa_engine::object::ObjectInitializer;
-use boa_engine::object::builtins::JsArray;
+use boa_engine::object::builtins::{JsArray, JsArrayBuffer, JsTypedArray, JsUint8Array};
 use boa_engine::property::Attribute;
 use boa_engine::vm::RuntimeLimits;
 use boa_engine::{
@@ -133,6 +133,74 @@ fn opt_string(s: Option<String>) -> JsValue {
     s.map_or(JsValue::null(), |s| string(&s))
 }
 
+/// The bytes of an `ArrayBuffer` or typed array (its viewed part);
+/// `None` for other values.
+fn bytes(v: &JsValue, ctx: &mut Context) -> JsResult<Option<Vec<u8>>> {
+    let Some(o) = v.as_object() else {
+        return Ok(None);
+    };
+    if let Ok(buf) = JsArrayBuffer::from_object(o.clone()) {
+        return Ok(Some(buf.data().map(|d| d.to_vec()).unwrap_or_default()));
+    }
+    if let Ok(view) = JsTypedArray::from_object(o) {
+        let (offset, len) = (view.byte_offset(ctx)?, view.byte_length(ctx)?);
+        let Some(buf) = view.buffer(ctx)?.as_object() else {
+            return Ok(Some(Vec::new()));
+        };
+        let buf = JsArrayBuffer::from_object(buf)?;
+        let data = buf.data();
+        return Ok(Some(
+            data.and_then(|d| d.get(offset..offset + len).map(<[u8]>::to_vec))
+                .unwrap_or_default(),
+        ));
+    }
+    Ok(None)
+}
+
+/// A new `Uint8Array` holding `b`.
+fn u8array(b: &[u8], ctx: &mut Context) -> JsResult<JsValue> {
+    let buf = JsArrayBuffer::new(b.len(), ctx)?;
+    if let Some(mut d) = buf.data_mut() {
+        d.copy_from_slice(b);
+    }
+    Ok(JsUint8Array::from_array_buffer(buf, ctx)?.into())
+}
+
+/// Bytes the browser writes into a buffer, growing it if needed (`None`
+/// when the browser returns -1).
+fn read_bytes(mut get: impl FnMut(*mut u8, usize) -> i32) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = get(buf.as_mut_ptr(), buf.len());
+        if n < 0 {
+            return None;
+        }
+        let n = n as usize;
+        if n <= buf.len() {
+            buf.truncate(n);
+            return Some(buf);
+        }
+        buf.resize(n, 0);
+    }
+}
+
+/// Standard base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = chunk.iter().fold(0u32, |a, &b| a << 8 | b as u32) << (8 * (3 - chunk.len()));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
 type Native = fn(&JsValue, &[JsValue], &mut Context) -> JsResult<JsValue>;
 
 /// The `__rb` object: one function per rb import, with JS-friendly types.
@@ -192,12 +260,12 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             Ok(JsArray::from_iter(out.into_iter().map(JsValue::from), c).into())
         }),
         ("http", 4, |_, a, c| {
-            let (url, method, body, ctype) = (
-                text(a, 0, c)?,
-                text(a, 1, c)?,
-                text(a, 2, c)?,
-                text(a, 3, c)?,
-            );
+            // The body is a string (sent as UTF-8) or bytes.
+            let body = match bytes(a.get_or_undefined(2), c)? {
+                Some(b) => b,
+                None => text(a, 2, c)?.into_bytes(),
+            };
+            let (url, method, ctype) = (text(a, 0, c)?, text(a, 1, c)?, text(a, 3, c)?);
             Ok(unsafe {
                 ffi::http(
                     url.as_ptr(),
@@ -222,6 +290,65 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             }
             buf.truncate(n.max(0) as usize);
             Ok(JsString::from(String::from_utf8_lossy(&buf).as_ref()).into())
+        }),
+        ("httpBytes", 1, |_, a, c| {
+            let id = int(a, 0, c)?;
+            let b = read_bytes(|p, n| unsafe { ffi::http_body(id, p, n) }).unwrap_or_default();
+            u8array(&b, c)
+        }),
+        ("httpHeaders", 1, |_, a, c| {
+            let id = int(a, 0, c)?;
+            Ok(string(
+                &read_string(|p, n| unsafe { ffi::http_headers(id, p, n) }).unwrap_or_default(),
+            ))
+        }),
+        ("files", 1, |_, a, c| {
+            let h = int(a, 0, c)?;
+            Ok(opt_string(read_string(|p, n| unsafe {
+                ffi::files(h, p, n)
+            })))
+        }),
+        ("fileData", 2, |_, a, c| {
+            let (h, i) = (int(a, 0, c)?, int(a, 1, c)?);
+            match read_bytes(|p, n| unsafe { ffi::file_data(h, i, p, n) }) {
+                Some(b) => u8array(&b, c),
+                None => Ok(JsValue::null()),
+            }
+        }),
+        ("blobUrl", 3, |_, a, c| {
+            let (url, mime) = (text(a, 0, c)?, text(a, 1, c)?);
+            let data = bytes(a.get_or_undefined(2), c)?.unwrap_or_default();
+            unsafe {
+                ffi::blob_url(
+                    url.as_ptr(),
+                    url.len(),
+                    mime.as_ptr(),
+                    mime.len(),
+                    data.as_ptr(),
+                    data.len(),
+                )
+            };
+            Ok(JsValue::undefined())
+        }),
+        ("blobRevoke", 1, |_, a, c| {
+            let url = text(a, 0, c)?;
+            unsafe { ffi::blob_revoke(url.as_ptr(), url.len()) };
+            Ok(JsValue::undefined())
+        }),
+        // Byte helpers for Blob, FileReader and fetch bodies.
+        ("encodeUtf8", 1, |_, a, c| {
+            let s = a.get_or_undefined(0).to_string(c)?.to_std_string_lossy();
+            u8array(s.as_bytes(), c)
+        }),
+        ("decodeUtf8", 1, |_, a, c| {
+            let b = bytes(a.get_or_undefined(0), c)?.unwrap_or_default();
+            // A BOM is not part of the text (Encoding: "UTF-8 decode").
+            let b = b.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&b);
+            Ok(string(&String::from_utf8_lossy(b)))
+        }),
+        ("base64", 1, |_, a, c| {
+            let b = bytes(a.get_or_undefined(0), c)?.unwrap_or_default();
+            Ok(string(&base64(&b)))
         }),
         ("rect", 2, |_, a, c| {
             Ok(unsafe { ffi::rect(int(a, 0, c)?, int(a, 1, c)?) }.into())

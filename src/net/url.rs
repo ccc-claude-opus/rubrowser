@@ -16,7 +16,7 @@ pub fn scheme(s: &str) -> Option<&str> {
         && sch
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c));
-    let known = matches!(sch, "about" | "data" | "file" | "http" | "https");
+    let known = matches!(sch, "about" | "blob" | "data" | "file" | "http" | "https");
     (valid && (known || s[i + 1..].starts_with("//"))).then_some(sch)
 }
 

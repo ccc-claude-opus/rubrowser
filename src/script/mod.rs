@@ -102,6 +102,9 @@ pub struct Output {
     pub submit: Option<NodeId>,
     /// HTTP requests the script started (`fetch`, `XMLHttpRequest`).
     pub http: Vec<HttpCall>,
+    /// Elements whose activation behavior the script asked for
+    /// (`click()` on a link or a file input, `showPicker()`).
+    pub activate: Vec<NodeId>,
 }
 
 /// An HTTP request started by a script; the browser answers it with
@@ -156,8 +159,9 @@ struct State {
     /// Wall-clock milliseconds since the Unix epoch at `now == 0`.
     wall_offset: f64,
     next_http: i32,
-    /// The response being delivered to `rb_http`: (id, body).
-    response: Option<(i32, Vec<u8>)>,
+    /// The response being delivered to `rb_http`: (id, body, headers as
+    /// `name: value` lines).
+    response: Option<(i32, Vec<u8>, String)>,
     /// The script's exported `memory`.
     memory: Option<Memory>,
 }
@@ -376,20 +380,22 @@ impl Script {
     }
 
     /// Delivers the response to HTTP request `id`: `status` (0 when the
-    /// request failed) and the body, readable with `http_body` during the
-    /// `rb_http` call.
+    /// request failed), the body and the headers (`name: value` lines),
+    /// readable with `http_body` and `http_headers` during the `rb_http`
+    /// call.
     pub fn http_done(
         &mut self,
         doc: &mut Document,
         id: i32,
         status: i32,
         body: Vec<u8>,
+        headers: &str,
         now: f64,
     ) -> Result<(), String> {
         let Some(f) = self.http_fn.clone() else {
             return Ok(());
         };
-        self.store.data_mut().response = Some((id, body));
+        self.store.data_mut().response = Some((id, body, headers.to_string()));
         let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, (id, status)));
         self.store.data_mut().response = None;
         r
@@ -622,6 +628,17 @@ fn write_str(caller: &mut Caller<'_, State>, ptr: i32, cap: i32, s: &str) -> Res
     Ok(s.len() as i32)
 }
 
+/// Copies as much of `bytes` as fits in `cap` bytes at `ptr`; returns the
+/// full length.
+fn write_bytes(caller: &mut Caller<'_, State>, ptr: i32, cap: i32, bytes: &[u8]) -> Result<i32, Error> {
+    let n = bytes.len().min(cap.max(0) as usize);
+    let mem = memory(caller)?;
+    let data = mem.data_mut(caller);
+    let r = range(data, ptr, n)?;
+    data[r].copy_from_slice(&bytes[..n]);
+    Ok(bytes.len() as i32)
+}
+
 /// A handle that refers to an existing node.
 fn node(doc: &Document, h: i32) -> Option<NodeId> {
     let id = usize::try_from(h).ok()?;
@@ -816,15 +833,85 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         "http_body",
         |mut c: C, id: i32, p: i32, cap: i32| -> Result<i32, Error> {
             let body = match &c.data().response {
-                Some((rid, b)) if *rid == id => b.clone(),
+                Some((rid, b, _)) if *rid == id => b.clone(),
                 _ => return Ok(-1),
             };
-            let n = body.len().min(cap.max(0) as usize);
-            let mem = memory(&c)?;
-            let data = mem.data_mut(&mut c);
-            let r = range(data, p, n)?;
-            data[r].copy_from_slice(&body[..n]);
-            Ok(body.len() as i32)
+            write_bytes(&mut c, p, cap, &body)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "http_headers",
+        |mut c: C, id: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let headers = match &c.data().response {
+                Some((rid, _, h)) if *rid == id => h.clone(),
+                _ => return Ok(-1),
+            };
+            write_str(&mut c, p, cap, &headers)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "files",
+        |mut c: C, h: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            // The selection's serial, then `name\ttype\tsize\tmodified`
+            // lines.
+            let doc = &c.data().doc;
+            let Some(e) = element(doc, h)
+                .filter(|&e| crate::document::control(&doc.dom, e) == Some(crate::document::Control::File))
+            else {
+                return Ok(-1);
+            };
+            let mut s = doc.forms.selection(e).to_string();
+            for f in doc.forms.files(e) {
+                let name = f.name.replace(['\t', '\n'], " ");
+                s.push_str(&format!("\n{name}\t{}\t{}\t{}", f.mime, f.bytes.len(), f.modified));
+            }
+            write_str(&mut c, p, cap, &s)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "file_data",
+        |mut c: C, h: i32, i: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            let doc = &c.data().doc;
+            let file = element(doc, h)
+                .and_then(|e| doc.forms.files(e).get(usize::try_from(i).ok()?))
+                .map(|f| f.bytes.clone());
+            match file {
+                Some(bytes) => write_bytes(&mut c, p, cap, &bytes),
+                None => Ok(-1),
+            }
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "blob_url",
+        |mut c: C, up: i32, ul: i32, tp: i32, tl: i32, dp: i32, dl: i32| -> Result<(), Error> {
+            let url = read_str(&c, up, ul)?;
+            let mime = read_str(&c, tp, tl)?;
+            let bytes = {
+                let mem = memory(&c)?;
+                let data = mem.data(&c);
+                data[range(data, dp, dl.max(0) as usize)?].to_vec()
+            };
+            let blob = crate::document::FileData {
+                name: String::new(),
+                mime,
+                bytes: bytes.into(),
+                modified: 0.0,
+            };
+            c.data_mut().doc.blobs.insert(url, blob);
+            Ok(())
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "blob_revoke",
+        |mut c: C, up: i32, ul: i32| -> Result<(), Error> {
+            let url = read_str(&c, up, ul)?;
+            c.data_mut().doc.blobs.remove(&url);
+            Ok(())
         },
     )?;
     l.func_wrap("rb", "parent", |c: C, h: i32| -> i32 {
@@ -1389,8 +1476,14 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         }
     })?;
     l.func_wrap("rb", "form_action", |mut c: C, h: i32, op: i32| {
-        // op: 0 submit, 1 reset.
+        // op: 0 submit, 1 reset (forms); 2 activate (any element).
         let s = c.data_mut();
+        if op == 2 {
+            if let Some(e) = element(&s.doc, h) {
+                s.out.activate.push(e);
+            }
+            return;
+        }
         let Some(form) = element(&s.doc, h).filter(|&e| s.doc.dom.tag(e) == Some("form")) else {
             return;
         };

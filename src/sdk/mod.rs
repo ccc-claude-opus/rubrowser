@@ -60,6 +60,11 @@ imports! {
     fn rect(h: i32, which: i32) -> f64;
     fn http(up: *const u8, ul: usize, mp: *const u8, ml: usize, bp: *const u8, bl: usize, cp: *const u8, cl: usize) -> i32;
     fn http_body(id: i32, p: *mut u8, cap: usize) -> i32;
+    fn http_headers(id: i32, p: *mut u8, cap: usize) -> i32;
+    fn files(h: i32, p: *mut u8, cap: usize) -> i32;
+    fn file_data(h: i32, i: i32, p: *mut u8, cap: usize) -> i32;
+    fn blob_url(up: *const u8, ul: usize, tp: *const u8, tl: usize, dp: *const u8, dl: usize);
+    fn blob_revoke(up: *const u8, ul: usize);
     fn parent(h: i32) -> i32;
     fn get_text(h: i32, p: *mut u8, cap: usize) -> i32;
     fn set_text(h: i32, p: *const u8, n: usize);

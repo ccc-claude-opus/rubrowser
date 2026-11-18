@@ -27,7 +27,8 @@ mod image;
 pub mod media;
 
 pub use forms::{
-    Control, FormState, control, form_of, label_target, option_label, options, urlencode,
+    Control, FileData, FormState, FormValue, control, entry_pairs, extensions_for_mime, form_of,
+    label_target, mime_for_name, multipart, option_label, options, text_plain, urlencode,
 };
 pub use image::{Bitmap, ImageState, Images};
 
@@ -152,6 +153,8 @@ pub struct Document {
     media_events: Vec<(NodeId, &'static str)>,
     /// The user has interacted with the page (sound may autoplay).
     pub user_activated: bool,
+    /// `blob:` URLs the page's scripts created (`URL.createObjectURL`).
+    pub blobs: HashMap<String, FileData>,
 }
 
 impl Document {
@@ -194,6 +197,7 @@ impl Document {
             media: Default::default(),
             media_events: Vec::new(),
             user_activated: false,
+            blobs: HashMap::new(),
         }
     }
 
@@ -1265,7 +1269,12 @@ impl Document {
                     "#000000".into()
                 }
             }
-            Some(Control::File) => String::new(),
+            // HTML: "C:\fakepath\" and the first file's name.
+            Some(Control::File) => self
+                .forms
+                .files(node)
+                .first()
+                .map_or(String::new(), |f| format!("C:\\fakepath\\{}", f.name)),
             _ => self.inputs.get(&node).map_or_else(
                 || self.dom.attr(node, "value").unwrap_or("").to_string(),
                 TextField::text,
@@ -1275,6 +1284,12 @@ impl Document {
 
     pub fn set_input_value(&mut self, node: NodeId, value: &str) {
         match control(&self.dom, node) {
+            // Scripts may only clear a file input.
+            Some(Control::File) => {
+                if value.is_empty() && !self.forms.files(node).is_empty() {
+                    self.forms.set_files(node, Vec::new());
+                }
+            }
             Some(Control::Select) => {
                 let found = options(&self.dom, node)
                     .into_iter()
@@ -1312,8 +1327,19 @@ impl Document {
         }
     }
 
-    /// Name/value pairs a form submits (with the button that submitted it).
+    /// Name/value pairs a form submits (with the button that submitted it);
+    /// files stand for their names.
     pub fn form_data(&self, form: NodeId, submitter: Option<NodeId>) -> Vec<(String, String)> {
+        entry_pairs(&self.form_entries(form, submitter))
+    }
+
+    /// The entry list a form submits (HTML: "constructing the entry list"),
+    /// with the button that submitted it.
+    pub fn form_entries(
+        &self,
+        form: NodeId,
+        submitter: Option<NodeId>,
+    ) -> Vec<(String, FormValue)> {
         let mut out = Vec::new();
         for n in self.dom.descendants(form) {
             let (Some(kind), Some(name)) = (control(&self.dom, n), self.dom.attr(n, "name")) else {
@@ -1329,8 +1355,24 @@ impl Document {
                 }
                 _ => true,
             };
-            if include {
-                out.push((name.to_string(), self.input_value(n)));
+            if !include {
+                continue;
+            }
+            if kind == Control::File {
+                let files = self.forms.files(n);
+                if files.is_empty() {
+                    // No file: an empty one without a name.
+                    let empty = FileData {
+                        mime: "application/octet-stream".into(),
+                        ..FileData::new("", Vec::new(), 0.0)
+                    };
+                    out.push((name.to_string(), FormValue::File(empty)));
+                }
+                for f in files {
+                    out.push((name.to_string(), FormValue::File(f.clone())));
+                }
+            } else {
+                out.push((name.to_string(), FormValue::Text(self.input_value(n))));
             }
         }
         out
