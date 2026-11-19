@@ -954,18 +954,18 @@ impl Browser {
         } else {
             // Resources of a page carry its URL as the referrer (pages
             // themselves are opened without one).
-            let referrer = match self.requests[&id] {
-                Request::Page { .. } => String::new(),
+            let (referrer, fetch_site) = match self.requests[&id] {
+                Request::Page { .. } => (String::new(), String::new()),
                 ref r => self
                     .tabs
                     .iter()
                     .find(|t| t.id == r.tab())
-                    .map_or_else(String::new, |t| url::referrer(&t.doc.url, url)),
+                    .map_or_else(Default::default, |t| (url::referrer(&t.doc.url, url), url::fetch_site(&t.doc.url, url))),
             };
-            if referrer.is_empty() {
+            if referrer.is_empty() && fetch_site.is_empty() {
                 host.fetch(id, url);
             } else {
-                host.fetch_with(id, url, &crate::input::HttpRequest { referrer, ..Default::default() });
+                host.fetch_with(id, url, &crate::input::HttpRequest { referrer, fetch_site, ..Default::default() });
             }
         }
     }
@@ -1961,11 +1961,15 @@ impl Browser {
             let fid = self.next_id;
             self.next_id += 1;
             self.requests.insert(fid, req);
+            let doc = &self.tabs[i].doc.url;
+            let origin = if matches!(call.method.as_str(), "" | "GET" | "HEAD") { String::new() } else { url::origin_header(doc) };
             let request = crate::input::HttpRequest {
                 method: call.method,
                 body: call.body,
                 content_type: call.content_type,
-                referrer: url::referrer(&self.tabs[i].doc.url, &target),
+                referrer: url::referrer(doc, &target),
+                origin,
+                fetch_site: url::fetch_site(doc, &target),
             };
             host.fetch_with(fid, &target, &request);
         }
@@ -3121,12 +3125,18 @@ impl Browser {
             // The body is sent once; going back to this entry reloads it
             // with GET.
             let target = base.split('#').next().unwrap_or("").to_string();
-            let referrer = url::referrer(&self.tabs[self.active].doc.url, &target);
+            let doc = &self.tabs[self.active].doc.url;
+            let referrer = url::referrer(doc, &target);
+            // Origin and Sec-Fetch-Site let the server refuse forms posted
+            // from other sites (CSRF)
+            let (origin, fetch_site) = (url::origin_header(doc), url::fetch_site(doc, &target));
             self.tabs[self.active].post = Some(crate::input::HttpRequest {
                 method: "POST".into(),
                 body,
                 content_type,
                 referrer,
+                origin,
+                fetch_site,
             });
             return self.navigate(&target, host);
         }
@@ -4027,6 +4037,8 @@ mod tests {
         clipboard: Option<String>,
         /// (url, Referer) of requests that send one.
         referrers: Vec<(String, String)>,
+        /// (url, Origin, Sec-Fetch-Site) of requests with a method.
+        origins: Vec<(String, String, String)>,
     }
 
     impl Host for TestHost {
@@ -4044,6 +4056,7 @@ mod tests {
             let body = String::from_utf8_lossy(&r.body).into_owned();
             self.requests
                 .push((url.to_string(), r.method.clone(), body));
+            self.origins.push((url.to_string(), r.origin.clone(), r.fetch_site.clone()));
         }
         fn clipboard_get(&mut self) -> Option<String> {
             self.clipboard.clone()
@@ -4251,6 +4264,32 @@ mod tests {
         click_page(&mut b, &mut h, "out");
         assert_eq!(b.tabs.len(), tabs + 1, "target=_blank opens a tab");
         assert_eq!(b.tabs[b.active].url(), "https://w.org/other");
+    }
+
+    #[test]
+    fn form_posts_say_where_they_come_from() {
+        let (mut b, mut h) = browser();
+        b.navigate("http://evil.localhost:8700/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        let page = br#"<form method=post action="http://files.localhost:8700/delete"><input name=p value=x>
+            <button id=go>Go</button></form>
+            <form method=post action="/own"><button id=own>Own</button></form>"#;
+        b.fetch_done(id, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        click_page(&mut b, &mut h, "go");
+        assert_eq!(
+            h.origins.last().unwrap(),
+            &("http://files.localhost:8700/delete".to_string(), "http://evil.localhost:8700".to_string(), "cross-site".to_string())
+        );
+        b.navigate("http://evil.localhost:8700/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(page.to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        click_page(&mut b, &mut h, "own");
+        assert_eq!(
+            h.origins.last().unwrap(),
+            &("http://evil.localhost:8700/own".to_string(), "http://evil.localhost:8700".to_string(), "same-origin".to_string())
+        );
     }
 
     #[test]

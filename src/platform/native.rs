@@ -177,7 +177,7 @@ impl Host for NativeHost {
     fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
         let proxy = self.proxy.clone();
         let url = url.to_string();
-        let request = (!request.method.is_empty() || !request.referrer.is_empty()).then(|| request.clone());
+        let request = (*request != HttpRequest::default()).then(|| request.clone());
         std::thread::spawn(move || {
             let _ = proxy.send_event(Fetched::new(id, load_full(&url, request.as_ref())));
         });
@@ -504,6 +504,12 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
                     if !referrer.is_empty() {
                         req = req.header("Referer", referrer);
                     }
+                    if !r.origin.is_empty() {
+                        req = req.header("Origin", &r.origin);
+                    }
+                    if !r.fetch_site.is_empty() {
+                        req = req.header("Sec-Fetch-Site", &r.fetch_site);
+                    }
                     req.send(&r.body[..])
                 }
                 None => {
@@ -515,6 +521,9 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
                         .header("Accept-Language", crate::net::accept_language());
                     if !referrer.is_empty() {
                         req = req.header("Referer", referrer);
+                    }
+                    if let Some(site) = request.map(|r| r.fetch_site.as_str()).filter(|s| !s.is_empty()) {
+                        req = req.header("Sec-Fetch-Site", site);
                     }
                     req.call()
                 }
@@ -601,7 +610,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
             self.pending += 1;
             let tx = self.tx.clone();
             let url = url.to_string();
-            let request = (!request.method.is_empty() || !request.referrer.is_empty()).then(|| request.clone());
+            let request = (*request != HttpRequest::default()).then(|| request.clone());
             std::thread::spawn(move || {
                 let _ = tx.send(Fetched::new(id, load_full(&url, request.as_ref())));
             });

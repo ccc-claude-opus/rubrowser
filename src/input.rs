@@ -121,6 +121,10 @@ pub struct HttpRequest {
     /// The `Referer` to send (empty: none), from the document's URL and the
     /// default referrer policy.
     pub referrer: String,
+    /// The `Origin` header (empty: none), sent with POST requests.
+    pub origin: String,
+    /// The `Sec-Fetch-Site` header (empty: none).
+    pub fetch_site: String,
 }
 
 /// What happened on a WebSocket connection (RFC 6455), reported by the

@@ -244,23 +244,60 @@ pub fn title(url: &str) -> String {
     }
 }
 
+/// The serialized origin (`scheme://host[:port]`) of an HTTP(S) URL; None
+/// for other schemes (opaque origins).
+fn http_origin(u: &str) -> Option<String> {
+    let (scheme, rest) = u.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    let host = rest.split(['/', '?', '#']).next()?;
+    // credentials are never sent
+    let host = host.rsplit_once('@').map_or(host, |(_, h)| h).to_ascii_lowercase();
+    let default = if scheme == "http" { ":80" } else { ":443" };
+    Some(format!("{scheme}://{}", host.strip_suffix(default).unwrap_or(&host)))
+}
+
+/// The `Origin` header of a request made by a document at `doc` (Fetch
+/// §3.1): its origin, or `null` for documents without an HTTP(S) origin.
+pub fn origin_header(doc: &str) -> String {
+    http_origin(doc).unwrap_or_else(|| "null".into())
+}
+
+/// Whether `url` is potentially trustworthy (Secure Contexts §3.1): HTTPS,
+/// or HTTP to the loopback (`localhost`, `*.localhost`, 127.0.0.0/8, ::1).
+fn trustworthy(url: &str) -> bool {
+    let Some(o) = http_origin(url) else { return false };
+    if o.starts_with("https:") {
+        return true;
+    }
+    let host = &o["http://".len()..];
+    let host = if host.starts_with('[') { host.split(']').next().map_or("", |h| &h[1..]) } else { host.split(':').next().unwrap_or("") };
+    host == "localhost" || host.ends_with(".localhost") || host == "::1" || host.starts_with("127.")
+}
+
+/// `Sec-Fetch-Site` (Fetch Metadata Request Headers §2.4) for a request from
+/// a document at `doc` to `target`; empty when it is not sent (the target is
+/// not potentially trustworthy). rubrowser has no Public Suffix List, so a
+/// different origin is always `cross-site`, never `same-site` (the stricter
+/// answer).
+pub fn fetch_site(doc: &str, target: &str) -> String {
+    if !trustworthy(target) {
+        return String::new();
+    }
+    match (http_origin(doc), http_origin(target)) {
+        (Some(a), Some(b)) if a == b => "same-origin".into(),
+        _ => "cross-site".into(),
+    }
+}
+
 /// The `Referer` for a request from a document at `doc` to `target`, under
 /// the default referrer policy `strict-origin-when-cross-origin` (Referrer
 /// Policy §3): the whole URL (without fragment) to the same origin, only
 /// the origin elsewhere, nothing from HTTPS to HTTP or from non-HTTP pages.
 pub fn referrer(doc: &str, target: &str) -> String {
-    let origin = |u: &str| -> Option<String> {
-        let (scheme, rest) = u.split_once("://")?;
-        let scheme = scheme.to_ascii_lowercase();
-        if scheme != "http" && scheme != "https" {
-            return None;
-        }
-        let host = rest.split(['/', '?', '#']).next()?;
-        // credentials are never sent
-        let host = host.rsplit_once('@').map_or(host, |(_, h)| h);
-        Some(format!("{scheme}://{}", host.to_ascii_lowercase()))
-    };
-    let (Some(from), Some(to)) = (origin(doc), origin(target)) else {
+    let (Some(from), Some(to)) = (http_origin(doc), http_origin(target)) else {
         return String::new();
     };
     if from.starts_with("https:") && to.starts_with("http:") {
@@ -291,6 +328,19 @@ mod tests {
         assert_eq!(referrer("https://user:pw@a.test/p", "https://a.test/q"), "https://a.test/p");
         assert_eq!(referrer("file:///tmp/x.html", "https://b.test/"), "");
         assert_eq!(referrer("about:home", "https://b.test/"), "");
+    }
+
+    #[test]
+    fn origin_and_fetch_site() {
+        use super::{fetch_site, origin_header};
+        assert_eq!(origin_header("http://notes.localhost:8700/a?b#c"), "http://notes.localhost:8700");
+        assert_eq!(origin_header("https://a.test:443/x"), "https://a.test");
+        assert_eq!(origin_header("file:///tmp/x.html"), "null");
+        assert_eq!(fetch_site("http://files.localhost:8700/", "http://files.localhost:8700/delete"), "same-origin");
+        assert_eq!(fetch_site("http://evil.localhost:8700/", "http://files.localhost:8700/delete"), "cross-site");
+        assert_eq!(fetch_site("https://evil.test/", "http://127.0.0.1:8700/x"), "cross-site");
+        assert_eq!(fetch_site("about:home", "https://a.test/"), "cross-site");
+        assert_eq!(fetch_site("http://a.test/", "http://b.test/"), "", "not potentially trustworthy: not sent");
     }
 
     use super::*;
