@@ -1,0 +1,19 @@
+# Changelog
+
+## 0.3.0
+
+- **Touch and an on-screen keyboard**: Touch Events and Pointer Events with `pointerType: "touch"`, compatibility mouse events, `touch-action`; a tap clicks, a drag scrolls with momentum, a long press opens the context menu. An on-screen keyboard (`--keyboard auto|always|never`) for text fields the user touched, with layouts for `type`/`inputmode` and an Enter key labelled from `enterkeyhint`.
+- **Origin and Sec-Fetch-Site**: POST requests carry `Origin`; requests to potentially trustworthy URLs carry `Sec-Fetch-Site` (Fetch Metadata), so servers can refuse forms posted from other sites. Without a Public Suffix List, other origins are `cross-site`.
+- **`--installer URL`**: pages that declare an app package (`<link rel="ruwebos-app">`) get an Install button.
+- **WebSocket** (`ws:`/`wss:`, text and binary messages, subprotocols), `focus()`/`blur()` and `document.activeElement`, `pointer-events: none`, ruby annotations, scroll position restored on back/forward and reload, non-ASCII URLs percent-encoded as the URL Standard says.
+- **Files**: `<input type=file>` with the native dialog, `Blob`/`File`/`FileReader`/`blob:` URLs, multipart uploads, downloads (`Content-Disposition: attachment`, `<a download>`).
+- **Text selection**, copy and a context menu; `<img>` `load`/`error` events with `complete`/`naturalWidth`/`naturalHeight`; a `Referer` on requests (`strict-origin-when-cross-origin`).
+- **Input**: keyboard shortcuts with any layout, `keyup`, `KeyboardEvent.repeat`, mouse and pointer events, `hashchange`/`popstate`.
+- **Web Audio** oscillators and gain nodes with `AudioParam` automation; media `#t=` fragments, the frame after a seek, `drawImage(video)`.
+- **Intl**: every IANA time zone (also `Date`'s local time), zh-TW, sv and en-CA dates; `table-layout: fixed`.
+- CSSOM, link URL parts, deep recursion; the `nodeValue` setter, unitless `calc()` numbers, render-blocking stylesheets (up to 3 s).
+- **Linux**: cross-build, tests on Debian 13, booting in ruvm.
+
+## 0.2.0
+
+The first release on crates.io.

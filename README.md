@@ -144,6 +144,8 @@ Also: gradients, box and text shadows, `filter`, `clip-path` shapes, 2D transfor
 
 Not supported yet: IME, cross-origin requests from scripts, scripts inside iframes, WebGL, canvas shadows and filters.
 
+What changed in each version: [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
 MIT. The bundled DejaVu fonts are under the Bitstream Vera license.
