@@ -98,6 +98,8 @@ pub struct Selector {
     parts: Vec<(Compound, Option<Combinator>)>,
     pub pseudo_element: Option<PseudoElement>,
     pub specificity: [u16; 3],
+    /// The selector as written (for the developer tools).
+    pub text: std::rc::Rc<str>,
 }
 
 impl Selector {
@@ -510,6 +512,7 @@ impl<'a> Parser<'a> {
             parts,
             pseudo_element: element,
             specificity,
+            text: "".into(),
         })
     }
 }
@@ -606,7 +609,11 @@ pub fn parse_list(src: &str) -> Option<Vec<Selector>> {
     };
     let mut out = Vec::new();
     loop {
-        out.push(p.complex()?);
+        p.ws();
+        let start = p.i;
+        let mut sel = p.complex()?;
+        sel.text = src.get(start..p.i).unwrap_or("").trim().into();
+        out.push(sel);
         p.ws();
         if !p.eat(b',') {
             break;
@@ -976,12 +983,14 @@ impl Selector {
                     .collect(),
                 pseudo_element: None,
                 specificity: [0; 3],
+                text: "".into(),
             });
             out.push(DynPart {
                 context: Selector {
                     parts: context,
                     pseudo_element: None,
                     specificity: [0; 3],
+                    text: "".into(),
                 },
                 subject,
                 scope,

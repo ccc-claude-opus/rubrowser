@@ -726,6 +726,24 @@ impl Document {
         ))
     }
 
+    /// The style rules that apply to element `n`, the winning ones first
+    /// (the developer tools' Styles pane).
+    pub fn matched_rules(&self, n: NodeId) -> Vec<crate::css::MatchedRule> {
+        let Some((_, _, cascade)) = self.cascade.as_ref() else {
+            return Vec::new();
+        };
+        let forms = &self.forms;
+        let dom = &self.dom;
+        let checked = |n: NodeId| forms.checked(dom, n);
+        let cx = Matcher {
+            dom,
+            state: self.state,
+            checked: &checked,
+            containers: &self.containers,
+        };
+        cascade.matched_rules(&cx, n)
+    }
+
     /// Whether media query list `query` matches the viewport (`matchMedia`).
     pub fn media_matches(&self, query: &str) -> bool {
         let env = MediaEnv {
@@ -1881,6 +1899,18 @@ impl Document {
 
     /// Scrolls the innermost scroller under `(x, y)` that can move by `dy`.
     /// Returns true if something scrolled.
+    /// The scroll position of scroll container `n`.
+    pub fn element_scroll(&self, n: NodeId) -> f32 {
+        self.scroll_of(Some(n))
+    }
+
+    /// Scrolls container `n` to `y` (clamped to its range after the next
+    /// layout).
+    pub fn scroll_element_to(&mut self, n: NodeId, y: f32) {
+        self.scroll.insert(Some(n), y.max(0.0));
+        self.needs_layout = true;
+    }
+
     pub fn scroll_by(&mut self, x: f32, y: f32, dy: f32) -> bool {
         self.fragment = None;
         self.restore = None;

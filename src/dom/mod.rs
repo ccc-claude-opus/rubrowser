@@ -8,7 +8,7 @@ mod parse;
 pub use parse::{parse_html, parse_html_fragment};
 
 /// Elements that never have children or an end tag.
-const VOID: &[&str] = &[
+pub(crate) const VOID: &[&str] = &[
     "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "source", "track",
     "wbr",
 ];
@@ -306,6 +306,16 @@ impl Dom {
             .into_iter()
             .filter_map(|n| self.text(n))
             .collect()
+    }
+
+    /// Replaces the text of text (or comment) node `id`.
+    pub fn set_text(&mut self, id: NodeId, text: &str) {
+        if let Some(n) = self.nodes.get_mut(id)
+            && let NodeData::Text(t) | NodeData::Comment(t) = &mut n.data
+        {
+            *t = text.to_string();
+            self.version += 1;
+        }
     }
 
     /// Replaces all children of `id` with one text node.

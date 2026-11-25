@@ -236,7 +236,40 @@ pub struct Cascade {
     pub keyframes: HashMap<String, Rc<[animation::Keyframe]>>,
 }
 
+/// A style rule that applies to an element (for the developer tools).
+pub struct MatchedRule {
+    pub selector: Rc<str>,
+    pub decls: Rc<[Decl]>,
+    /// Whether it comes from the browser's own (user agent) style sheet.
+    pub user_agent: bool,
+}
+
 impl Cascade {
+    /// The rules that apply to element `n` (not its pseudo-elements), the
+    /// winning ones first.
+    pub fn matched_rules(&self, cx: &Matcher, n: NodeId) -> Vec<MatchedRule> {
+        let mut candidates = Vec::new();
+        self.candidates(cx.dom, n, &mut candidates);
+        let mut found: Vec<&Indexed> = candidates
+            .iter()
+            .map(|&i| &self.rules[i as usize])
+            .filter(|r| {
+                r.selector.pseudo_element.is_none()
+                    && selector::matches(cx, &r.selector, n)
+                    && r.containers.iter().all(|q| q.matches(cx, n))
+            })
+            .collect();
+        found.sort_by_key(|r| std::cmp::Reverse((r.origin, r.layer, r.selector.specificity, r.order)));
+        found
+            .into_iter()
+            .map(|r| MatchedRule {
+                selector: r.selector.text.clone(),
+                decls: r.decls.clone(),
+                user_agent: r.origin == 0,
+            })
+            .collect()
+    }
+
     /// Indexes the UA sheet and `author` sheets (in order, with the media
     /// list they were included with) for `env`.
     pub fn new(author: &[(Rc<Sheet>, MediaList)], env: &MediaEnv) -> Cascade {

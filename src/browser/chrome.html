@@ -211,6 +211,131 @@
     overflow: hidden;
     white-space: nowrap;
   }
+
+  /* Developer tools, docked below the page (src/browser/devtools.rs). */
+  #devtools {
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    height: 300px;
+    background: #202124;
+    color: #e3e3e3;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  #devtools[hidden] { display: none; }
+  #dt-resize { height: 5px; flex-shrink: 0; background: #3c3f45; cursor: row-resize; }
+  #dt-bar {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    height: 28px;
+    flex-shrink: 0;
+    padding: 0 6px;
+    background: #2b2d31;
+    border-bottom: 1px solid #3c3f45;
+    font-family: sans-serif;
+  }
+  #dt-bar button {
+    width: auto;
+    height: 24px;
+    padding: 0 10px;
+    border-radius: 4px;
+    font-size: 12px;
+    color: #c4c7c5;
+  }
+  #dt-bar button.on { color: #8ab4f8; background: #35373c; }
+  #dt-bar .fill { flex: 1; }
+  .dt-panel { display: none; flex: 1; min-height: 0; }
+  #devtools.elements #dt-elements { display: flex; }
+  #devtools.console #dt-console { display: flex; flex-direction: column; }
+  #devtools.network #dt-network { display: flex; }
+  #devtools.console #dt-filters { display: flex; }
+  #dt-filters { display: none; gap: 2px; }
+
+  #dt-tree { flex: 1; min-width: 0; overflow: auto; padding: 4px 0; }
+  .dt-row { white-space: pre; padding-right: 8px; line-height: 18px; }
+  .dt-row:hover { background: #2f3238; }
+  .dt-row.sel { background: #394457; }
+  .dt-tw { display: inline-block; width: 12px; color: #9aa0a6; }
+  .dt-tag { color: #5db0d7; }
+  .dt-an { color: #9bbbdc; }
+  .dt-av { color: #f29766; }
+  .dt-text { color: #e3e3e3; }
+  .dt-comment { color: #898989; }
+  #dt-side {
+    display: flex;
+    flex-direction: column;
+    width: 38%;
+    flex-shrink: 0;
+    border-left: 1px solid #3c3f45;
+  }
+  #dt-side-content { flex: 1; min-height: 0; overflow: auto; padding: 4px 8px; }
+  .dt-h { margin: 8px 0 3px; color: #9aa0a6; font-family: sans-serif; font-weight: bold; }
+  .dt-kv { white-space: pre-wrap; line-height: 17px; }
+  .dt-rule { margin-bottom: 6px; }
+  .dt-sel { color: #e3e3e3; }
+  .dt-src { color: #9aa0a6; }
+  .dt-boxm { margin: 4px 0; padding: 6px; background: #f6b26b; color: #202124; text-align: center; }
+  .dt-boxm div { margin: 2px 8px 0; padding: 6px; text-align: center; }
+  .dt-boxm .b { background: #ffe599; }
+  .dt-boxm .p { background: #93c47d; }
+  .dt-boxm .c { background: #6fa8dc; }
+  .dt-input {
+    width: 100%;
+    height: 24px;
+    flex-shrink: 0;
+    box-sizing: border-box;
+    padding: 0 8px;
+    border: none;
+    border-top: 1px solid #3c3f45;
+    background: #202124;
+    color: #e3e3e3;
+    font-family: monospace;
+    font-size: 12px;
+  }
+
+  #dt-log { flex: 1; min-height: 0; overflow: auto; }
+  .dt-msg {
+    padding: 2px 8px;
+    border-bottom: 1px solid #2f3134;
+    white-space: pre-wrap;
+    line-height: 17px;
+  }
+  .dt-msg.warn { background: #413c26; color: #f2d28e; }
+  .dt-msg.error { background: #4e3534; color: #f9a9a3; }
+  .dt-msg.cmd { color: #8ab4f8; }
+  .dt-msg.result { color: #c4c7c5; }
+  .dt-count {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 0 5px;
+    border-radius: 7px;
+    background: #5f6368;
+    color: #ffffff;
+  }
+
+  #dt-requests { flex: 1; min-width: 0; overflow: auto; }
+  #dt-detail {
+    display: none;
+    width: 50%;
+    flex-shrink: 0;
+    overflow: auto;
+    padding: 4px 8px;
+    border-left: 1px solid #3c3f45;
+  }
+  #dt-detail.show { display: block; }
+  .dt-req { display: flex; gap: 8px; padding: 1px 8px; line-height: 18px; white-space: pre; }
+  .dt-req:hover { background: #2f3238; }
+  .dt-req.sel { background: #394457; }
+  .dt-req.fail { color: #f28b82; }
+  .dt-req.head { color: #9aa0a6; font-family: sans-serif; border-bottom: 1px solid #3c3f45; }
+  .dt-req .name { flex: 1; min-width: 0; overflow: hidden; }
+  .dt-req .st { width: 44px; flex-shrink: 0; }
+  .dt-req .ty { width: 70px; flex-shrink: 0; overflow: hidden; }
+  .dt-req .sz { width: 64px; flex-shrink: 0; text-align: right; }
+  .dt-req .tm { width: 56px; flex-shrink: 0; text-align: right; }
+  .dt-body { white-space: pre-wrap; padding: 4px; background: #2b2d31; }
 </style>
 </head>
 <body>
@@ -226,6 +351,34 @@
     <button id="install" data-action="install" hidden>安裝</button>
   </div>
   <div id="viewport"></div>
+  <div id="devtools" class="elements" hidden>
+    <div id="dt-resize" data-dt="resize"></div>
+    <div id="dt-bar">
+      <button id="dt-inspect" data-dt="inspect" title="Select an element in the page">&#x2b1a;</button>
+      <button id="dt-tab-elements" data-dt="panel:elements">Elements</button>
+      <button id="dt-tab-console" data-dt="panel:console">Console</button>
+      <button id="dt-tab-network" data-dt="panel:network">Network</button>
+      <span id="dt-filters"><button id="dt-f-all" data-dt="filter:all">All</button><button id="dt-f-warn" data-dt="filter:warn">Warnings</button><button id="dt-f-error" data-dt="filter:error">Errors</button></span>
+      <span class="fill"></span>
+      <button id="dt-clear" data-dt="clear" title="Clear">&#x2298;</button>
+      <button id="dt-close" data-dt="close" title="Close">&#x2715;</button>
+    </div>
+    <div id="dt-elements" class="dt-panel">
+      <div id="dt-tree"></div>
+      <div id="dt-side">
+        <div id="dt-side-content"></div>
+        <input id="dt-edit" class="dt-input" placeholder="name=value: set an attribute (-name removes)">
+      </div>
+    </div>
+    <div id="dt-console" class="dt-panel">
+      <div id="dt-log"></div>
+      <input id="dt-input" class="dt-input" placeholder="&#x203a; JavaScript">
+    </div>
+    <div id="dt-network" class="dt-panel">
+      <div id="dt-requests"></div>
+      <div id="dt-detail"></div>
+    </div>
+  </div>
   <div id="osk" hidden></div>
   <div id="download"><span id="download-text"></span><button id="download-close" data-action="close-download">&#x2715;</button></div>
   <div id="status"></div>

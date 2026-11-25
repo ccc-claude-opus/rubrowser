@@ -798,6 +798,34 @@
   }
   global.__rb_report = reportError;
 
+  // The developer tools' console: evaluates `src` as a global script and
+  // logs the result (or the exception) for the browser, which shows it.
+  function inspectValue(v) {
+    if (typeof v === 'string') return JSON.stringify(v);
+    if (v === undefined || v === null || typeof v === 'number' || typeof v === 'boolean' || typeof v === 'bigint' || typeof v === 'symbol') return String(v);
+    if (typeof v === 'function') return 'ƒ ' + (v.name || 'anonymous') + '()';
+    if (v instanceof Promise) return 'Promise {…}';
+    if (v instanceof Node && v.nodeType === 1) {
+      const id = v.id ? '#' + v.id : '';
+      const cls = v.className && typeof v.className === 'string' ? '.' + v.className.trim().split(/\s+/).join('.') : '';
+      return '<' + v.localName + '> ' + v.localName + id + cls;
+    }
+    return format([v]);
+  }
+  global.__rb_devtools_eval = function (src) {
+    let v;
+    try {
+      v = (0, eval)(src);
+    } catch (e) {
+      const head = e instanceof Error ? e.name + ': ' + e.message : inspectValue(e);
+      rb.log('\u0001devtools-error Uncaught ' + head);
+      return;
+    }
+    // Shown in the console as `$_`, as in other browsers.
+    global.$_ = v;
+    rb.log('\u0001devtools-result ' + inspectValue(v));
+  };
+
   const console = {
     log: (...a) => rb.log(format(a)),
     info: (...a) => rb.log(format(a)),

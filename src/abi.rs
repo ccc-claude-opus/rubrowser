@@ -57,6 +57,7 @@ pub mod key {
     pub const DOWN: i32 = 40;
     pub const DELETE: i32 = 46;
     pub const F5: i32 = 116;
+    pub const F12: i32 = 123;
     pub const LEFT_BRACKET: i32 = 219;
     pub const RIGHT_BRACKET: i32 = 221;
     /// Other printable characters: `CHAR_BASE + Unicode scalar value`.
@@ -82,6 +83,7 @@ pub fn key_name(code: i32, shift: bool) -> String {
         key::DOWN => "ArrowDown",
         key::DELETE => "Delete",
         key::F5 => "F5",
+        key::F12 => "F12",
         key::LEFT_BRACKET => "[",
         key::RIGHT_BRACKET => "]",
         c if c >= key::CHAR_BASE => {

@@ -578,6 +578,9 @@ pub struct Shot {
     pub installer: Option<String>,
     /// When the on-screen keyboard comes up.
     pub keyboard: KeyboardMode,
+    /// Open the developer tools at this panel (`elements`, `console`,
+    /// `network`), with `elements:SELECTOR` selecting an element.
+    pub devtools: Option<String>,
 }
 
 /// Loads `url` without a window, waits for its resources, and writes the
@@ -693,8 +696,16 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
     };
     pump(&mut browser, &mut host);
     browser.render(now(&start), &mut host);
+    if let Some(d) = &shot.devtools {
+        let (panel, selector) = d.split_once(':').unwrap_or((d, ""));
+        browser.open_devtools(panel);
+        if !selector.is_empty() && !browser.inspect_selector(selector) {
+            eprintln!("rubrowser: --devtools: no element matches {selector}");
+        }
+        browser.render(now(&start), &mut host);
+    }
     // A debugging aid: input to play before the screenshot, e.g.
-    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; type 文字; js console.log(1); wait 500"
+    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; type 文字; js console.log(1); console 1 + 1; wait 500"
     // (window logical px; keys are letters or escape/enter/tab/left/right/up/down).
     if let Ok(script) = std::env::var("RUBROWSER_INPUT") {
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -725,6 +736,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                         "right" => key::RIGHT,
                         "up" => key::UP,
                         "down" => key::DOWN,
+                        "f12" => key::F12,
                         "[" => key::LEFT_BRACKET,
                         "]" => key::RIGHT_BRACKET,
                         k => k.chars().next().map_or(0, |c| c.to_ascii_uppercase() as i32),
@@ -768,6 +780,8 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                     browser.event(Event::Touch { id: 1, x: x1, y: y1, phase: TouchPhase::End }, now(&start), &mut host);
                 }
                 "js" => browser.run_script(&step[2..], &mut host),
+                // the developer tools' console line
+                "console" => browser.devtools_eval(&step[7..], &mut host),
                 other => eprintln!("rubrowser: RUBROWSER_INPUT: unknown step {other}"),
             }
             pump(&mut browser, &mut host);
@@ -1075,6 +1089,7 @@ fn key_code(k: &Key) -> i32 {
             NamedKey::ArrowDown => key::DOWN,
             NamedKey::Delete => key::DELETE,
             NamedKey::F5 => key::F5,
+            NamedKey::F12 => key::F12,
             _ => 0,
         },
         Key::Character(s) => {

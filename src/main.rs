@@ -1,9 +1,10 @@
 use std::time::Duration;
 
 const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [--keyboard auto|always|never] [URL]
-       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] [--keyboard MODE] URL
+       rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] [--keyboard MODE] [--devtools PANEL] URL
   --installer URL  an app installer (ruwebos's): pages declaring <link rel=\"ruwebos-app\"> get an Install button
-  --keyboard MODE  the on-screen keyboard for text fields: auto (after a touch; default), always, never";
+  --keyboard MODE  the on-screen keyboard for text fields: auto (after a touch; default), always, never
+  --devtools PANEL open the developer tools at elements, console or network (elements:SELECTOR selects an element)";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -17,6 +18,7 @@ fn main() {
         javascript: true,
         installer: None,
         keyboard: rubrowser::browser::KeyboardMode::Auto,
+        devtools: None,
     };
     while let Some(a) = args.next() {
         let mut value = |name: &str| {
@@ -35,6 +37,7 @@ fn main() {
                 shot.timeout = Duration::from_secs(secs);
             }
             "--no-js" => shot.javascript = false,
+            "--devtools" => shot.devtools = Some(value("--devtools")),
             "--installer" => shot.installer = Some(value("--installer")),
             "--keyboard" => {
                 let v = value("--keyboard");

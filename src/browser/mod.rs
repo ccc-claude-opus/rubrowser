@@ -5,6 +5,7 @@
 //! `data-action` attribute run browser commands, and the tab strip and
 //! address bar are kept in sync by editing the chrome DOM.
 
+mod devtools;
 mod osk;
 mod touch;
 
@@ -80,6 +81,8 @@ struct Press {
 struct MenuCtx {
     link: Option<String>,
     image: Option<String>,
+    /// The page element it was opened on (for "Inspect").
+    node: Option<NodeId>,
     /// The text field it was opened on.
     field: Option<(Target, NodeId)>,
 }
@@ -571,6 +574,8 @@ struct Tab {
     link_events: Vec<(NodeId, &'static str)>,
     /// Scripts inserted by scripts are queued: run them on the next update.
     kick: bool,
+    /// The developer tools' console, network log and DOM tree state.
+    dev: devtools::TabDev,
     /// The page's own stylesheets (`<link rel=stylesheet>` in the parsed
     /// document) still loading, and since when: they are render-blocking
     /// (HTML), so the page is not shown unstyled meanwhile.
@@ -660,6 +665,8 @@ pub struct Browser {
     local: Vec<(u32, Result<Vec<u8>, String>)>,
     /// Last page click (element, time), to detect double clicks.
     last_click: Option<(NodeId, f64)>,
+    /// The developer tools panel (see `devtools.rs`).
+    devtools: devtools::DevTools,
     /// The last page mouse press (point and time), for double-clicking a word.
     last_down: Option<(f32, f32, f64)>,
     /// Where the pointer was when page mouse events last went out.
@@ -715,6 +722,7 @@ impl Browser {
             shown_tabs: Vec::new(),
             local: Vec::new(),
             last_click: None,
+            devtools: Default::default(),
             last_down: None,
             last_move: (-1.0, -1.0),
             key_repeat: false,
@@ -769,6 +777,7 @@ impl Browser {
             known: Default::default(),
             link_events: Vec::new(),
             kick: false,
+            dev: Default::default(),
             blocking: (std::collections::HashSet::new(), 0.0),
         });
         self.active = self.tabs.len() - 1;
@@ -924,6 +933,7 @@ impl Browser {
                 let id = self.next_id;
                 self.next_id += 1;
                 self.requests.insert(id, req);
+                self.net_begin(id, &url, Some(&p), host);
                 host.fetch_with(id, &url, &p);
             }
             _ => self.fetch(req, &url, host),
@@ -936,6 +946,7 @@ impl Browser {
         let id = self.next_id;
         self.next_id += 1;
         self.requests.insert(id, req);
+        self.net_begin(id, url, None, host);
         if let Some(name) = url.strip_prefix("about:") {
             let result = builtin(name)
                 .map(<[u8]>::to_vec)
@@ -1588,6 +1599,7 @@ impl Browser {
     /// Called by the platform when fetch `id` completes.
     pub fn fetch_done(&mut self, id: u32, result: Result<Vec<u8>, String>, host: &mut dyn Host) {
         let info = self.responses.remove(&id);
+        self.net_end(id, &result, info.as_ref(), host);
         let Some(req) = self.requests.remove(&id) else {
             return;
         };
@@ -1775,7 +1787,7 @@ impl Browser {
                 let (status, body) = match result {
                     Ok(b) => (info.as_ref().map_or(200, |r| r.status as i32), b),
                     Err(e) => {
-                        host.log(&e);
+                        self.console_message(i, &format!("error: {e}"), host);
                         (0, Vec::new())
                     }
                 };
@@ -1917,7 +1929,7 @@ impl Browser {
         };
         let out = script.take_output();
         for msg in &out.logs {
-            host.log(msg);
+            self.console_message(i, msg, host);
         }
         let tab = &mut self.tabs[i];
         tab.timers
@@ -1952,6 +1964,7 @@ impl Browser {
                 let fid = self.next_id;
                 self.next_id += 1;
                 self.requests.insert(fid, req);
+                self.net_begin(fid, &target, None, host);
                 self.local.push((
                     fid,
                     Err(format!("cross-origin request to {target} blocked")),
@@ -1971,6 +1984,7 @@ impl Browser {
                 origin,
                 fetch_site: url::fetch_site(doc, &target),
             };
+            self.net_begin(fid, &target, Some(&request), host);
             host.fetch_with(fid, &target, &request);
         }
         for call in out.ws {
@@ -2081,10 +2095,11 @@ impl Browser {
         } else if let Some(Some(script)) = self.tabs[i].scripts.get_mut(si) {
             // What it logged before failing (a panic's message).
             for msg in script.take_output().logs {
-                host.log(&msg);
+                self.console_message(i, &msg, host);
             }
         }
-        host.log(&format!("script error in {}: {err}", self.tabs[i].doc.url));
+        let msg = format!("script error in {}: {err}", self.tabs[i].doc.url);
+        self.console_message(i, &msg, host);
         if survives {
             return;
         }
@@ -2411,6 +2426,9 @@ impl Browser {
 
     fn mouse_move(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         self.pointer = (x, y);
+        if self.devtools_pointer_move(x, y) {
+            return;
+        }
         if self.menu.is_some() {
             // Hover inside the menu (it is part of the chrome, above the page).
             let hover = self.chrome.hit_test(x, y).element;
@@ -2587,6 +2605,9 @@ impl Browser {
             }
             return;
         }
+        if self.devtools_pointer_down(x, y) {
+            return;
+        }
         let (t, lx, ly) = self.target_at(x, y);
         // The on-screen keyboard's keys type into the focused field (focus stays).
         if t == Target::Chrome
@@ -2743,6 +2764,9 @@ impl Browser {
 
     fn mouse_up(&mut self, x: f32, y: f32, host: &mut dyn Host) {
         self.pointer = (x, y);
+        if self.devtools_pointer_up() {
+            return;
+        }
         let Some(press) = self.press.take() else {
             return;
         };
@@ -2788,6 +2812,10 @@ impl Browser {
                 let dom = &self.chrome.dom;
                 let mut n = Some(node);
                 while let Some(id) = n {
+                    if let Some(cmd) = dom.attr(id, "data-dt") {
+                        let cmd = cmd.to_string();
+                        return self.devtools_command(&cmd);
+                    }
                     let tab = dom
                         .attr(id, "data-tab")
                         .and_then(|v| v.parse::<usize>().ok());
@@ -3184,6 +3212,7 @@ impl Browser {
             {
                 return;
             }
+            ctx.node = hit.element;
             let doc = &self.tabs[self.active].doc;
             let base = doc.base_url();
             let mut n = hit.element;
@@ -3251,6 +3280,9 @@ impl Browser {
             ("下一頁", "forward", tab.index + 1 < tab.history.len(), k("Alt+→", "⌘]")),
             ("重新載入", "reload", true, k("Ctrl+R", "⌘R")),
         ]);
+        if ctx.node.is_some() {
+            items.extend([("", "", false, ""), ("檢查", "ctx-inspect", true, k("Ctrl+Shift+C", "⌥⌘I"))]);
+        }
         let esc = |v: &str| v.replace('&', "&amp;").replace('<', "&lt;");
         let mut html = String::new();
         for (label, action, on, keys) in &items {
@@ -3321,6 +3353,11 @@ impl Browser {
     fn menu_command(&mut self, action: &str, ctx: MenuCtx, host: &mut dyn Host) {
         let page_selection = |b: &Self| b.tabs[b.active].doc.selected_text();
         match action {
+            "ctx-inspect" => {
+                if let Some(n) = ctx.node {
+                    self.inspect(n);
+                }
+            }
             "ctx-open-link" => {
                 if let Some(u) = ctx.link {
                     self.navigate(&u, host);
@@ -3412,6 +3449,22 @@ impl Browser {
                 key::ESCAPE if doc.selection.is_some() => doc.set_selection(None),
                 _ => {}
             }
+        }
+        // Developer tools: F12, Cmd+Opt+I / Ctrl+Shift+I; Cmd/Ctrl+Shift+C
+        // picks an element.
+        let devtools_key = code == key::F12
+            || (code == 'I' as i32 && ((mods.meta && mods.alt) || (mods.ctrl && mods.shift)));
+        if devtools_key {
+            return self.toggle_devtools();
+        }
+        if code == 'C' as i32 && cmd && mods.shift {
+            if !self.devtools.open {
+                self.open_devtools("elements");
+            }
+            return self.devtools_command("inspect");
+        }
+        if self.devtools.open && self.devtools_key(code) {
+            return;
         }
         match code {
             c if cmd && c == 'L' as i32 => return self.focus_address(true),
@@ -3541,6 +3594,9 @@ impl Browser {
     }
 
     fn input_action(&mut self, t: Target, n: NodeId, action: Action, host: &mut dyn Host) {
+        if t == Target::Chrome && matches!(action, Action::Submit) && self.devtools_submit(n, host) {
+            return;
+        }
         let is_address = t == Target::Chrome && Some(n) == self.chrome_el("address");
         match action {
             Action::Submit if is_address => {
@@ -3612,6 +3668,7 @@ impl Browser {
         if self.dirty {
             self.sync_chrome(host);
         }
+        self.sync_devtools();
         let (w, h) = self.logical_size();
         self.chrome.set_viewport(w, h);
         self.chrome.update(&self.fonts);
@@ -3841,6 +3898,7 @@ impl Browser {
                 .doc
                 .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
         }
+        self.paint_devtools_overlay();
         // The status bubble and the context menu are part of the chrome but
         // sit above the page.
         // (repainted exactly: around them the chrome would paint its
@@ -6764,5 +6822,262 @@ mod tests {
         assert_eq!(h.saved.last().unwrap().0, "page.html");
         assert_eq!(b.tabs[b.active].url(), "https://files.test/");
         assert!(b.download_notice().contains("/downloads/page.html"));
+    }
+
+    // ----- developer tools -------------------------------------------------
+
+    /// The text of chrome element `id`.
+    fn chrome_text(b: &Browser, id: &str) -> String {
+        b.chrome.dom.text_content(b.chrome_el(id).unwrap())
+    }
+
+    /// Clicks the chrome element with `data-dt` = `cmd`.
+    fn click_dt(b: &mut Browser, h: &mut TestHost, cmd: &str) {
+        b.render(0.0, h);
+        let n = b
+            .chrome
+            .dom
+            .descendants(crate::dom::Dom::ROOT)
+            .into_iter()
+            .find(|&n| b.chrome.dom.attr(n, "data-dt") == Some(cmd))
+            .unwrap_or_else(|| panic!("no control {cmd}"));
+        let r = b.chrome.box_rects(n).unwrap().0;
+        click_at(b, h, r);
+        b.render(0.0, h);
+    }
+
+    #[test]
+    fn devtools_open_with_f12_and_dock_below_the_page() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://dt.test/", "<p>x</p>");
+        let full = b.viewport_rect();
+        press(&mut b, &mut h, key::F12, Modifiers::default());
+        b.render(0.0, &mut h);
+        assert!(b.devtools_open());
+        let vp = b.viewport_rect();
+        let panel = chrome_rect(&b, "devtools");
+        assert!(vp.h < full.h - 250.0, "the page gets shorter: {vp:?}");
+        assert!(panel.y >= vp.y + vp.h - 1.0, "the panel is below the page");
+        // Cmd+Opt+I closes it again; Ctrl+Shift+I opens it.
+        let mods = Modifiers { meta: true, alt: true, ..Default::default() };
+        press(&mut b, &mut h, 'I' as i32, mods);
+        b.render(0.0, &mut h);
+        assert!(!b.devtools_open());
+        assert_eq!(b.viewport_rect().h, full.h);
+        let mods = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        press(&mut b, &mut h, 'I' as i32, mods);
+        assert!(b.devtools_open());
+        // Dragging the top edge resizes it.
+        b.render(0.0, &mut h);
+        let edge = chrome_rect(&b, "dt-resize");
+        let (x, y) = ((edge.x + 50.0) as i32, (edge.y + 2.0) as i32);
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseMove { x, y: y - 100 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y: y - 100, button: 0 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.devtools.height, 400.0);
+        click_dt(&mut b, &mut h, "close");
+        assert!(!b.devtools_open());
+    }
+
+    #[test]
+    fn devtools_console_shows_logs_and_runs_code() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<p>x</p><script>console.log('hi', 1); console.log('hi', 1); console.warn('careful'); \
+             console.error('bad'); nope();</script>",
+        );
+        b.open_devtools("console");
+        b.render(0.0, &mut h);
+        let log = chrome_text(&b, "dt-log");
+        assert!(log.contains("2hi 1"), "repeated messages are counted: {log}");
+        assert!(log.contains("careful") && log.contains("bad"), "{log}");
+        assert!(log.contains("Uncaught ReferenceError"), "{log}");
+        let classes: Vec<String> = b
+            .chrome
+            .dom
+            .children(b.chrome_el("dt-log").unwrap())
+            .iter()
+            .map(|&n| b.chrome.dom.attr(n, "class").unwrap_or("").to_string())
+            .collect();
+        assert!(classes.contains(&"dt-msg warn".to_string()), "{classes:?}");
+        assert!(classes.contains(&"dt-msg error".to_string()), "{classes:?}");
+        // Typing code and Enter runs it in the page.
+        let r = chrome_rect(&b, "dt-input");
+        click_at(&mut b, &mut h, r);
+        type_text(&mut b, &mut h, "document.querySelector('p').textContent + 1");
+        press(&mut b, &mut h, key::ENTER, Modifiers::default());
+        b.render(0.0, &mut h);
+        let log = chrome_text(&b, "dt-log");
+        assert!(log.contains("› document.querySelector('p').textContent + 1"), "{log}");
+        assert!(log.contains("← \"x1\""), "{log}");
+        assert_eq!(b.chrome.input_value(b.chrome_el("dt-input").unwrap()), "");
+        // The page's state changes and errors are shown.
+        b.devtools_eval("document.title = 'changed'; undefinedThing", &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.title().as_deref(), Some("changed"));
+        assert!(chrome_text(&b, "dt-log").contains("Uncaught ReferenceError: undefinedThing"));
+        // Up recalls earlier input.
+        press(&mut b, &mut h, key::UP, Modifiers::default());
+        press(&mut b, &mut h, key::UP, Modifiers::default());
+        assert_eq!(
+            b.chrome.input_value(b.chrome_el("dt-input").unwrap()),
+            "document.querySelector('p').textContent + 1"
+        );
+        // Filters, then clearing.
+        click_dt(&mut b, &mut h, "filter:warn");
+        assert_eq!(chrome_text(&b, "dt-log"), "careful");
+        click_dt(&mut b, &mut h, "filter:all");
+        click_dt(&mut b, &mut h, "clear");
+        assert_eq!(chrome_text(&b, "dt-log"), "");
+        // A new page starts a new log.
+        b.devtools_eval("1", &mut h);
+        load(&mut b, &mut h, "https://dt.test/next", "<script>console.log('next page')</script>");
+        b.render(0.0, &mut h);
+        assert_eq!(chrome_text(&b, "dt-log"), "next page");
+    }
+
+    #[test]
+    fn devtools_elements_tree_styles_and_edits() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<style>.card { padding: 10px; color: rgb(1, 2, 3) } #x .card { margin: 4px }</style>\
+             <div id=x><div class=card style='border: 2px solid red'>Card text</div><ul><li>a</li></ul></div>",
+        );
+        assert!(b.inspect_selector(".card"));
+        b.render(0.0, &mut h);
+        let card = page_el(&b, "x");
+        let card = b.tabs[b.active].doc.dom.children(card)[0];
+        assert_eq!(b.tabs[b.active].dev.selected, Some(card));
+        let tree = chrome_text(&b, "dt-tree");
+        assert!(tree.contains("<div class=\"card\" style=\"border: 2px solid red\">Card text</div>"), "{tree}");
+        assert!(tree.contains("<ul>…</ul>"), "collapsed: {tree}");
+        let side = chrome_text(&b, "dt-side-content");
+        assert!(side.contains("div.card"), "{side}");
+        assert!(side.contains("element.style"), "{side}");
+        let at = |s: &str| side.find(s).unwrap_or_else(|| panic!("{s} in {side}"));
+        assert!(at("#x .card") < at(".card {"), "the more specific rule first: {side}");
+        assert!(side.contains("color: rgb(1, 2, 3)"), "computed: {side}");
+        assert!(side.contains("padding 10 10 10 10"), "box model: {side}");
+        // Expanding a node shows its children.
+        let ul = b.tabs[b.active].doc.dom.find_tag(crate::dom::Dom::ROOT, "ul").unwrap();
+        click_dt(&mut b, &mut h, &format!("toggle:{ul}"));
+        assert!(chrome_text(&b, "dt-tree").contains("<li>a</li>"));
+        // Editing attributes and text.
+        b.devtools_edit("title=\"hello\"");
+        b.devtools_edit("-style");
+        let doc = &b.tabs[b.active].doc;
+        assert_eq!(doc.dom.attr(card, "title"), Some("hello"));
+        assert_eq!(doc.dom.attr(card, "style"), None);
+        let text = doc.dom.children(card)[0];
+        // (a lone text child shares its element's row: select it directly)
+        b.devtools_command(&format!("select:{text}"));
+        b.render(0.0, &mut h);
+        let r = chrome_rect(&b, "dt-edit");
+        click_at(&mut b, &mut h, r);
+        type_text(&mut b, &mut h, "New text");
+        press(&mut b, &mut h, key::ENTER, Modifiers::default());
+        assert_eq!(b.tabs[b.active].doc.dom.text_content(card), "New text");
+        // The page changed by script: the tree follows (after a moment).
+        b.run_script("document.getElementById('x').append(document.createElement('section'))", &mut h);
+        b.render(1000.0, &mut h);
+        assert!(chrome_text(&b, "dt-tree").contains("<section></section>"));
+    }
+
+    #[test]
+    fn devtools_inspect_mode_picks_a_page_element() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<p id=a style='height:40px'>first</p><p id=b style='height:40px' onclick=\"document.title='clicked'\">second</p>",
+        );
+        let mods = Modifiers { ctrl: true, shift: true, ..Default::default() };
+        press(&mut b, &mut h, 'C' as i32, mods);
+        b.render(0.0, &mut h);
+        assert!(b.devtools.inspecting);
+        let (x, y) = text_at(&b, "second", 1);
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        assert_eq!(b.devtools.hover, Some(page_el(&b, "b")), "outlined under the pointer");
+        // The outline is drawn over the page.
+        let before = {
+            b.devtools.inspecting = false;
+            b.devtools.hover = None;
+            b.render(0.0, &mut h).pixels().to_vec()
+        };
+        b.devtools.inspecting = true;
+        b.event(Event::MouseMove { x, y }, 0.0, &mut h);
+        let after = b.render(0.0, &mut h).pixels().to_vec();
+        assert_ne!(before, after, "the overlay changes the page's pixels");
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert!(!b.devtools.inspecting);
+        assert_eq!(b.tabs[b.active].dev.selected, Some(page_el(&b, "b")));
+        assert_ne!(b.tabs[b.active].doc.title().as_deref(), Some("clicked"), "the page did not get the click");
+        assert_eq!(b.devtools.panel, devtools::Panel::Elements);
+        // The context menu's "Inspect" selects the element under it.
+        let (x, y) = text_at(&b, "first", 1);
+        b.event(Event::MouseDown { x, y, button: 2 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        let menu = b.chrome_el("menu").unwrap();
+        let item = b
+            .chrome
+            .dom
+            .descendants(menu)
+            .into_iter()
+            .find(|&n| b.chrome.dom.attr(n, "data-menu") == Some("ctx-inspect"))
+            .unwrap();
+        let r = b.chrome.content_box(item).unwrap();
+        click_at(&mut b, &mut h, r);
+        assert_eq!(b.tabs[b.active].dev.selected, Some(page_el(&b, "a")));
+    }
+
+    #[test]
+    fn devtools_network_lists_requests() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/app/",
+            "<link rel=stylesheet href=s.css><script>\
+             fetch('/api', { method: 'POST', body: JSON.stringify({ q: 1 }), headers: { 'content-type': 'application/json' } });\
+             fetch('https://other.test/x');</script>",
+        );
+        b.render(0.0, &mut h);
+        let css = h.fetched.iter().find(|f| f.1.ends_with("s.css")).unwrap().0;
+        b.fetch_done(css, Ok(b"p{}".to_vec()), &mut h);
+        let api = h.fetched.iter().find(|f| f.1.ends_with("/api")).unwrap().0;
+        b.fetch_response(
+            api,
+            ResponseInfo {
+                status: 201,
+                headers: vec![("content-type".into(), "application/json".into())],
+            },
+        );
+        b.fetch_done(api, Ok(br#"{"ok":true}"#.to_vec()), &mut h);
+        b.open_devtools("network");
+        b.render(0.0, &mut h);
+        let list = chrome_text(&b, "dt-requests");
+        assert!(list.contains("app200document"), "{list}");
+        assert!(list.contains("s.css200stylesheet3 B"), "{list}");
+        assert!(list.contains("api201fetch11 B"), "{list}");
+        assert!(list.contains("x(failed)fetch"), "cross-origin, blocked: {list}");
+        click_dt(&mut b, &mut h, &format!("req:{api}"));
+        let detail = chrome_text(&b, "dt-detail");
+        assert!(detail.contains("URL: https://dt.test/api"), "{detail}");
+        assert!(detail.contains("Method: POST"), "{detail}");
+        assert!(detail.contains("content-type: application/json"), "{detail}");
+        assert!(detail.contains("{\"q\":1}"), "the request body: {detail}");
+        assert!(detail.contains("{\"ok\":true}"), "the response: {detail}");
+        click_dt(&mut b, &mut h, "clear");
+        assert_eq!(chrome_text(&b, "dt-requests"), "NameStatusTypeSizeTime");
     }
 }
