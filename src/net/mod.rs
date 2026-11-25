@@ -1,6 +1,7 @@
 //! Loading resources: URLs and fetching.
 
 pub mod cookies;
+pub mod cors;
 pub mod storage;
 pub mod url;
 

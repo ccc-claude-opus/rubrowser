@@ -88,6 +88,23 @@ struct MenuCtx {
     field: Option<(Target, NodeId)>,
 }
 
+/// A script's cross-origin request (Fetch standard, CORS protocol).
+#[derive(Clone, Debug)]
+struct Cors {
+    /// The page's origin (`Origin`).
+    origin: String,
+    /// Credentials mode `include`: cookies go both ways, and the server
+    /// must allow them.
+    credentials: bool,
+    /// `mode: "no-cors"`: the script gets an opaque response.
+    opaque: bool,
+    method: String,
+    /// Headers that needed the preflight (lowercase).
+    requested: Vec<String>,
+    /// While the preflight is out: the request to send once it passes.
+    actual: Option<crate::input::HttpRequest>,
+}
+
 /// What an outstanding fetch is for.
 #[derive(Clone, Debug)]
 enum Request {
@@ -132,12 +149,16 @@ enum Request {
         source: String,
         url: String,
     },
-    /// An HTTP request from script `script` (its request `id`).
+    /// An HTTP request from script `script` (its request `id`) to `url`
+    /// (the URL after redirects, once known).
     Http {
         tab: u64,
         serial: u64,
         script: usize,
         id: i32,
+        url: String,
+        /// For a cross-origin request: the CORS protocol's state.
+        cors: Option<Box<Cors>>,
     },
     /// A module imported by module script `slot`.
     Module {
@@ -1613,6 +1634,10 @@ impl Browser {
     /// Called by the platform when fetch `id` was redirected to `url`
     /// (before [`Browser::fetch_done`]), so the page uses its real address.
     pub fn fetch_redirected(&mut self, id: u32, final_url: &str) {
+        if let Some(Request::Http { url, .. }) = self.requests.get_mut(&id) {
+            *url = final_url.to_string();
+            return;
+        }
         if let Some(Request::Page { tab, url, .. }) = self.requests.get_mut(&id) {
             let tab = *tab;
             // HTTP never sends the fragment: keep the requested one.
@@ -1820,6 +1845,8 @@ impl Browser {
                 serial,
                 script,
                 id,
+                url,
+                cors,
             } => {
                 let Some(i) = self
                     .tab_index(tab)
@@ -1827,7 +1854,59 @@ impl Browser {
                 else {
                     return;
                 };
+                let page = self.tabs[i].doc.url.clone();
+                // A same-origin request redirected to another origin is
+                // checked like a cross-origin one.
+                let cors = cors.or_else(|| {
+                    (origin(&url).is_some() && origin(&url) != origin(&page)).then(|| {
+                        Box::new(Cors {
+                            origin: url::origin_header(&page),
+                            credentials: true,
+                            opaque: false,
+                            method: String::new(),
+                            requested: Vec::new(),
+                            actual: None,
+                        })
+                    })
+                });
+                let mut exposed = info.as_ref().map(|r| r.headers.clone()).unwrap_or_default();
+                let mut result = result;
+                if let Some(c) = &cors {
+                    if c.actual.is_some() {
+                        // The preflight's answer: send the request, or fail.
+                        let status = info.as_ref().map_or(0, |r| r.status);
+                        let checked = result.as_ref().map_err(|e| e.clone()).and_then(|_| {
+                            crate::net::cors::check_preflight(&c.origin, c.credentials, status, &c.method, &c.requested, &exposed)
+                        });
+                        if checked.is_ok() {
+                            let mut c = c.clone();
+                            let request = c.actual.take().unwrap_or_default();
+                            let req = Request::Http { tab, serial, script, id, url: url.clone(), cors: Some(c) };
+                            self.send_script_request(req, &url, request, host);
+                            return;
+                        }
+                        result = checked.map(|_| Vec::new());
+                    } else if c.opaque {
+                        // no-cors: neither status, headers nor body.
+                        result = result.map(|_| Vec::new());
+                        exposed = vec![(":opaque".into(), "1".into())];
+                    } else if result.is_ok() {
+                        match crate::net::cors::check(&c.origin, c.credentials, &exposed) {
+                            Ok(()) => exposed = crate::net::cors::exposed(&exposed, c.credentials),
+                            Err(e) => result = Err(e),
+                        }
+                    }
+                    if let Err(e) = &result {
+                        let msg = format!(
+                            "Access to fetch at '{url}' from origin '{}' has been blocked by CORS policy: {e}",
+                            c.origin
+                        );
+                        result = Err(msg);
+                    }
+                }
+                let opaque = cors.as_ref().is_some_and(|c| c.opaque) && result.is_ok();
                 let (status, body) = match result {
+                    Ok(_) if opaque => (0, Vec::new()),
                     Ok(b) => (info.as_ref().map_or(200, |r| r.status as i32), b),
                     Err(e) => {
                         self.console_message(i, &format!("error: {e}"), host);
@@ -1835,9 +1914,8 @@ impl Browser {
                     }
                 };
                 // Headers as `name: value` lines, for the script.
-                let headers: String = info
+                let headers: String = exposed
                     .iter()
-                    .flat_map(|r| &r.headers)
                     .map(|(n, v)| format!("{n}: {v}\r\n"))
                     .collect();
                 let now = self.now;
@@ -1994,45 +2072,9 @@ impl Browser {
         }
         self.dirty = true;
         let page = tab.doc.url.clone();
-        let (id, serial) = (tab.id, tab.serial);
         for call in out.http {
             let target = url::resolve(&page, &call.url);
-            let req = Request::Http {
-                tab: id,
-                serial,
-                script: si,
-                id: call.id,
-            };
-            // Only the page's own origin: without CORS checks, reading other
-            // sites' responses (with this browser's cookies) is not allowed.
-            if origin(&target) != origin(&page) || origin(&page).is_none() {
-                let fid = self.next_id;
-                self.next_id += 1;
-                self.requests.insert(fid, req);
-                self.net_begin(fid, &target, None, host);
-                self.local.push((
-                    fid,
-                    Err(format!("cross-origin request to {target} blocked")),
-                ));
-                continue;
-            }
-            let fid = self.next_id;
-            self.next_id += 1;
-            self.requests.insert(fid, req);
-            let doc = &self.tabs[i].doc.url;
-            let origin = if matches!(call.method.as_str(), "" | "GET" | "HEAD") { String::new() } else { url::origin_header(doc) };
-            let request = crate::input::HttpRequest {
-                method: call.method,
-                body: call.body,
-                content_type: call.content_type,
-                referrer: url::referrer(doc, &target),
-                origin,
-                fetch_site: url::fetch_site(doc, &target),
-                headers: call.headers,
-                omit_credentials: false,
-            };
-            self.net_begin(fid, &target, Some(&request), host);
-            host.fetch_with(fid, &target, &request);
+            self.script_request(i, si, call, &target, host);
         }
         for call in out.ws {
             self.ws_call(i, si, call, host);
@@ -2126,6 +2168,82 @@ impl Browser {
                 Err(e) => self.script_failed(i, si, &e, host),
             }
         }
+    }
+
+    /// Starts HTTP request `call` of script `si` of tab `i` to `target`:
+    /// same-origin requests directly, cross-origin ones by the CORS
+    /// protocol (with a preflight when needed).
+    fn script_request(&mut self, i: usize, si: usize, call: crate::script::HttpCall, target: &str, host: &mut dyn Host) {
+        use crate::net::cors;
+        let (tab, serial) = (self.tabs[i].id, self.tabs[i].serial);
+        let page = self.tabs[i].doc.url.clone();
+        let same = origin(target).is_some() && origin(target) == origin(&page);
+        let method = if call.method.is_empty() { "GET".to_string() } else { call.method.clone() };
+        let mut request = crate::input::HttpRequest {
+            method: method.clone(),
+            body: call.body,
+            content_type: call.content_type,
+            referrer: url::referrer(&page, target),
+            origin: String::new(),
+            fetch_site: url::fetch_site(&page, target),
+            headers: call.headers,
+            omit_credentials: call.credentials == "omit",
+        };
+        let req = |cors| Request::Http { tab, serial, script: si, id: call.id, url: target.to_string(), cors };
+        let fail = |b: &mut Self, msg: String, host: &mut dyn Host| {
+            let fid = b.next_id;
+            b.next_id += 1;
+            b.requests.insert(fid, req(None));
+            b.net_begin(fid, target, None, host);
+            b.local.push((fid, Err(msg)));
+        };
+        if same {
+            if !matches!(method.as_str(), "GET" | "HEAD") {
+                request.origin = url::origin_header(&page);
+            }
+            return self.send_script_request(req(None), target, request, host);
+        }
+        if origin(target).is_none() {
+            return fail(self, format!("Fetch API cannot load {target}: URL scheme is not supported."), host);
+        }
+        if call.mode == "same-origin" {
+            return fail(self, format!("Fetch API cannot load {target}. Request mode is \"same-origin\" but the URL's origin is not same as the request origin."), host);
+        }
+        let opaque = call.mode == "no-cors";
+        let requested = cors::unsafe_headers(&request.headers, &request.content_type);
+        if opaque && (!cors::simple_method(&method) || !requested.is_empty()) {
+            return fail(self, format!("Fetch API cannot load {target}: a no-cors request may only use GET, HEAD or POST and CORS-safelisted headers."), host);
+        }
+        let credentials = call.credentials == "include";
+        request.omit_credentials = !credentials;
+        request.origin = url::origin_header(&page);
+        let mut state = Cors { origin: request.origin.clone(), credentials, opaque, method: method.clone(), requested: requested.clone(), actual: None };
+        if !opaque && cors::needs_preflight(&method, &request.headers, &request.content_type) {
+            let mut headers = vec![("Access-Control-Request-Method".to_string(), method)];
+            if !requested.is_empty() {
+                headers.push(("Access-Control-Request-Headers".into(), requested.join(",")));
+            }
+            let preflight = crate::input::HttpRequest {
+                method: "OPTIONS".into(),
+                origin: request.origin.clone(),
+                referrer: request.referrer.clone(),
+                fetch_site: request.fetch_site.clone(),
+                headers,
+                omit_credentials: true,
+                ..Default::default()
+            };
+            state.actual = Some(request);
+            return self.send_script_request(req(Some(Box::new(state))), target, preflight, host);
+        }
+        self.send_script_request(req(Some(Box::new(state))), target, request, host);
+    }
+
+    fn send_script_request(&mut self, req: Request, target: &str, request: crate::input::HttpRequest, host: &mut dyn Host) {
+        let fid = self.next_id;
+        self.next_id += 1;
+        self.requests.insert(fid, req);
+        self.net_begin(fid, target, Some(&request), host);
+        host.fetch_with(fid, target, &request);
     }
 
     /// Reports a script failure and stops that script.
@@ -7123,6 +7241,9 @@ mod tests {
             },
         );
         b.fetch_done(api, Ok(br#"{"ok":true}"#.to_vec()), &mut h);
+        // The cross-origin request is sent; without CORS headers it fails.
+        let other = h.fetched.iter().find(|f| f.1 == "https://other.test/x").unwrap().0;
+        b.fetch_done(other, Err("HTTP 404".into()), &mut h);
         b.open_devtools("network");
         b.render(0.0, &mut h);
         let list = chrome_text(&b, "dt-requests");
@@ -7542,5 +7663,102 @@ mod tests {
         b.render(300.0, &mut h);
         assert!(h.logs.contains(&"io far true 1".to_string()), "{:?}", h.logs);
         assert!(h.logs.contains(&"ro box 150".to_string()), "{:?}", h.logs);
+    }
+
+    // ----- CORS -------------------------------------------------------------
+
+    /// Answers request `id` with `status`, `headers` and `body`.
+    fn answer(b: &mut Browser, h: &mut NetHost, id: u32, status: u16, headers: &[(&str, &str)], body: &str) {
+        let headers = headers.iter().map(|(n, v)| (n.to_string(), v.to_string())).collect();
+        b.fetch_response(id, ResponseInfo { status, headers });
+        b.fetch_done(id, Ok(body.as_bytes().to_vec()), h);
+        b.render(0.0, h);
+    }
+
+    fn sent_to<'a>(h: &'a NetHost, end: &str) -> Vec<&'a (u32, String, crate::input::HttpRequest)> {
+        h.sent.iter().filter(|s| s.1.ends_with(end)).collect()
+    }
+
+    #[test]
+    fn cors_simple_requests_and_exposed_headers() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://app.test/",
+            "<script>\
+             fetch('https://api.test/open').then((r) => r.text().then((t) => console.log('open', r.status, t, r.headers.get('x-secret'), r.headers.get('x-shown'), r.headers.get('content-type'))), (e) => console.log('open failed', e.name));\
+             fetch('https://api.test/closed').then(() => console.log('closed ok'), (e) => console.log('closed failed', e.name));\
+             fetch('https://api.test/creds', { credentials: 'include' }).then(() => console.log('creds ok'), () => console.log('creds failed'));\
+             fetch('https://api.test/opaque', { mode: 'no-cors' }).then((r) => console.log('opaque', r.type, r.status));\
+             fetch('https://api.test/same', { mode: 'same-origin' }).catch((e) => console.log('same-origin mode', e.name));\
+             fetch('/moved').then(() => console.log('moved ok'), () => console.log('moved failed'));</script>",
+        );
+        let open = sent_to(&h, "/open")[0].clone();
+        assert_eq!(open.2.origin, "https://app.test", "cross-origin requests carry Origin");
+        assert!(open.2.omit_credentials, "and no cookies by default");
+        let creds = sent_to(&h, "/creds")[0].clone();
+        assert!(!creds.2.omit_credentials);
+        assert!(sent_to(&h, "/same").is_empty(), "mode same-origin is not sent");
+        answer(&mut b, &mut h, open.0, 200, &[("access-control-allow-origin", "*"), ("x-secret", "s"), ("x-shown", "v"), ("access-control-expose-headers", "X-Shown"), ("content-type", "text/plain")], "hello");
+        let closed = sent_to(&h, "/closed")[0].0;
+        answer(&mut b, &mut h, closed, 200, &[], "secret");
+        answer(&mut b, &mut h, creds.0, 200, &[("access-control-allow-origin", "*")], "x");
+        let opaque = sent_to(&h, "/opaque")[0].0;
+        answer(&mut b, &mut h, opaque, 200, &[], "hidden");
+        // A same-origin request redirected to another origin is checked too.
+        let moved = sent_to(&h, "/moved")[0].0;
+        b.fetch_redirected(moved, "https://elsewhere.test/x");
+        answer(&mut b, &mut h, moved, 200, &[], "x");
+        b.render(10.0, &mut h);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("open 200 hello null v text/plain"), "{logs}");
+        assert!(logs.contains("closed failed TypeError"), "{logs}");
+        assert!(logs.contains("No 'Access-Control-Allow-Origin' header is present"), "{logs}");
+        assert!(logs.contains("creds failed"), "{logs}");
+        assert!(logs.contains("opaque opaque 0"), "{logs}");
+        assert!(logs.contains("same-origin mode TypeError"), "{logs}");
+        assert!(logs.contains("moved failed"), "{logs}");
+    }
+
+    #[test]
+    fn cors_preflight() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://app.test/",
+            "<script>\
+             fetch('https://api.test/put', { method: 'PUT', body: '{}', headers: { 'content-type': 'application/json', 'X-Token': 't' }, credentials: 'include' })\
+               .then((r) => r.text()).then((t) => console.log('put', t), (e) => console.log('put failed'));\
+             fetch('https://api.test/denied', { method: 'DELETE' }).then(() => console.log('denied ok'), () => console.log('denied failed'));</script>",
+        );
+        let pre = sent_to(&h, "/put")[0].clone();
+        assert_eq!(pre.2.method, "OPTIONS");
+        assert!(pre.2.omit_credentials, "preflights send no cookies");
+        assert!(pre.2.headers.contains(&("Access-Control-Request-Method".into(), "PUT".into())), "{:?}", pre.2.headers);
+        assert!(pre.2.headers.contains(&("Access-Control-Request-Headers".into(), "content-type,x-token".into())), "{:?}", pre.2.headers);
+        let allow = [
+            ("access-control-allow-origin", "https://app.test"),
+            ("access-control-allow-credentials", "true"),
+            ("access-control-allow-methods", "PUT"),
+            ("access-control-allow-headers", "Content-Type, X-Token"),
+        ];
+        answer(&mut b, &mut h, pre.0, 204, &allow, "");
+        let actual = sent_to(&h, "/put")[1].clone();
+        assert_eq!((actual.2.method.as_str(), &actual.2.body[..]), ("PUT", &b"{}"[..]));
+        assert!(!actual.2.omit_credentials);
+        answer(&mut b, &mut h, actual.0, 200, &allow[..2], "done");
+        let denied = sent_to(&h, "/denied")[0].clone();
+        assert_eq!(denied.2.method, "OPTIONS");
+        answer(&mut b, &mut h, denied.0, 204, &[("access-control-allow-origin", "*"), ("access-control-allow-methods", "PUT")], "");
+        assert_eq!(sent_to(&h, "/denied").len(), 1, "the request itself is not sent");
+        b.render(10.0, &mut h);
+        let logs = h.logs.join("\n");
+        assert!(logs.contains("put done"), "{logs}");
+        assert!(logs.contains("denied failed"), "{logs}");
+        assert!(logs.contains("Method DELETE is not allowed"), "{logs}");
     }
 }

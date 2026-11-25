@@ -11,7 +11,9 @@ what the server receives:
   are sent but hidden from document.cookie and cannot be overwritten by it;
 - 303 (and 302 after POST) redirects continue with GET;
 - persistent cookies and localStorage survive a restart with the same
-  --user-data-dir; session cookies do not.
+  --user-data-dir; session cookies do not;
+- CORS against a second server (another port, so another origin): simple
+  requests, a preflight, credentials, and refusals.
 
 Usage: scripts/http-test.py [path/to/rubrowser]
 """
@@ -66,6 +68,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(body=b"<!doctype html><title>home</title><p>home")
         if path == "/form":
             return self.reply(303, headers=[("Location", "/done")])
+        if path.startswith("/cors/"):
+            origin = self.headers.get("Origin", "")
+            allow = [("Access-Control-Allow-Origin", origin), ("Access-Control-Allow-Credentials", "true"),
+                     ("Access-Control-Allow-Methods", "PUT"), ("Access-Control-Allow-Headers", "x-custom, content-type"),
+                     ("Access-Control-Expose-Headers", "X-Shown"), ("X-Shown", "yes"), ("Set-Cookie", "api=1; Path=/; SameSite=None")]
+            if path == "/cors/none":
+                allow = []
+            if self.command == "OPTIONS":
+                return self.reply(204 if path != "/cors/none" else 405, headers=allow)
+            echo = {"method": self.command, "cookie": self.headers.get("Cookie"), "x": self.headers.get("X-Custom"),
+                    "origin": origin}
+            return self.reply(body=json.dumps(echo).encode(), ctype="application/json", headers=allow)
         if path.startswith("/api/"):
             echo = {"method": self.command, "auth": self.headers.get("Authorization"),
                     "x": self.headers.get("X-Custom"), "type": self.headers.get("Content-Type"),
@@ -74,7 +88,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return self.reply(body=json.dumps(echo).encode(), ctype="application/json")
         self.reply(404, b"no")
 
-    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = handle_any
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_HEAD = do_OPTIONS = handle_any
 
 
 def start(exe, profile):
@@ -107,6 +121,9 @@ def main():
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     site = f"http://127.0.0.1:{server.server_address[1]}"
+    other = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=other.serve_forever, daemon=True).start()
+    api = f"http://127.0.0.1:{other.server_address[1]}"
     with tempfile.TemporaryDirectory() as profile:
         proc, page = start(exe, profile)
         try:
@@ -136,6 +153,22 @@ def main():
             page.wait_event("Page.loadEventFired")
             posts = [(s[0], s[1]) for s in seen if s[1] in ("/form", "/done")]
             check("303 after POST continues with GET", posts[-2:] == [("POST", "/form"), ("GET", "/done")], posts)
+            # CORS.
+            r = ev(page, f"fetch('{api}/cors/open').then(async (r) => [await r.json(), r.headers.get('x-shown')])")
+            check("CORS simple GET", r and r[0]["origin"] == site and r[0]["cookie"] is None and r[1] == "yes", r)
+            r = ev(page, f"fetch('{api}/cors/none').then(() => 'ok', (e) => e.name)")
+            check("CORS refused without Access-Control-Allow-Origin", r == "TypeError", r)
+            r = ev(page, f"fetch('{api}/cors/put', {{ method: 'PUT', body: '{{}}', credentials: 'include', "
+                         f"headers: {{ 'X-Custom': 'c', 'Content-Type': 'application/json' }} }}).then((r) => r.json())")
+            kinds = [(s[0], s[1]) for s in seen if s[1] == "/cors/put"]
+            check("CORS preflight, then the request", kinds == [("OPTIONS", "/cors/put"), ("PUT", "/cors/put")]
+                  and r and r["x"] == "c", (kinds, r))
+            r = ev(page, f"fetch('{api}/cors/again', {{ credentials: 'include' }}).then((r) => r.json())")
+            # (cookies are per host, not per port: both servers' cookies go)
+            check("credentials: include sends the API's cookie", r and "api=1" in (r["cookie"] or ""), r)
+            r = ev(page, f"fetch('{api}/cors/none', {{ method: 'DELETE' }}).then(() => 'ok', (e) => e.name)")
+            check("a refused preflight stops the request", r == "TypeError" and
+                  [s[0] for s in seen if s[1] == "/cors/none"][-1] == "OPTIONS", r)
         finally:
             page.call("Browser.close")
             proc.wait(timeout=10)
@@ -154,6 +187,7 @@ def main():
             page.call("Browser.close")
             proc.wait(timeout=10)
     server.shutdown()
+    other.shutdown()
     failed = [r for r in results if not r[1]]
     for name, ok, detail in results:
         print(("PASS " if ok else "FAIL ") + name + ("" if ok else f"  ({detail})"))

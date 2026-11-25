@@ -55,10 +55,10 @@ flowchart LR
 
 | CSSOM | `<style>` / `<link>` 的 `sheet`、`document.styleSheets`、`CSSStyleSheet`（`cssRules`、`insertRule`、`deleteRule`、`addRule`、`replace` / `replaceSync`）、`CSSStyleRule`（`selectorText`、`style` 的 `getPropertyValue` / `setProperty` / `cssText`）、`CSSMediaRule` / `CSSSupportsRule` 等群組規則（`cssRules`、`insertRule`）、`CSSImportRule`、`CSSFontFaceRule`、`CSSKeyframesRule`（以文字保存）；修改會套用到頁面，元素的文字不變；跨來源 `<link>` 的 `cssRules` 丟 `SecurityError` |
 | Canvas | `getContext('2d')` 的 `CanvasRenderingContext2D`（路徑、漸層、圖樣、變形、裁切、文字、圖片（`<img>`、`<canvas>`，以及 `<video>` 目前顯示的那一格）、像素讀寫、`toDataURL` / `toBlob`）、`Path2D`、`ImageData`；每個呼叫以 `canvas` import 交給瀏覽器以 tiny-skia 繪製 |
-| 網路 | `fetch`（`Request`、`Response` 的 `text` / `json` / `arrayBuffer` / `blob` / `bytes`、`Headers`；本文可以是字串、`URLSearchParams`、`FormData`（以 `multipart/form-data` 送出）、`Blob`、`ArrayBuffer` / typed array）、`XMLHttpRequest`（`responseType` 為 `arraybuffer` / `blob` / `json`、`upload` 的進度事件、回應標頭）；回應有真正的狀態碼與標頭；所有 HTTP 方法（GET、POST、PUT、DELETE、PATCH、HEAD…），腳本設的請求標頭會送出（Fetch 標準禁止的 `Cookie`、`Host`、`Origin`、`Sec-*` 等除外）；只允許與頁面同源的網址（還沒有 CORS 檢查）；`blob:` 與 `data:` 網址在 runtime 裡直接回應 |
+| 網路 | `fetch`（`Request`、`Response` 的 `text` / `json` / `arrayBuffer` / `blob` / `bytes`、`Headers`；本文可以是字串、`URLSearchParams`、`FormData`（以 `multipart/form-data` 送出）、`Blob`、`ArrayBuffer` / typed array）、`XMLHttpRequest`（`responseType` 為 `arraybuffer` / `blob` / `json`、`upload` 的進度事件、回應標頭）；回應有真正的狀態碼與標頭；所有 HTTP 方法（GET、POST、PUT、DELETE、PATCH、HEAD…），腳本設的請求標頭會送出（Fetch 標準禁止的 `Cookie`、`Host`、`Origin`、`Sec-*` 等除外）；跨來源請求依 Fetch 標準的 CORS：送 `Origin`，非簡單請求先送 `OPTIONS` preflight，檢查 `Access-Control-Allow-Origin` / `-Credentials` / `-Methods` / `-Headers`，腳本只看得到安全的回應標頭與 `Access-Control-Expose-Headers` 列出的；預設不帶 cookie（`credentials: 'include'` 或 XHR 的 `withCredentials` 才帶），`mode: 'no-cors'` 得到 opaque 回應，`mode: 'same-origin'` 拒絕跨來源；同源請求被轉址到別的來源時也做 CORS 檢查；被擋下時在主控台說明原因；`blob:` 與 `data:` 網址在 runtime 裡直接回應 |
 | 檔案 | `Blob`（`size`、`type`、`slice`、`text`、`arrayBuffer`、`bytes`、`stream`）、`File`、`FileList`、`FileReader`（`readAsText` / `readAsDataURL` / `readAsArrayBuffer` / `readAsBinaryString`、`abort`、進度事件）、`<input type=file>` 的 `files`、`showPicker()`、`URL.createObjectURL` / `revokeObjectURL`（`blob:` 網址可用於 `<img>`、`<a>`、`fetch`）；詳見 [files.md](files.md) |
 
-尚未支援：跨來源請求（CORS）、canvas 的陰影與 WebGL、真正執行的 Web Worker、shadow DOM 的繪製、以元素 id 當全域變數（named access on Window）。
+尚未支援：canvas 的陰影與 WebGL、真正執行的 Web Worker、shadow DOM 的繪製、以元素 id 當全域變數（named access on Window）。
 
 ### 模組協定
 

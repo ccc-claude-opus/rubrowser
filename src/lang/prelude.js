@@ -2533,7 +2533,7 @@
   global.__rb_http = function (id, status) {
     const done = httpPending.get(id);
     httpPending.delete(id);
-    if (done) done(status, status ? rb.httpBytes(id) : new Uint8Array(0), status ? rb.httpHeaders(id) : '');
+    if (done) done(status, status ? rb.httpBytes(id) : new Uint8Array(0), rb.httpHeaders(id));
   };
   // WebSocket (HTML § 9.3, RFC 6455): the browser holds the connection and
   // reports to __rb_ws (1 open, 2 text, 3 binary, 4 closed, 5 error).
@@ -2656,6 +2656,13 @@
       if (signal && signal.aborted) { reject(signal.reason); return; }
       httpRequest(req.method, req.url, x.body, headers, req, (status, bytes, headers) => {
         if (signal && signal.aborted) { reject(signal.reason); return; }
+        if (!status && headers.startsWith(':opaque')) {
+          // mode: 'no-cors' to another origin: nothing of it is readable.
+          const r = new Response(null, { status: 0 });
+          r.type = 'opaque';
+          resolve(r);
+          return;
+        }
         if (!status) { reject(new TypeError('Failed to fetch')); return; }
         const r = new Response(bytes, { status, headers: parseHeaders(headers) });
         r.url = req.url;
