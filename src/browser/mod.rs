@@ -577,6 +577,8 @@ struct Tab {
     kick: bool,
     /// The developer tools' console, network log and DOM tree state.
     dev: devtools::TabDev,
+    /// `sessionStorage` areas by origin (kept across navigation).
+    session_storage: HashMap<String, crate::net::storage::Shared>,
     /// The page's own stylesheets (`<link rel=stylesheet>` in the parsed
     /// document) still loading, and since when: they are render-blocking
     /// (HTML), so the page is not shown unstyled meanwhile.
@@ -670,6 +672,8 @@ pub struct Browser {
     devtools: devtools::DevTools,
     /// Remote debugging connections (Chrome DevTools Protocol).
     cdp: cdp::Cdp,
+    /// `localStorage` areas by origin, loaded from the host when first used.
+    local_storage: HashMap<String, crate::net::storage::Shared>,
     /// The last page mouse press (point and time), for double-clicking a word.
     last_down: Option<(f32, f32, f64)>,
     /// Where the pointer was when page mouse events last went out.
@@ -727,6 +731,7 @@ impl Browser {
             last_click: None,
             devtools: Default::default(),
             cdp: Default::default(),
+            local_storage: HashMap::new(),
             last_down: None,
             last_move: (-1.0, -1.0),
             key_repeat: false,
@@ -782,6 +787,7 @@ impl Browser {
             link_events: Vec::new(),
             kick: false,
             dev: Default::default(),
+            session_storage: HashMap::new(),
             blocking: (std::collections::HashSet::new(), 0.0),
         });
         self.active = self.tabs.len() - 1;
@@ -1005,6 +1011,8 @@ impl Browser {
         if tab.scrolls[tab.index] > 0.0 {
             tab.doc.restore_scroll(tab.scrolls[tab.index]);
         }
+        self.attach_storage(i, host);
+        let tab = &mut self.tabs[i];
         // Scripts see the viewport (`matchMedia`, `innerWidth`) from the start.
         tab.doc.set_viewport(vp.w, vp.h);
         tab.doc.set_fonts(self.fonts.clone());
@@ -1126,6 +1134,35 @@ impl Browser {
         self.tabs[i].queuing = false;
         self.run_scripts(i, host);
         self.dirty = true;
+    }
+
+    /// Gives tab `i`'s new document its origin's storage areas.
+    fn attach_storage(&mut self, i: usize, host: &mut dyn Host) {
+        use crate::net::storage::{self, Area};
+        let origin = storage::origin_key(&self.tabs[i].doc.url);
+        let local = self
+            .local_storage
+            .entry(origin.clone())
+            .or_insert_with(|| {
+                let saved = host.load_storage(&origin).map(|t| Area::decode(&t));
+                Rc::new(std::cell::RefCell::new(saved.unwrap_or_default()))
+            })
+            .clone();
+        let tab = &mut self.tabs[i];
+        let session = tab.session_storage.entry(origin).or_default().clone();
+        tab.doc.local_storage = Some(local);
+        tab.doc.session_storage = Some(session);
+    }
+
+    /// Saves `localStorage` areas scripts changed.
+    fn save_storage(&mut self, host: &mut dyn Host) {
+        for (origin, area) in &self.local_storage {
+            let mut a = area.borrow_mut();
+            if a.dirty {
+                a.dirty = false;
+                host.save_storage(origin, &a.encode());
+            }
+        }
     }
 
     /// Runs pending scripts of tab `i` from the front while they are ready,
@@ -1935,6 +1972,7 @@ impl Browser {
         };
         let out = script.take_output();
         self.record_call(i, si);
+        self.save_storage(host);
         for msg in &out.logs {
             self.console_message(i, msg, host);
         }
@@ -1990,6 +2028,8 @@ impl Browser {
                 referrer: url::referrer(doc, &target),
                 origin,
                 fetch_site: url::fetch_site(doc, &target),
+                headers: call.headers,
+                omit_credentials: false,
             };
             self.net_begin(fid, &target, Some(&request), host);
             host.fetch_with(fid, &target, &request);
@@ -3172,6 +3212,7 @@ impl Browser {
                 referrer,
                 origin,
                 fetch_site,
+                ..Default::default()
             });
             return self.navigate(&target, host);
         }
@@ -7304,5 +7345,202 @@ mod tests {
         // Screenshots are PNG.
         let out = cdp(&mut b, &mut h, 1, r#"{"id":40,"method":"Page.captureScreenshot"}"#);
         assert!(reply(&out, 40)["result"]["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
+    }
+
+    // ----- requests, storage, cookies, observers -----------------------------
+
+    /// Records full requests and saved storage.
+    #[derive(Default)]
+    struct NetHost {
+        inner: TestHost,
+        sent: Vec<(u32, String, crate::input::HttpRequest)>,
+        saved: HashMap<String, String>,
+        logs: Vec<String>,
+    }
+
+    impl Host for NetHost {
+        fn fetch(&mut self, id: u32, url: &str) {
+            self.inner.fetch(id, url);
+        }
+        fn fetch_with(&mut self, id: u32, url: &str, r: &crate::input::HttpRequest) {
+            self.inner.fetch(id, url);
+            self.sent.push((id, url.into(), r.clone()));
+        }
+        fn clipboard_get(&mut self) -> Option<String> {
+            None
+        }
+        fn clipboard_set(&mut self, _: &str) {}
+        fn set_cursor(&mut self, _: Cursor) {}
+        fn set_title(&mut self, _: &str) {}
+        fn log(&mut self, m: &str) {
+            self.logs.push(m.into());
+        }
+        fn load_storage(&mut self, origin: &str) -> Option<String> {
+            self.saved.get(origin).cloned()
+        }
+        fn save_storage(&mut self, origin: &str, data: &str) {
+            self.saved.insert(origin.into(), data.into());
+        }
+    }
+
+    fn net_page(b: &mut Browser, h: &mut NetHost, url: &str, html: &str) {
+        b.navigate(url, h);
+        let id = h.inner.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(html.as_bytes().to_vec()), h);
+        b.render(0.0, h);
+    }
+
+    #[test]
+    fn scripts_send_any_method_and_their_headers() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://api.test/",
+            "<script>fetch('/items/1', { method: 'delete', headers: { Authorization: 'Bearer t', 'X-Req': 'a', Cookie: 'no', 'Sec-Thing': 'no' } });\
+             fetch('/items/2', { method: 'PUT', body: '{}', headers: { 'content-type': 'application/json' } });\
+             const x = new XMLHttpRequest(); x.open('PATCH', '/items/3'); x.setRequestHeader('X-A', '1'); x.setRequestHeader('X-A', '2'); x.send('p');</script>",
+        );
+        let find = |end: &str| h.sent.iter().find(|s| s.1.ends_with(end)).unwrap().2.clone();
+        let del = find("/items/1");
+        assert_eq!(del.method, "DELETE");
+        // (Headers keeps names lowercase; HTTP does not care.)
+        assert!(del.headers.contains(&("authorization".into(), "Bearer t".into())), "{:?}", del.headers);
+        assert!(del.headers.contains(&("x-req".into(), "a".into())));
+        assert!(!del.headers.iter().any(|(n, _)| n == "cookie" || n == "sec-thing"), "forbidden: {:?}", del.headers);
+        let put = find("/items/2");
+        assert_eq!((put.method.as_str(), put.content_type.as_str(), &put.body[..]), ("PUT", "application/json", &b"{}"[..]));
+        let patch = find("/items/3");
+        assert_eq!(patch.method, "PATCH");
+        assert!(patch.headers.contains(&("x-a".into(), "1, 2".into())), "{:?}", patch.headers);
+    }
+
+    #[test]
+    fn web_storage_is_kept_per_origin_and_tab() {
+        let mut h = NetHost::default();
+        h.saved.insert("https://a.test".into(), "theme\tdark\n".into());
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://a.test/one",
+            "<script>console.log('saved', localStorage.getItem('theme'), localStorage.theme);\
+             localStorage.setItem('n', '1'); localStorage.x = 'y'; sessionStorage.setItem('s', 'tab');\
+             try { localStorage.setItem('big', 'x'.repeat(5000001)); } catch (e) { console.log('quota', e.name); }</script>",
+        );
+        assert!(h.logs.contains(&"saved dark dark".to_string()), "{:?}", h.logs);
+        assert!(h.logs.contains(&"quota QuotaExceededError".to_string()), "{:?}", h.logs);
+        assert_eq!(h.saved["https://a.test"], "theme\tdark\nn\t1\nx\ty\n", "saved through the host");
+        // Same origin, next page of the tab: both areas are there.
+        net_page(
+            &mut b,
+            &mut h,
+            "https://a.test/two",
+            "<script>console.log('two', localStorage.n, sessionStorage.getItem('s'), localStorage.length, Object.keys(localStorage).join(','));\
+             delete localStorage.x;</script>",
+        );
+        assert!(h.logs.contains(&"two 1 tab 3 theme,n,x".to_string()), "{:?}", h.logs);
+        assert_eq!(h.saved["https://a.test"], "theme\tdark\nn\t1\n");
+        // Another origin sees nothing; a new tab has its own session storage.
+        net_page(&mut b, &mut h, "https://b.test/", "<script>console.log('b', localStorage.length)</script>");
+        assert!(h.logs.contains(&"b 0".to_string()), "{:?}", h.logs);
+        b.new_tab("https://a.test/three", &mut h);
+        let id = h.inner.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(b"<script>console.log('tab2', localStorage.n, sessionStorage.length)</script>".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        assert!(h.logs.contains(&"tab2 1 0".to_string()), "{:?}", h.logs);
+    }
+
+    #[test]
+    fn document_cookie_uses_the_shared_jar() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://cookies.test/",
+            "<script>document.cookie = 'a=1; path=/'; document.cookie = 'b=2'; document.cookie = 'a=; Max-Age=0';\
+             console.log('cookie', document.cookie, navigator.cookieEnabled);</script>",
+        );
+        assert!(h.logs.contains(&"cookie b=2 true".to_string()), "{:?}", h.logs);
+        assert_eq!(crate::net::cookies::jar().document_cookie("https://cookies.test/x"), "b=2");
+    }
+
+    #[test]
+    fn mutation_observers_see_script_changes() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://mo.test/",
+            r#"<div id=root><p id=p class=a>text</p></div><script>
+              const root = document.getElementById('root'), p = document.getElementById('p');
+              const log = (rs) => console.log(rs.map((r) => [r.type, r.target.id || r.target.nodeName, r.attributeName, r.oldValue,
+                r.addedNodes.map((n) => n.nodeName).join('+'), r.removedNodes.map((n) => n.nodeName).join('+')].join(':')).join(' | '));
+              const mo = new MutationObserver(log);
+              mo.observe(root, { childList: true, subtree: true, attributes: true, attributeOldValue: true, characterData: true, attributeFilter: ['class', 'title'] });
+              p.className = 'b';
+              p.setAttribute('data-x', '1');
+              p.title = 't';
+              root.appendChild(document.createElement('span'));
+              p.remove();
+              const other = new MutationObserver(() => console.log('other'));
+              other.observe(p, { attributes: true });
+              other.disconnect();
+              p.id = 'gone';
+              setTimeout(() => {
+                const t = new MutationObserver(log);
+                t.observe(root, { characterData: true, subtree: true, characterDataOldValue: true });
+                root.appendChild(document.createTextNode('x'));
+                root.lastChild.data = 'y';
+                console.log('taken', t.takeRecords().length);
+                root.innerHTML = '<b>new</b>';
+              }, 5);
+            </script>"#,
+        );
+        b.render(10.0, &mut h);
+        let logs = h.logs.join("\n");
+        // (records are delivered after the script: p's id is 'gone' by then)
+        assert!(
+            logs.contains("attributes:gone:class:a:: | attributes:gone:title::: | childList:root:::SPAN: | childList:root::::P"),
+            "{logs}"
+        );
+        assert!(!logs.contains("other"), "a disconnected observer gets nothing: {logs}");
+        // The second observer's record was taken; the first one (no old
+        // values) still sees the text and innerHTML changes.
+        assert!(logs.contains("taken 1"), "{logs}");
+        assert!(logs.contains("childList:root:::#text: | characterData:#text:::: | childList:root:::B:SPAN+#text"), "{logs}");
+    }
+
+    #[test]
+    fn intersection_and_resize_observers_follow_layout() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://io.test/",
+            r#"<div style="height: 2000px"></div><div id=far style="height: 50px">far</div><div id=box style="width: 100px; padding: 5px">box</div><script>
+              const io = new IntersectionObserver((es) => es.forEach((e) => console.log('io', e.target.id, e.isIntersecting, e.intersectionRatio)));
+              io.observe(document.getElementById('far'));
+              const ro = new ResizeObserver((es) => es.forEach((e) => console.log('ro', e.target.id, e.contentRect.width)));
+              ro.observe(document.getElementById('box'));
+              setTimeout(() => { document.getElementById('box').style.width = '150px'; }, 100);
+            </script>"#,
+        );
+        b.render(50.0, &mut h);
+        assert!(h.logs.contains(&"io far false 0".to_string()), "{:?}", h.logs);
+        assert!(h.logs.contains(&"ro box 100".to_string()), "{:?}", h.logs);
+        // Scrolling the page brings it into view.
+        b.event(Event::MouseMove { x: 300, y: 300 }, 60.0, &mut h);
+        for _ in 0..20 {
+            b.event(Event::Wheel { dx: 0, dy: 120 }, 60.0, &mut h);
+        }
+        b.render(200.0, &mut h);
+        b.render(300.0, &mut h);
+        assert!(h.logs.contains(&"io far true 1".to_string()), "{:?}", h.logs);
+        assert!(h.logs.contains(&"ro box 150".to_string()), "{:?}", h.logs);
     }
 }

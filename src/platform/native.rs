@@ -38,6 +38,7 @@ pub fn run(
     keyboard: KeyboardMode,
     debug_port: Option<u16>,
 ) -> Result<(), Box<dyn Error>> {
+    install_cookie_jar();
     let event_loop = EventLoop::<Fetched>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     let debugger = match debug_port {
@@ -222,6 +223,14 @@ fn ws_close(sockets: &mut Sockets, id: u32, code: u16, reason: &str) {
 }
 
 impl Host for NativeHost {
+    fn load_storage(&mut self, origin: &str) -> Option<String> {
+        load_storage(origin)
+    }
+
+    fn save_storage(&mut self, origin: &str, data: &str) {
+        save_storage(origin, data)
+    }
+
     fn fetch(&mut self, id: u32, url: &str) {
         self.fetch_with(id, url, &HttpRequest::default());
     }
@@ -333,6 +342,9 @@ fn agent() -> &'static ureq::Agent {
             .user_agent(user_agent())
             .timeout_global(Some(Duration::from_secs(30)))
             .http_status_as_error(false)
+            // Redirects are followed here, to keep cookies set on the way.
+            .max_redirects(0)
+            .allow_non_standard_methods(true)
             .build()
             .into()
     })
@@ -550,87 +562,248 @@ fn is_transport_error(e: &str) -> bool {
     e.starts_with("io:") || e.contains("onnection")
 }
 
-/// One HTTP(S) request.
-fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
-    use ureq::ResponseExt;
-    {
-        {
-            let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
-            let referrer = request.map_or("", |r| r.referrer.as_str());
-            let mut resp = match request.filter(|r| r.method != "GET" && !r.method.is_empty()) {
-                Some(r) => {
-                    let ctype = if r.content_type.is_empty() {
-                        "text/plain;charset=UTF-8"
-                    } else {
-                        &r.content_type
-                    };
-                    let mut req = agent()
-                        .post(url)
-                        .header("Accept", "*/*")
-                        .header("Accept-Language", crate::net::accept_language())
-                        .header("Content-Type", ctype);
-                    if !referrer.is_empty() {
-                        req = req.header("Referer", referrer);
-                    }
-                    if !r.origin.is_empty() {
-                        req = req.header("Origin", &r.origin);
-                    }
-                    if !r.fetch_site.is_empty() {
-                        req = req.header("Sec-Fetch-Site", &r.fetch_site);
-                    }
-                    req.send(&r.body[..])
-                }
-                None => {
-                    // script requests (fetch, XHR) accept anything
-                    let script = request.is_some_and(|r| !r.method.is_empty());
-                    let mut req = agent()
-                        .get(url)
-                        .header("Accept", if script { "*/*" } else { accept })
-                        .header("Accept-Language", crate::net::accept_language());
-                    if !referrer.is_empty() {
-                        req = req.header("Referer", referrer);
-                    }
-                    if let Some(site) = request.map(|r| r.fetch_site.as_str()).filter(|s| !s.is_empty()) {
-                        req = req.header("Sec-Fetch-Site", site);
-                    }
-                    req.call()
-                }
-            }
-            .map_err(|e| e.to_string())?;
-            let status = resp.status();
-            let final_url = resp.get_uri().to_string();
-            let info = ResponseInfo {
-                status: status.as_u16(),
-                headers: resp
-                    .headers()
-                    .iter()
-                    .map(|(n, v)| {
-                        (
-                            n.as_str().to_string(),
-                            String::from_utf8_lossy(v.as_bytes()).into_owned(),
-                        )
-                    })
-                    .collect(),
-            };
-            let body = resp
-                .body_mut()
-                .with_config()
-                .limit(MAX_BODY)
-                .read_to_vec()
-                .map_err(|e| e.to_string())?;
-            if status.is_client_error() || status.is_server_error() {
-                // Error pages are still pages; resources fail.
-                if !status.is_success() && body.is_empty() {
-                    return Err(format!("HTTP {status}"));
-                }
-            }
-            Ok(Loaded {
-                body,
-                final_url: (final_url != url).then_some(final_url),
-                info: Some(info),
-            })
-        }
+// ----- cookies -------------------------------------------------------------
+
+/// The folder the profile (cookies, local storage) is saved in; `None`:
+/// nothing is saved.
+static PROFILE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+/// Sets where the profile is saved (before the first request).
+pub fn set_profile_dir(dir: Option<std::path::PathBuf>) {
+    let _ = PROFILE.set(dir);
+}
+
+fn profile_dir() -> Option<&'static std::path::Path> {
+    PROFILE.get_or_init(|| None).as_deref()
+}
+
+/// The usual profile folder: `~/Library/Application Support/rubrowser`
+/// (macOS), `$XDG_DATA_HOME/rubrowser` or `~/.local/share/rubrowser`.
+pub fn default_profile_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if cfg!(target_os = "macos") {
+        return home.map(|h| h.join("Library/Application Support/rubrowser"));
     }
+    std::env::var_os("XDG_DATA_HOME")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")))
+        .map(|d| d.join("rubrowser"))
+}
+
+/// The cookie jar of every request, loaded from the profile.
+fn jar() -> &'static std::sync::Mutex<cookie_store::CookieStore> {
+    static JAR: std::sync::OnceLock<std::sync::Mutex<cookie_store::CookieStore>> = std::sync::OnceLock::new();
+    JAR.get_or_init(|| {
+        let saved = profile_dir()
+            .and_then(|d| std::fs::File::open(d.join("cookies.json")).ok())
+            .and_then(|f| cookie_store::serde::json::load(std::io::BufReader::new(f)).ok());
+        std::sync::Mutex::new(saved.unwrap_or_default())
+    })
+}
+
+/// Writes the persistent cookies to the profile.
+fn save_cookies(store: &cookie_store::CookieStore) {
+    let Some(dir) = profile_dir() else { return };
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let tmp = dir.join("cookies.json.tmp");
+    if let Ok(mut f) = std::fs::File::create(&tmp)
+        && cookie_store::serde::json::save(store, &mut f).is_ok()
+    {
+        let _ = std::fs::rename(&tmp, dir.join("cookies.json"));
+    }
+}
+
+/// `Cookie` for a request to `url` (`None`: no cookies).
+fn cookie_header(url: &str) -> Option<String> {
+    let u = ::url::Url::parse(url).ok()?;
+    let store = jar().lock().unwrap_or_else(|e| e.into_inner());
+    let v: Vec<String> = store.get_request_values(&u).map(|(n, v)| format!("{n}={v}")).collect();
+    (!v.is_empty()).then(|| v.join("; "))
+}
+
+/// Stores the `Set-Cookie`s of a response from `url`.
+fn store_cookies(url: &str, headers: &ureq::http::HeaderMap) {
+    let Ok(u) = ::url::Url::parse(url) else { return };
+    let cookies: Vec<cookie_store::RawCookie<'static>> = headers
+        .get_all("set-cookie")
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|v| cookie_store::RawCookie::parse(v.to_string()).ok())
+        .collect();
+    if cookies.is_empty() {
+        return;
+    }
+    let mut store = jar().lock().unwrap_or_else(|e| e.into_inner());
+    store.store_response_cookies(cookies.into_iter(), &u);
+    save_cookies(&store);
+}
+
+/// Saved `localStorage` of `origin` in the profile.
+fn load_storage(origin: &str) -> Option<String> {
+    let dir = profile_dir()?.join("storage");
+    std::fs::read_to_string(dir.join(crate::net::storage::file_name(origin))).ok()
+}
+
+/// Saves `localStorage` of `origin` in the profile (if there is one).
+fn save_storage(origin: &str, data: &str) {
+    let Some(dir) = profile_dir().map(|d| d.join("storage")) else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let file = dir.join(crate::net::storage::file_name(origin));
+    if data.is_empty() {
+        let _ = std::fs::remove_file(file);
+        return;
+    }
+    let tmp = file.with_extension("tmp");
+    if std::fs::write(&tmp, data).is_ok() {
+        let _ = std::fs::rename(&tmp, file);
+    }
+}
+
+/// The jar as `document.cookie` sees it.
+struct NativeJar;
+
+impl crate::net::cookies::CookieJar for NativeJar {
+    fn document_cookie(&self, url: &str) -> String {
+        let Ok(u) = ::url::Url::parse(url) else { return String::new() };
+        let store = jar().lock().unwrap_or_else(|e| e.into_inner());
+        store
+            .matches(&u)
+            .into_iter()
+            .filter(|c| !c.http_only().unwrap_or(false))
+            .map(|c| format!("{}={}", c.name(), c.value()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn set_document_cookie(&self, url: &str, value: &str) {
+        let Ok(u) = ::url::Url::parse(url) else { return };
+        let Ok(c) = cookie_store::RawCookie::parse(value.to_string()) else { return };
+        // Scripts cannot set HttpOnly cookies or replace one.
+        if c.http_only().unwrap_or(false) {
+            return;
+        }
+        let mut store = jar().lock().unwrap_or_else(|e| e.into_inner());
+        let protected = store
+            .matches(&u)
+            .into_iter()
+            .any(|old| old.name() == c.name() && old.http_only().unwrap_or(false));
+        if protected {
+            return;
+        }
+        let _ = store.insert_raw(&c, &u);
+        save_cookies(&store);
+    }
+}
+
+/// Makes `document.cookie` use the HTTP client's jar.
+fn install_cookie_jar() {
+    crate::net::cookies::install(Box::new(NativeJar));
+}
+
+// ----- HTTP -----------------------------------------------------------------
+
+/// Whether a request with `method` carries its body (GET, HEAD, OPTIONS
+/// and DELETE are sent without one).
+fn sends_body(method: &str) -> bool {
+    !matches!(method, "GET" | "HEAD" | "OPTIONS" | "DELETE" | "TRACE")
+}
+
+/// One HTTP(S) request (any method), following redirects and keeping
+/// cookies set on the way.
+fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
+    let accept = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8";
+    // script requests (fetch, XHR) accept anything
+    let script = request.is_some_and(|r| !r.method.is_empty());
+    let cookies = !request.is_some_and(|r| r.omit_credentials);
+    let mut method = request
+        .map(|r| r.method.to_ascii_uppercase())
+        .filter(|m| !m.is_empty())
+        .unwrap_or_else(|| "GET".into());
+    let mut with_body = request.is_some() && sends_body(&method);
+    let mut at = url.to_string();
+    for _ in 0..=20 {
+        let mut b = ureq::http::Request::builder()
+            .method(method.as_str())
+            .uri(at.as_str())
+            .header("Accept", if script || method != "GET" { "*/*" } else { accept })
+            .header("Accept-Language", crate::net::accept_language());
+        if let Some(r) = request {
+            if !r.referrer.is_empty() {
+                b = b.header("Referer", r.referrer.as_str());
+            }
+            if !r.origin.is_empty() {
+                b = b.header("Origin", r.origin.as_str());
+            }
+            if !r.fetch_site.is_empty() {
+                b = b.header("Sec-Fetch-Site", r.fetch_site.as_str());
+            }
+            if with_body {
+                let ctype = if r.content_type.is_empty() { "text/plain;charset=UTF-8" } else { &r.content_type };
+                b = b.header("Content-Type", ctype);
+            }
+            for (n, v) in &r.headers {
+                b = b.header(n.as_str(), v.as_str());
+            }
+        }
+        if cookies && let Some(c) = cookie_header(&at) {
+            b = b.header("Cookie", c);
+        }
+        let sent = match request.filter(|_| with_body) {
+            Some(r) => agent().run(b.body(&r.body[..]).map_err(|e| e.to_string())?),
+            None => agent().run(b.body(()).map_err(|e| e.to_string())?),
+        };
+        let mut resp = sent.map_err(|e| e.to_string())?;
+        if cookies {
+            store_cookies(&at, resp.headers());
+        }
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|l| l.to_str().ok())
+            .map(|l| url::resolve(&at, l));
+        if status.is_redirection() && status != 304 && let Some(next) = location {
+            // 303, and 301/302 after a POST, continue with GET (Fetch
+            // standard "HTTP-redirect fetch"); 307/308 keep the method.
+            let code = status.as_u16();
+            if (code == 303 && method != "HEAD") || (matches!(code, 301 | 302) && method == "POST") {
+                method = "GET".into();
+                with_body = false;
+            }
+            at = next;
+            continue;
+        }
+        let info = ResponseInfo {
+            status: status.as_u16(),
+            headers: resp
+                .headers()
+                .iter()
+                .map(|(n, v)| (n.as_str().to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned()))
+                .collect(),
+        };
+        let body = resp
+            .body_mut()
+            .with_config()
+            .limit(MAX_BODY)
+            .read_to_vec()
+            .map_err(|e| e.to_string())?;
+        if (status.is_client_error() || status.is_server_error()) && body.is_empty() {
+            // Error pages are still pages; resources fail.
+            return Err(format!("HTTP {status}"));
+        }
+        return Ok(Loaded {
+            body,
+            final_url: (at != url).then_some(at),
+            info: Some(info),
+        });
+    }
+    Err("too many redirects".into())
 }
 
 /// The host without a window (screenshots, `--headless`).
@@ -640,6 +813,14 @@ struct Headless {
     sockets: Sockets,
 }
 impl Host for Headless {
+    fn load_storage(&mut self, origin: &str) -> Option<String> {
+        load_storage(origin)
+    }
+
+    fn save_storage(&mut self, origin: &str, data: &str) {
+        save_storage(origin, data)
+    }
+
     fn fetch(&mut self, id: u32, url: &str) {
         self.fetch_with(id, url, &HttpRequest::default());
     }
@@ -693,6 +874,7 @@ impl Host for Headless {
 /// `Browser.close` or the process is stopped.
 pub fn headless(url: Option<String>, port: u16, shot: &Shot) -> Result<(), Box<dyn Error>> {
     use std::sync::mpsc;
+    install_cookie_jar();
     let (tx, rx) = mpsc::channel();
     let wake = std::sync::Mutex::new(tx.clone());
     let server = Some(start_debugging(port, move |f| {
@@ -762,6 +944,7 @@ pub struct Shot {
 /// Loads `url` without a window, waits for its resources, and writes the
 /// rendered window (chrome and page) to the PNG file `out`.
 pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error>> {
+    install_cookie_jar();
     use std::sync::mpsc;
     let (tx, rx) = mpsc::channel();
     let mut host = Headless { tx, pending: 0, sockets: Sockets::new() };

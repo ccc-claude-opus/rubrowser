@@ -7,6 +7,9 @@
 (function (rb) {
   'use strict';
   const global = globalThis;
+  // A plain copy of the native object, so DOM calls can be wrapped (see
+  // MutationObserver).
+  rb = Object.getOwnPropertyNames(rb).reduce((o, k) => { o[k] = rb[k]; return o; }, {});
 
   // ----- nodes -------------------------------------------------------------
 
@@ -1013,15 +1016,36 @@
 
   // ----- web platform stand-ins ---------------------------------------------
 
-  // Storage lasts for the page (nothing is written to disk).
+  // Web Storage: the browser keeps the items (localStorage per origin,
+  // saved with the profile; sessionStorage per tab). Items are also
+  // properties (`localStorage.theme`), as in browsers.
   class Storage {
-    constructor() { Object.defineProperty(this, '_m', { value: new Map() }); }
-    get length() { return this._m.size; }
-    key(i) { return [...this._m.keys()][i] ?? null; }
-    getItem(k) { return this._m.has(String(k)) ? this._m.get(String(k)) : null; }
-    setItem(k, v) { this._m.set(String(k), String(v)); }
-    removeItem(k) { this._m.delete(String(k)); }
-    clear() { this._m.clear(); }
+    constructor(area) {
+      // (configurable: the proxy lists only the items as own keys)
+      Object.defineProperty(this, '_a', { value: area, configurable: true });
+      return new Proxy(this, {
+        get: (t, k, r) => (typeof k === 'symbol' || k in Storage.prototype || k === '_a' ? Reflect.get(t, k, r) : t.getItem(k) ?? undefined),
+        set: (t, k, v) => { if (typeof k === 'symbol' || k in Storage.prototype) return Reflect.set(t, k, v); t.setItem(k, v); return true; },
+        has: (t, k) => typeof k === 'symbol' || k in Storage.prototype ? k in t : t.getItem(k) !== null,
+        deleteProperty: (t, k) => { t.removeItem(k); return true; },
+        ownKeys: (t) => { const keys = []; for (let i = 0; i < t.length; i++) keys.push(t.key(i)); return keys; },
+        getOwnPropertyDescriptor: (t, k) => {
+          const v = typeof k === 'string' ? t.getItem(k) : null;
+          return v === null ? undefined : { value: v, writable: true, enumerable: true, configurable: true };
+        },
+      });
+    }
+    get length() { return rb.storage(this._a, 4, '', ''); }
+    key(i) { return rb.storage(this._a, 5, String(Math.trunc(Number(i)) || 0), ''); }
+    getItem(k) { return rb.storage(this._a, 0, String(k), ''); }
+    setItem(k, v) {
+      if (rb.storage(this._a, 1, String(k), String(v)) === -2) {
+        throw new DOMException("Failed to execute 'setItem' on 'Storage': Setting the value of '" + k + "' exceeded the quota.", 'QuotaExceededError');
+      }
+    }
+    removeItem(k) { rb.storage(this._a, 2, String(k), ''); }
+    clear() { rb.storage(this._a, 3, '', ''); }
+    get [Symbol.toStringTag]() { return 'Storage'; }
   }
 
   class CustomEvent extends Event {
@@ -1033,35 +1057,234 @@
 
   // Observers: nothing changes size or mutates behind scripts' backs here,
   // and everything counts as visible (so lazy loaders load at once).
-  class MutationObserver {
-    constructor(cb) { this.cb = cb; }
-    observe() {}
-    disconnect() {}
-    takeRecords() { return []; }
+  // ----- MutationObserver (DOM standard §4.3) -------------------------------
+  // Every change scripts make goes through a few rb calls; while observers
+  // exist, those calls record what they change. (Changes the browser makes
+  // itself, such as typing, are not DOM mutations.)
+
+  const mutationObservers = new Set();
+  let mutationsQueued = false;
+  const parentOf = (h) => rb.relative(h, 0);
+  const childrenOf = (h) => { const n = rb.childCount(h); const out = []; for (let i = 0; i < n; i++) out.push(rb.childAt(h, i)); return out; };
+  function isInclusiveAncestor(a, h) {
+    for (let x = h; x >= 0; x = parentOf(x)) if (x === a) return true;
+    return false;
   }
-  class ResizeObserver {
-    constructor(cb) { this.cb = cb; }
-    observe() {}
-    unobserve() {}
-    disconnect() {}
-  }
-  class IntersectionObserver {
-    constructor(cb, options) { this.cb = cb; this.root = (options && options.root) || null; }
-    observe(target) {
-      const entry = {
-        target,
-        isIntersecting: true,
-        intersectionRatio: 1,
-        time: rb.now(),
-        boundingClientRect: {},
-        intersectionRect: {},
-        rootBounds: null,
-      };
-      addTimer(() => this.cb([entry], this), 0, [], false);
+  function queueMutation(type, target, f) {
+    for (const mo of mutationObservers) {
+      let oldValue;
+      let match = false;
+      for (const [node, o] of mo._regs) {
+        if (node !== target && !(o.subtree && isInclusiveAncestor(node, target))) continue;
+        if (type === 'attributes' && (!o.attributes || (o.attributeFilter && !o.attributeFilter.includes(f.attributeName)))) continue;
+        if (type === 'characterData' && !o.characterData) continue;
+        if (type === 'childList' && !o.childList) continue;
+        match = true;
+        if ((type === 'attributes' && o.attributeOldValue) || (type === 'characterData' && o.characterDataOldValue)) oldValue = f.oldValue;
+      }
+      if (!match) continue;
+      mo._records.push({
+        type, target: wrap(target),
+        addedNodes: (f.added || []).map(wrap), removedNodes: (f.removed || []).map(wrap),
+        previousSibling: f.prev >= 0 ? wrap(f.prev) : null, nextSibling: f.next >= 0 ? wrap(f.next) : null,
+        attributeName: f.attributeName ?? null, attributeNamespace: null, oldValue: oldValue ?? null,
+      });
+      if (!mutationsQueued) {
+        mutationsQueued = true;
+        queueMicrotask(() => {
+          mutationsQueued = false;
+          for (const o of [...mutationObservers]) {
+            const records = o.takeRecords();
+            if (records.length) call(o._cb, o, [records, o]);
+          }
+        });
+      }
     }
-    unobserve() {}
-    disconnect() {}
+  }
+  {
+    const raw = {};
+    for (const k of ['insert', 'remove', 'setAttr', 'removeAttr', 'setText', 'setHtml', 'classOp', 'setStyle']) raw[k] = rb[k];
+    const watching = () => mutationObservers.size > 0;
+    const attr = (h, name, change) => {
+      if (!watching()) { const r = change(); observersChanged(); return r; }
+      const old = rb.getAttr(h, name);
+      const r = change();
+      if (rb.getAttr(h, name) !== old || name !== 'class' && name !== 'style') queueMutation('attributes', h, { attributeName: name, oldValue: old });
+      observersChanged();
+      return r;
+    };
+    const list = (h, change) => {
+      if (!watching()) { const r = change(); observersChanged(); return r; }
+      const before = childrenOf(h);
+      const r = change();
+      const after = childrenOf(h);
+      const removed = before.filter((c) => !after.includes(c));
+      const added = after.filter((c) => !before.includes(c));
+      if (removed.length || added.length) queueMutation('childList', h, { added, removed });
+      observersChanged();
+      return r;
+    };
+    rb.setAttr = (h, n, v) => attr(h, n, () => raw.setAttr(h, n, v));
+    rb.removeAttr = (h, n) => (rb.getAttr(h, n) === null ? undefined : attr(h, n, () => raw.removeAttr(h, n)));
+    rb.classOp = (h, op, c) => attr(h, 'class', () => raw.classOp(h, op, c));
+    rb.setStyle = (h, p, v) => attr(h, 'style', () => raw.setStyle(h, p, v));
+    rb.setHtml = (h, html) => list(h, () => raw.setHtml(h, html));
+    rb.setText = (h, t) => {
+      const kind = rb.nodeType(h);
+      if (kind !== 3 && kind !== 8) return list(h, () => raw.setText(h, t));
+      if (!watching()) return raw.setText(h, t);
+      const old = rb.getText(h);
+      const r = raw.setText(h, t);
+      queueMutation('characterData', h, { oldValue: old });
+      return r;
+    };
+    rb.remove = (h) => {
+      const p = parentOf(h);
+      if (p < 0 || !watching()) { const r = raw.remove(h); observersChanged(); return r; }
+      const prev = rb.relative(h, 4), next = rb.relative(h, 3);
+      const r = raw.remove(h);
+      queueMutation('childList', p, { removed: [h], prev, next });
+      observersChanged();
+      return r;
+    };
+    rb.insert = (p, ch, before) => {
+      if (!watching()) { const r = raw.insert(p, ch, before); observersChanged(); return r; }
+      const old = parentOf(ch);
+      if (old >= 0) {
+        const prev = rb.relative(ch, 4), next = rb.relative(ch, 3);
+        raw.remove(ch);
+        queueMutation('childList', old, { removed: [ch], prev, next });
+      }
+      const r = raw.insert(p, ch, before);
+      queueMutation('childList', p, { added: [ch], prev: rb.relative(ch, 4), next: rb.relative(ch, 3) });
+      observersChanged();
+      return r;
+    };
+  }
+  class MutationObserver {
+    constructor(cb) {
+      if (typeof cb !== 'function') throw new TypeError("Failed to construct 'MutationObserver': parameter 1 is not of type 'Function'.");
+      this._cb = cb;
+      this._regs = new Map(); // handle -> options
+      this._records = [];
+    }
+    observe(target, options = {}) {
+      if (!target || target.__h === undefined) throw new TypeError("Failed to execute 'observe' on 'MutationObserver': parameter 1 is not of type 'Node'.");
+      const o = { ...options };
+      if (o.attributeOldValue !== undefined || o.attributeFilter !== undefined) o.attributes ??= true;
+      if (o.characterDataOldValue !== undefined) o.characterData ??= true;
+      if (!o.childList && !o.attributes && !o.characterData) {
+        throw new TypeError("Failed to execute 'observe' on 'MutationObserver': The options object must set at least one of 'attributes', 'characterData', or 'childList' to true.");
+      }
+      if (o.attributeFilter) o.attributeFilter = [...o.attributeFilter].map(String);
+      this._regs.set(target.__h, o);
+      mutationObservers.add(this);
+    }
+    disconnect() { this._regs.clear(); this._records = []; mutationObservers.delete(this); }
+    takeRecords() { const r = this._records; this._records = []; return r; }
+  }
+
+  // ----- IntersectionObserver, ResizeObserver --------------------------------
+  // Checked from the last layout: soon after observe() and DOM changes, on
+  // scroll and resize, and every half second while something is observed.
+
+  const geometryObservers = new Set();
+  let geometryTimer = 0;
+  let geometryPoll = 0;
+  let geometryHooked = false;
+  function observersChanged() {
+    if (!geometryObservers.size) return;
+    if (!geometryHooked) {
+      geometryHooked = true;
+      document.addEventListener('scroll', observersChanged, true);
+      document.addEventListener('resize', observersChanged);
+    }
+    if (!geometryTimer) geometryTimer = addTimer(checkGeometry, 16, [], false);
+  }
+  function checkGeometry() {
+    geometryTimer = 0;
+    for (const o of [...geometryObservers]) o._check();
+    if (geometryObservers.size && !geometryPoll) {
+      geometryPoll = addTimer(() => { geometryPoll = 0; checkGeometry(); }, 500, [], false);
+    }
+  }
+  const rectOf = (x, y, w, h) => ({ x, y, width: w, height: h, top: y, left: x, right: x + w, bottom: y + h, toJSON() { return this; } });
+  function marginOf(spec) {
+    const parts = String(spec || '0px').trim().split(/\s+/).map((v) => parseFloat(v) || 0);
+    const [t, r = t, b = t, l = r] = parts;
+    return [t, r, b, l];
+  }
+
+  class IntersectionObserver {
+    constructor(cb, options = {}) {
+      this._cb = cb;
+      this.root = options.root || null;
+      this.rootMargin = options.rootMargin || '0px';
+      const t = options.threshold ?? 0;
+      this.thresholds = (Array.isArray(t) ? t : [t]).map(Number).sort((a, b) => a - b);
+      if (this.thresholds.some((v) => !(v >= 0 && v <= 1))) throw new RangeError('Threshold values must be numbers between 0 and 1');
+      this._targets = new Map(); // element -> [thresholdIndex, isIntersecting] last reported
+    }
+    observe(el) {
+      if (!this._targets.has(el)) this._targets.set(el, null);
+      geometryObservers.add(this);
+      observersChanged();
+    }
+    unobserve(el) { this._targets.delete(el); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
     takeRecords() { return []; }
+    _check() {
+      const [mt, mr, mb, ml] = marginOf(this.rootMargin);
+      const r = this.root ? this.root.getBoundingClientRect() : rectOf(0, 0, global.innerWidth, global.innerHeight);
+      const root = rectOf(r.left - ml, r.top - mt, r.width + ml + mr, r.height + mt + mb);
+      const entries = [];
+      for (const [el, last] of this._targets) {
+        const b = el.getBoundingClientRect();
+        const x0 = Math.max(b.left, root.left), y0 = Math.max(b.top, root.top);
+        const x1 = Math.min(b.right, root.right), y1 = Math.min(b.bottom, root.bottom);
+        const isIntersecting = el.isConnected && x1 >= x0 && y1 >= y0;
+        const inter = isIntersecting ? rectOf(x0, y0, x1 - x0, y1 - y0) : rectOf(0, 0, 0, 0);
+        const area = b.width * b.height;
+        const ratio = !isIntersecting ? 0 : area > 0 ? (inter.width * inter.height) / area : 1;
+        let index = this.thresholds.findIndex((t) => t > ratio);
+        if (index < 0) index = this.thresholds.length;
+        if (last && last[0] === index && last[1] === isIntersecting) continue;
+        this._targets.set(el, [index, isIntersecting]);
+        entries.push({ target: el, time: rb.now(), rootBounds: root, boundingClientRect: b, intersectionRect: inter, isIntersecting, intersectionRatio: ratio });
+      }
+      if (entries.length) call(this._cb, this, [entries, this]);
+    }
+  }
+
+  class ResizeObserver {
+    constructor(cb) { this._cb = cb; this._targets = new Map(); /* element -> [width, height] last reported */ }
+    observe(el) {
+      if (!this._targets.has(el)) this._targets.set(el, [0, 0]);
+      geometryObservers.add(this);
+      observersChanged();
+    }
+    unobserve(el) { this._targets.delete(el); if (!this._targets.size) geometryObservers.delete(this); }
+    disconnect() { this._targets.clear(); geometryObservers.delete(this); }
+    _check() {
+      const entries = [];
+      for (const [el, last] of this._targets) {
+        const cs = getComputedStyle(el);
+        const px = (p) => parseFloat(cs.getPropertyValue(p)) || 0;
+        const [pt, pr, pb, pl] = ['padding-top', 'padding-right', 'padding-bottom', 'padding-left'].map(px);
+        const w = Math.max(0, el.clientWidth - pl - pr), h = Math.max(0, el.clientHeight - pt - pb);
+        if (w === last[0] && h === last[1]) continue;
+        this._targets.set(el, [w, h]);
+        const b = el.getBoundingClientRect();
+        entries.push({
+          target: el,
+          contentRect: rectOf(pl, pt, w, h),
+          contentBoxSize: [{ inlineSize: w, blockSize: h }],
+          borderBoxSize: [{ inlineSize: b.width, blockSize: b.height }],
+          devicePixelContentBoxSize: [{ inlineSize: w, blockSize: h }],
+        });
+      }
+      if (entries.length) call(this._cb, this, [entries, this]);
+    }
   }
 
   // HTMLHyperlinkElementUtils (HTML §4.6.6): the parts of an <a> or
@@ -2264,6 +2487,8 @@
       this.headers = new Headers(init.headers || (from ? from.headers : undefined));
       this._body = init.body !== undefined ? init.body : from ? from._body : null;
       this.signal = init.signal || (from ? from.signal : null);
+      this.credentials = init.credentials || (from ? from.credentials : 'same-origin');
+      this.mode = init.mode || (from ? from.mode : 'cors');
     }
     clone() { return new Request(this); }
   }
@@ -2383,11 +2608,16 @@
     }
   };
 
-  function httpRequest(method, url, body, contentType, done) {
+  // `headers`: [name, value] pairs (with Content-Type); `options`:
+  // { credentials, mode } as fetch takes them.
+  function httpRequest(method, url, body, headers, options, done) {
     const href = new URL(String(url), location.href).href;
     const local = localResponse(href, method);
     if (local) { addTimer(() => done(...local), 0, [], false); return; }
-    const id = rb.http(href, String(method || 'GET'), body, contentType || '');
+    let lines = '';
+    for (const [k, v] of headers) lines += String(k).replace(/[\r\n:]/g, '') + ': ' + String(v).replace(/[\r\n]/g, ' ') + '\r\n';
+    lines += ':credentials: ' + (options.credentials || 'same-origin') + '\r\n:mode: ' + (options.mode || 'cors') + '\r\n';
+    const id = rb.http(href, String(method || 'GET'), body, lines);
     httpPending.set(id, done);
   }
   // [status, bytes, headers] for blob: and data: URLs (Fetch: "scheme
@@ -2418,11 +2648,13 @@
     let req;
     try { req = new Request(input, init); } catch (e) { return Promise.reject(e); }
     const x = extractBody(req._body);
-    const ctype = req.headers.get('content-type') || x.type || '';
+    const headers = [...req.headers].filter(([k]) => k !== 'content-type');
+    const ctype = req.headers.get('content-type') || x.type;
+    if (ctype) headers.push(['content-type', ctype]);
     return new Promise((resolve, reject) => {
       const signal = req.signal;
       if (signal && signal.aborted) { reject(signal.reason); return; }
-      httpRequest(req.method, req.url, x.body, ctype, (status, bytes, headers) => {
+      httpRequest(req.method, req.url, x.body, headers, req, (status, bytes, headers) => {
         if (signal && signal.aborted) { reject(signal.reason); return; }
         if (!status) { reject(new TypeError('Failed to fetch')); return; }
         const r = new Response(bytes, { status, headers: parseHeaders(headers) });
@@ -2454,7 +2686,10 @@
       this.readyState = 1;
       fireAt(this, 'readystatechange', {});
     }
-    setRequestHeader(k, v) { this._headers[String(k).toLowerCase()] = String(v); }
+    setRequestHeader(k, v) {
+      k = String(k).toLowerCase();
+      this._headers[k] = k in this._headers ? this._headers[k] + ', ' + String(v) : String(v);
+    }
     overrideMimeType() {}
     getResponseHeader(k) { return this.readyState >= 2 ? parseHeaders(this._resp).get(k) : null; }
     getAllResponseHeaders() {
@@ -2473,10 +2708,13 @@
     send(body) {
       const x = extractBody(this._method === 'GET' || this._method === 'HEAD' ? null : body);
       const sent = typeof x.body === 'string' ? rb.encodeUtf8(x.body).length : x.body.length;
-      const ctype = this._headers['content-type'] || x.type || '';
+      const headers = Object.entries(this._headers).filter(([k]) => k !== 'content-type');
+      const ctype = this._headers['content-type'] || x.type;
+      if (ctype) headers.push(['content-type', ctype]);
       fireAt(this, 'loadstart', { loaded: 0, total: 0 });
       if (sent) fireAt(this.upload, 'loadstart', { lengthComputable: true, loaded: 0, total: sent });
-      httpRequest(this._method, this._url, x.body, ctype, (status, bytes, headers) => {
+      const options = { credentials: this.withCredentials ? 'include' : 'same-origin' };
+      httpRequest(this._method, this._url, x.body, headers, options, (status, bytes, headers) => {
         if (this._aborted) return;
         if (sent && status) {
           const up = { lengthComputable: true, loaded: sent, total: sent };
@@ -3476,7 +3714,7 @@
     },
     get language() { return this.languages[0]; },
     platform: '',
-    cookieEnabled: false,
+    cookieEnabled: true,
     onLine: true,
     hardwareConcurrency: 1,
     maxTouchPoints: 0,
@@ -3671,7 +3909,6 @@
     Object.defineProperty(document, 'readyState', { configurable: true, get: () => 'complete' });
   }
   // Cookies set by scripts last for the page.
-  let cookieJar = '';
   // document.domain: the host (setting it is ignored, as in browsers
   // with origin-keyed agent clusters).
   Object.defineProperty(document, 'domain', {
@@ -3679,15 +3916,11 @@
     get: () => location.hostname,
     set: () => {},
   });
+  // The browser's cookie jar, shared with HTTP (HttpOnly cookies hidden).
   Object.defineProperty(document, 'cookie', {
     configurable: true,
-    get: () => cookieJar,
-    set: (v) => {
-      const pair = String(v).split(';')[0];
-      const name = pair.split('=')[0].trim();
-      const rest = cookieJar.split('; ').filter((c) => c && c.split('=')[0] !== name);
-      cookieJar = [...rest, pair.trim()].join('; ');
-    },
+    get: () => rb.cookie(),
+    set: (v) => rb.setCookie(String(v)),
   });
   // The developer tools' Application panel: a snapshot of storage and
   // cookies (lines of tab-separated, percent-encoded fields), and edits.
@@ -3697,7 +3930,7 @@
     for (const [area, s] of [['local', global.localStorage], ['session', global.sessionStorage]]) {
       for (let i = 0; i < s.length; i++) lines.push([area, enc(s.key(i)), enc(s.getItem(s.key(i)))].join('\t'));
     }
-    for (const c of cookieJar.split('; ')) {
+    for (const c of document.cookie.split('; ')) {
       if (!c) continue;
       const at = c.indexOf('=');
       lines.push(['cookie', enc(at < 0 ? '' : c.slice(0, at)), enc(at < 0 ? c : c.slice(at + 1))].join('\t'));
@@ -3705,7 +3938,13 @@
     rb.log('\u0001devtools-storage ' + lines.join('\n'));
   };
   global.__rb_devtools_cookie_delete = function (name) {
-    cookieJar = cookieJar.split('; ').filter((c) => c && c.split('=')[0] !== name).join('; ');
+    // Expired at the paths it may have been set for.
+    const parts = location.pathname.split('/');
+    for (let i = parts.length; i > 0; i--) {
+      const path = parts.slice(0, i).join('/') || '/';
+      document.cookie = name + '=; Max-Age=0; Path=' + path;
+    }
+    document.cookie = name + '=; Max-Age=0';
   };
   // The event handler attributes of Window (HTML §8.1.8.2): pages test
   // `'onwheel' in window` and the like to choose the events they listen to.
@@ -3939,8 +4178,8 @@
     reportError: (e) => reportError(e),
     getSelection: () => ({ rangeCount: 0, removeAllRanges() {}, addRange() {}, toString: () => '' }),
     Storage,
-    localStorage: new Storage(),
-    sessionStorage: new Storage(),
+    localStorage: new Storage(0),
+    sessionStorage: new Storage(1),
     CustomEvent,
     DocumentFragment,
     MutationObserver,

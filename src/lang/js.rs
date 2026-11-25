@@ -287,21 +287,22 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
                 Some(b) => b,
                 None => text(a, 2, c)?.into_bytes(),
             };
-            let (url, method, ctype) = (text(a, 0, c)?, text(a, 1, c)?, text(a, 3, c)?);
+            // The 4th argument: header lines (`name: value\r\n`, with
+            // `:credentials` / `:mode`).
+            let (url, method, lines) = (text(a, 0, c)?, text(a, 1, c)?, text(a, 3, c)?);
             Ok(unsafe {
-                ffi::http(
+                ffi::http_request(
                     url.as_ptr(),
                     url.len(),
                     method.as_ptr(),
                     method.len(),
                     body.as_ptr(),
                     body.len(),
-                    ctype.as_ptr(),
-                    ctype.len(),
+                    lines.as_ptr(),
+                    lines.len(),
                 )
             }
-            .into())
-        }),
+            .into())        }),
         ("httpBody", 1, |_, a, c| {
             let id = int(a, 0, c)?;
             let mut buf = vec![0u8; 64 * 1024];
@@ -312,6 +313,35 @@ fn natives() -> Vec<(&'static str, usize, Native)> {
             }
             buf.truncate(n.max(0) as usize);
             Ok(JsString::from(String::from_utf8_lossy(&buf).as_ref()).into())
+        }),
+        ("storage", 4, |_, a, c| {
+            // (area, op, key, value) → string, null, or a number for ops
+            // that return one (see the `storage` import).
+            let (area, op) = (int(a, 0, c)?, int(a, 1, c)?);
+            let (key, value) = (text(a, 2, c)?, text(a, 3, c)?);
+            let mut buf = vec![0u8; 256];
+            loop {
+                let n = unsafe {
+                    ffi::storage(area, op, key.as_ptr(), key.len(), value.as_ptr(), value.len(), buf.as_mut_ptr(), buf.len())
+                };
+                if !matches!(op, 0 | 5) || n < 0 {
+                    return Ok(if n == -1 && matches!(op, 0 | 5) { JsValue::null() } else { n.into() });
+                }
+                let n = n as usize;
+                if n <= buf.len() {
+                    buf.truncate(n);
+                    return Ok(string(&String::from_utf8_lossy(&buf)));
+                }
+                buf.resize(n, 0);
+            }
+        }),
+        ("cookie", 0, |_, _, _| {
+            Ok(string(&read_string(|p, n| unsafe { ffi::cookie(p, n) }).unwrap_or_default()))
+        }),
+        ("setCookie", 1, |_, a, c| {
+            let v = text(a, 0, c)?;
+            unsafe { ffi::set_cookie(v.as_ptr(), v.len()) };
+            Ok(JsValue::undefined())
         }),
         ("httpBytes", 1, |_, a, c| {
             let id = int(a, 0, c)?;

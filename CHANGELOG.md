@@ -3,6 +3,11 @@
 ## Unreleased
 
 - **Developer tools** (F12, Cmd+Opt+I, Ctrl+Shift+I), docked below the page: Elements (DOM tree, box model outline on the page, attributes, matching rules with declarations that can be turned off, computed values, edits, picking an element), Console (levels, uncaught errors, a JavaScript line with history), Network (requests with headers and bodies), Sources, Application (localStorage, sessionStorage, cookies, `blob:` URLs) and Performance (script call time and instructions, frame times). `--devtools PANEL[:SELECTOR]` for screenshots.
+- **HTTP**: every method (PUT, DELETE, PATCH, HEAD… were sent as POST before) and the headers scripts set (without forbidden ones); redirects are followed by the browser, so cookies set on the way are kept; 303 (and 301/302 after POST) continue with GET.
+- **Cookies**: one jar (cookie_store, MIT OR Apache-2.0) for HTTP and `document.cookie`; HttpOnly cookies are hidden from and protected against scripts; persistent cookies are saved with the profile.
+- **Web Storage** kept by the browser: `localStorage` per origin, saved with the profile (5 MB quota, `QuotaExceededError`); `sessionStorage` per tab, surviving reloads and navigation; items as properties.
+- **Profile**: the window keeps cookies and local storage in the user's data folder (`--user-data-dir DIR` to choose); screenshots and `--headless` keep nothing unless given one.
+- **Observers**: `MutationObserver` records what scripts change (`childList`, `attributes`, `characterData`, `subtree`, filters, old values); `IntersectionObserver` (`root`, `rootMargin`, `threshold`) and `ResizeObserver` follow the layout.
 - **Remote debugging** over the Chrome DevTools Protocol: `--remote-debugging-port N` (127.0.0.1 only) and `--headless`; Browser, Target (flattened sessions), Page, Runtime, DOM, CSS, Network, Input, Overlay and Log. New dependency: serde_json (MIT OR Apache-2.0).
 
 ## 0.3.0

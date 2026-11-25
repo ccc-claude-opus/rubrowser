@@ -165,6 +165,10 @@ pub struct Document {
     media_events: Vec<(NodeId, &'static str)>,
     /// The user has interacted with the page (sound may autoplay).
     pub user_activated: bool,
+    /// The page's `localStorage` and `sessionStorage` areas (set by the
+    /// browser; `None`: storage is unavailable).
+    pub local_storage: Option<crate::net::storage::Shared>,
+    pub session_storage: Option<crate::net::storage::Shared>,
     /// `blob:` URLs the page's scripts created (`URL.createObjectURL`).
     pub blobs: HashMap<String, FileData>,
 }
@@ -214,6 +218,8 @@ impl Document {
             media: Default::default(),
             media_events: Vec::new(),
             user_activated: false,
+            local_storage: None,
+            session_storage: None,
             blobs: HashMap::new(),
         }
     }

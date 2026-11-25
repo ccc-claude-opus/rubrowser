@@ -8,7 +8,9 @@ const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [--keyboard au
   --devtools PANEL open the developer tools at elements, console, network, sources, application or performance
                    (elements:SELECTOR selects an element)
   --remote-debugging-port N  serve the Chrome DevTools Protocol on 127.0.0.1:N (0: any free port)
-  --headless       no window (with --remote-debugging-port)";
+  --headless       no window (with --remote-debugging-port)
+  --user-data-dir DIR  where cookies and local storage are kept (the window's default:
+                   the user's data folder; screenshots and --headless keep nothing without it)";
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -16,6 +18,7 @@ fn main() {
     let mut shot_file = None;
     let mut debug_port: Option<u16> = None;
     let mut headless = false;
+    let mut profile: Option<std::path::PathBuf> = None;
     let mut shot = rubrowser::platform::native::Shot {
         width: 1280,
         height: 900,
@@ -45,6 +48,7 @@ fn main() {
             "--no-js" => shot.javascript = false,
             "--devtools" => shot.devtools = Some(value("--devtools")),
             "--headless" => headless = true,
+            "--user-data-dir" => profile = Some(value("--user-data-dir").into()),
             "--remote-debugging-port" => {
                 let v = value("--remote-debugging-port");
                 debug_port = Some(v.parse().unwrap_or_else(|_| {
@@ -67,6 +71,13 @@ fn main() {
             _ => url = Some(a),
         }
     }
+    // The window keeps a profile by default; tools start clean.
+    let windowed = shot_file.is_none() && !headless;
+    rubrowser::platform::native::set_profile_dir(if windowed {
+        profile.or_else(rubrowser::platform::native::default_profile_dir)
+    } else {
+        profile
+    });
     let result = match shot_file {
         Some(file) => match url {
             Some(u) => rubrowser::platform::native::screenshot(&u, &file, &shot),

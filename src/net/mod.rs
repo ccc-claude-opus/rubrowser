@@ -1,5 +1,7 @@
 //! Loading resources: URLs and fetching.
 
+pub mod cookies;
+pub mod storage;
 pub mod url;
 
 /// The user's preferred languages (BCP 47 tags, most preferred first),

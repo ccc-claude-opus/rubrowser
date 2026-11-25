@@ -68,6 +68,10 @@ imports! {
     fn ws_send(id: i32, p: *const u8, n: usize, text: i32);
     fn ws_close(id: i32, code: i32, p: *const u8, n: usize);
     fn http_headers(id: i32, p: *mut u8, cap: usize) -> i32;
+    fn cookie(p: *mut u8, cap: usize) -> i32;
+    fn storage(area: i32, op: i32, kp: *const u8, kl: usize, vp: *const u8, vl: usize, p: *mut u8, cap: usize) -> i32;
+    fn set_cookie(p: *const u8, n: usize);
+    fn http_request(up: *const u8, ul: usize, mp: *const u8, ml: usize, bp: *const u8, bl: usize, hp: *const u8, hl: usize) -> i32;
     fn files(h: i32, p: *mut u8, cap: usize) -> i32;
     fn file_data(h: i32, i: i32, p: *mut u8, cap: usize) -> i32;
     fn blob_url(up: *const u8, ul: usize, tp: *const u8, tl: usize, dp: *const u8, dl: usize);

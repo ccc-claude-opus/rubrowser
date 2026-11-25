@@ -679,8 +679,10 @@ dependencies = [
  "cookie",
  "document-features",
  "idna",
- "indexmap",
  "log",
+ "serde",
+ "serde_derive",
+ "serde_json",
  "time",
  "url",
 ]
@@ -3416,6 +3418,7 @@ version = "0.3.0"
 dependencies = [
  "arboard",
  "boa_engine",
+ "cookie_store",
  "cpal",
  "csscolorparser",
  "dejavu",
@@ -3434,6 +3437,7 @@ dependencies = [
  "taffy",
  "tungstenite",
  "ureq",
+ "url",
  "wasmi",
  "wasmtime",
  "winit",
@@ -4363,7 +4367,6 @@ checksum = "cde93ff05758a36a851a398a772b0b79a82fbe3c186a46f2696baaeaf84c966b"
 dependencies = [
  "base64",
  "brotli-decompressor",
- "cookie_store",
  "encoding_rs",
  "flate2",
  "log",
@@ -4371,7 +4374,6 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "ureq-proto",
- "url",
  "utf8-zero",
  "webpki-roots 1.0.11",
 ]

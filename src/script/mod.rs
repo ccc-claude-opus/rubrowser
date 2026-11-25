@@ -131,6 +131,28 @@ pub struct HttpCall {
     pub method: String,
     pub body: Vec<u8>,
     pub content_type: String,
+    /// Other headers the script set (without forbidden ones).
+    pub headers: Vec<(String, String)>,
+    /// `fetch`'s `credentials` / XHR's `withCredentials`: `omit`,
+    /// `same-origin` (the default) or `include`.
+    pub credentials: String,
+    /// `fetch`'s `mode`: `cors` (the default), `same-origin`, `no-cors`.
+    pub mode: String,
+}
+
+/// Whether scripts may not set request header `name` (Fetch standard,
+/// "forbidden request-header").
+pub fn forbidden_header(name: &str) -> bool {
+    let n = name.trim().to_ascii_lowercase();
+    matches!(
+        n.as_str(),
+        "accept-charset" | "accept-encoding" | "access-control-request-headers"
+            | "access-control-request-method" | "connection" | "content-length" | "cookie"
+            | "cookie2" | "date" | "dnt" | "expect" | "host" | "keep-alive" | "origin"
+            | "referer" | "set-cookie" | "te" | "trailer" | "transfer-encoding" | "upgrade"
+            | "via" | "user-agent"
+    ) || n.starts_with("proxy-")
+        || n.starts_with("sec-")
 }
 
 /// The event being dispatched, readable through the `event_*` imports.
@@ -934,8 +956,138 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
                 },
                 body,
                 content_type,
+                ..Default::default()
             });
             Ok(id)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "storage",
+        |mut c: C, area: i32, op: i32, kp: i32, kl: i32, vp: i32, vl: i32, p: i32, cap: i32| -> Result<i32, Error> {
+            // Web Storage. area: 0 local, 1 session. op: 0 getItem (the
+            // value, -1 null), 1 setItem (-2: over the quota), 2 removeItem,
+            // 3 clear, 4 length, 5 key(index in the key argument).
+            // Values up to the quota (UTF-8: at most 3 bytes per unit).
+            let max = crate::net::storage::QUOTA * 3 + 4;
+            let key = read_text(&c, kp, kl, max)?;
+            let value = read_text(&c, vp, vl, max)?;
+            let doc = &c.data().doc;
+            let Some(store) = (if area == 0 { &doc.local_storage } else { &doc.session_storage }).clone() else {
+                return Ok(-3);
+            };
+            let out = {
+                let mut a = store.borrow_mut();
+                match op {
+                    0 => match a.get(&key) {
+                        Some(v) => Some(v.to_string()),
+                        None => return Ok(-1),
+                    },
+                    1 => return Ok(if a.set(&key, &value) { 0 } else { -2 }),
+                    2 => {
+                        a.remove(&key);
+                        return Ok(0);
+                    }
+                    3 => {
+                        a.clear();
+                        return Ok(0);
+                    }
+                    4 => return Ok(a.len() as i32),
+                    5 => match key.parse::<usize>().ok().and_then(|i| a.key(i)) {
+                        Some(k) => Some(k.to_string()),
+                        None => return Ok(-1),
+                    },
+                    _ => return Ok(-1),
+                }
+            };
+            write_str(&mut c, p, cap, &out.unwrap_or_default())
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "cookie",
+        |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+            // `document.cookie`: the shared jar's cookies for the page.
+            let url = c.data().doc.url.clone();
+            let v = if crate::net::cookies::cookie_url(&url) {
+                crate::net::cookies::jar().document_cookie(&url)
+            } else {
+                String::new()
+            };
+            write_str(&mut c, p, cap, &v)
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "set_cookie",
+        |c: C, p: i32, n: i32| -> Result<(), Error> {
+            let value = read_str(&c, p, n)?;
+            let url = &c.data().doc.url;
+            if crate::net::cookies::cookie_url(url) {
+                crate::net::cookies::jar().set_document_cookie(url, &value);
+            }
+            Ok(())
+        },
+    )?;
+    l.func_wrap(
+        "rb",
+        "http_request",
+        |mut c: C,
+         up: i32,
+         ul: i32,
+         mp: i32,
+         ml: i32,
+         bp: i32,
+         bl: i32,
+         hp: i32,
+         hl: i32|
+         -> Result<i32, Error> {
+            // Like `http`, with header lines (`name: value\r\n`);
+            // `:credentials` and `:mode` lines carry fetch's options.
+            let url = read_str(&c, up, ul)?;
+            let method = read_str(&c, mp, ml)?.to_ascii_uppercase();
+            let lines = read_str(&c, hp, hl)?;
+            let body = {
+                let mem = memory(&c)?;
+                let data = mem.data(&c);
+                data[range(data, bp, bl.max(0) as usize)?].to_vec()
+            };
+            let mut call = HttpCall {
+                url,
+                method: if method.is_empty() { "GET".into() } else { method },
+                body,
+                ..Default::default()
+            };
+            for line in lines.split("\r\n") {
+                let (name, value) = match line.strip_prefix(':') {
+                    Some(rest) => {
+                        let (n, v) = rest.split_once(':').unwrap_or((rest, ""));
+                        match n {
+                            "credentials" => call.credentials = v.trim().to_string(),
+                            "mode" => call.mode = v.trim().to_string(),
+                            _ => {}
+                        }
+                        continue;
+                    }
+                    None => match line.split_once(':') {
+                        Some((n, v)) => (n.trim(), v.trim()),
+                        None => continue,
+                    },
+                };
+                if name.is_empty() || forbidden_header(name) {
+                    continue;
+                }
+                if name.eq_ignore_ascii_case("content-type") {
+                    call.content_type = value.to_string();
+                } else {
+                    call.headers.push((name.to_string(), value.to_string()));
+                }
+            }
+            let s = c.data_mut();
+            s.next_http += 1;
+            call.id = s.next_http;
+            s.out.http.push(call);
+            Ok(s.next_http)
         },
     )?;
     l.func_wrap(

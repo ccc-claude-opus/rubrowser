@@ -125,6 +125,12 @@ pub struct HttpRequest {
     pub origin: String,
     /// The `Sec-Fetch-Site` header (empty: none).
     pub fetch_site: String,
+    /// Headers a script set (`fetch`, `XMLHttpRequest`), already without
+    /// the forbidden ones and `Content-Type`.
+    pub headers: Vec<(String, String)>,
+    /// Send no cookies and store none from the response (a cross-origin
+    /// request without credentials).
+    pub omit_credentials: bool,
 }
 
 /// What happened on a WebSocket connection (RFC 6455), reported by the
@@ -180,6 +186,14 @@ pub trait Host {
     fn save_download(&mut self, _name: &str, _bytes: &[u8]) -> Result<String, String> {
         Err("this platform cannot save downloads".into())
     }
+    /// The saved `localStorage` of `origin` ([`crate::net::storage::Area::encode`]
+    /// text), if any.
+    fn load_storage(&mut self, _origin: &str) -> Option<String> {
+        None
+    }
+    /// Saves the `localStorage` of `origin` (platforms without a profile
+    /// keep it for the session only).
+    fn save_storage(&mut self, _origin: &str, _data: &str) {}
     /// Wall-clock time in milliseconds since the Unix epoch, if known.
     fn wall_clock(&mut self) -> Option<f64> {
         None

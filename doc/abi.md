@@ -52,6 +52,9 @@ rubrowser 不執行 JavaScript，網頁的行為由 **WebAssembly 模組**負責
 | `http(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, type_ptr, type_len) -> i32` | 發出 HTTP 請求（只限同源），回傳請求編號；完成時瀏覽器呼叫匯出的 `rb_http(id, status)`（`status` 0 表示失敗） |
 | `http_body(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應內容，回傳總長度 |
 | `http_headers(id, ptr, cap) -> i32` | 在 `rb_http` 中讀取回應標頭：每行 `name: value\r\n`（名稱小寫）；`status` 為真正的 HTTP 狀態碼 |
+| `http_request(url_ptr, url_len, method_ptr, method_len, body_ptr, body_len, headers_ptr, headers_len) -> i32` | 同 `http`，但帶標頭行（`name: value\r\n`，含 `Content-Type`；禁止的標頭會被略過）；`:credentials: omit/same-origin/include` 與 `:mode: cors/same-origin/no-cors` 兩行是 `fetch` 的選項 |
+| `cookie(ptr, cap) -> i32` / `set_cookie(ptr, len)` | `document.cookie`：讀出（不含 HttpOnly）與設定一個 cookie；與 HTTP 共用同一個 jar |
+| `storage(area, op, key_ptr, key_len, value_ptr, value_len, out_ptr, cap) -> i32` | Web Storage。`area` 0 `localStorage`、1 `sessionStorage`；`op` 0 `getItem`（寫出值，-1 為 null）、1 `setItem`（-2 超過 5 MB 上限）、2 `removeItem`、3 `clear`、4 `length`、5 `key`（索引放在 key 參數）；-3 表示沒有 storage |
 | `parent(h) -> i32` | 父元素 |
 | `relative(h, which) -> i32` | `which`：0 父節點、1 第一個子節點、2 最後一個子節點、3 下一個兄弟、4 上一個兄弟（含文字節點） |
 | `child_count(h) -> i32` / `child_at(h, i) -> i32` | 子節點數與第 `i` 個子節點 |
