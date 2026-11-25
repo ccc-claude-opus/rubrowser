@@ -196,6 +196,9 @@ struct State {
     scale: f64,
     /// Last pointer position in logical pixels (button events have none).
     pointer: (i32, i32),
+    /// Where the input method's candidate window goes (the focused text
+    /// field, logical pixels); `None`: input methods are off.
+    ime: Option<(i32, i32, i32, i32)>,
 }
 
 struct NativeHost {
@@ -1011,7 +1014,7 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
         browser.render(now(&start), &mut host);
     }
     // A debugging aid: input to play before the screenshot, e.g.
-    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; type 文字; js console.log(1); console 1 + 1; wait 500"
+    // RUBROWSER_INPUT="down 300 400; move 360 420; up 360 420; key C cmd; keydown a; keyup a; type 文字; preedit ㄓㄨㄥ; js console.log(1); console 1 + 1; wait 500"
     // (window logical px; keys are letters or escape/enter/tab/left/right/up/down).
     if let Ok(script) = std::env::var("RUBROWSER_INPUT") {
         for step in script.split(';').map(str::trim).filter(|s| !s.is_empty()) {
@@ -1058,6 +1061,8 @@ pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error
                 }
                 "wait" => std::thread::sleep(Duration::from_millis(num(1).max(0) as u64)),
                 "type" => browser.event(Event::Text(step[4..].trim_start().to_string()), t, &mut host),
+                // an input method's composition (empty: ends it)
+                "preedit" => browser.event(Event::Preedit(step[7..].trim_start().to_string(), None), t, &mut host),
                 // touch-down|touch-move|touch-up ID X Y, tap X Y, swipe X Y X2 Y2 MS (finger 1)
                 "touch-down" | "touch-move" | "touch-up" => {
                     let phase = match w[0] {
@@ -1178,6 +1183,7 @@ impl ApplicationHandler<Fetched> for App {
             ctrl_click: false,
             scale,
             pointer: (-1, -1),
+            ime: None,
         });
     }
 
@@ -1201,6 +1207,21 @@ impl ApplicationHandler<Fetched> for App {
             flush_debugging(&mut s.browser, &self.debugger);
             if s.browser.cdp_wants_close() {
                 return event_loop.exit();
+            }
+            // Input methods only while a text field has the focus (so keys
+            // stay shortcuts elsewhere), placed at that field.
+            let ime = s.browser.ime_area().map(|r| (r.x as i32, r.y as i32, r.w as i32, r.h as i32));
+            if ime != s.ime {
+                if ime.is_some() != s.ime.is_some() {
+                    s.window.set_ime_allowed(ime.is_some());
+                }
+                if let Some((x, y, w, h)) = ime {
+                    s.window.set_ime_cursor_area(
+                        winit::dpi::LogicalPosition::new(x, y),
+                        winit::dpi::LogicalSize::new(w, h),
+                    );
+                }
+                s.ime = ime;
             }
         }
         let Some(s) = self.state.as_ref() else {
@@ -1302,6 +1323,9 @@ impl ApplicationHandler<Fetched> for App {
                 };
                 Some(Event::Wheel { dx, dy })
             }
+            // An input method: its composition, then the committed text.
+            WindowEvent::Ime(winit::event::Ime::Preedit(text, cursor)) => Some(Event::Preedit(text, cursor)),
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => Some(Event::Text(text)),
             WindowEvent::KeyboardInput { event, .. } => {
                 let code = shortcut_code(&event.logical_key, &event.physical_key, s.mods);
                 if std::env::var_os("RUBROWSER_KEYS").is_some() && event.state == ElementState::Pressed {

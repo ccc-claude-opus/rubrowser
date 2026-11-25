@@ -1609,15 +1609,16 @@ impl Painter<'_> {
                 let t = self.dom.text_content(node);
                 t.strip_prefix('\n').unwrap_or(&t).to_string()
             },
-            TextField::text,
+            TextField::display_text,
         );
         let chars: Vec<char> = text.chars().collect();
+        let preedit = field.and_then(TextField::preedit_range);
         let lh = style.line_height_px();
         let m = self.fonts.line_metrics(style.font(), style.font_size);
         let scroll_y = field.map_or(0.0, TextField::scroll_y);
         let focused = self.focus == Some(node);
         let (sel_s, sel_e) = field.map_or((0, 0), TextField::selection);
-        let caret = field.map_or(chars.len(), TextField::caret);
+        let caret = field.map_or(chars.len(), TextField::display_caret);
         let saved = c.clip();
         c.set_clip(
             self.phys(RectF {
@@ -1661,6 +1662,15 @@ impl Painter<'_> {
                     }
                 }
                 self.text(c, style, area.x, baseline, line, style.color);
+                // An input method's composition is underlined.
+                if let Some((p0, p1)) = preedit
+                    && p0 <= start + n
+                    && p1 >= start
+                {
+                    let (a, z) = (p0.max(start) - start, p1.min(start + n) - start);
+                    let line_rect = RectF { x: area.x + xs[a], y: baseline + 2.0, w: xs[z] - xs[a], h: 1.0 };
+                    self.fill(c, line_rect, style.color);
+                }
                 if focused && self.caret && caret >= start && caret <= start + n {
                     let bar = RectF {
                         x: area.x + xs[caret - start],
@@ -1689,9 +1699,10 @@ impl Painter<'_> {
         let focused = self.focus == Some(node);
         let value = field.map_or_else(
             || self.dom.attr(node, "value").unwrap_or("").to_string(),
-            TextField::text,
+            TextField::display_text,
         );
         let shown = display_value(self.dom, node, &value);
+        let preedit = field.and_then(TextField::preedit_range);
         let m = self.fonts.line_metrics(style.font(), style.font_size);
         let baseline = area.y + (area.h - (m.ascent + m.descent)) / 2.0 + m.ascent;
         let saved = c.clip();
@@ -1726,11 +1737,17 @@ impl Painter<'_> {
                 }
             }
             self.text(c, style, x0, baseline, &shown, style.color);
+            // An input method's composition is underlined.
+            if let Some((p0, p1)) = preedit {
+                let xs = TextField::positions(&self.fonts.advances(style.font(), style.font_size, &shown));
+                let (p0, p1) = (p0.min(xs.len() - 1), p1.min(xs.len() - 1));
+                self.fill(c, RectF { x: x0 + xs[p0], y: baseline + 2.0, w: xs[p1] - xs[p0], h: 1.0 }, style.color);
+            }
         }
         if focused && self.caret {
             let xs =
                 TextField::positions(&self.fonts.advances(style.font(), style.font_size, &shown));
-            let caret = field.map_or(0, TextField::caret).min(xs.len() - 1);
+            let caret = field.map_or(0, TextField::display_caret).min(xs.len() - 1);
             let x0 = area.x - field.map_or(0.0, TextField::scroll);
             let bar = RectF {
                 x: x0 + xs[caret],

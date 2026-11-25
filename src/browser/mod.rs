@@ -517,6 +517,12 @@ struct EventInit {
     delta: (f32, f32),
     /// Touch data (see [`crate::script::EventInfo::touch`]).
     touch: String,
+    /// `data` of input and composition events.
+    data: String,
+    /// During an input method's composition.
+    composing: bool,
+    /// `inputType` of input events.
+    input_type: &'static str,
 }
 
 impl EventInit {
@@ -689,6 +695,8 @@ pub struct Browser {
     local: Vec<(u32, Result<Vec<u8>, String>)>,
     /// Last page click (element, time), to detect double clicks.
     last_click: Option<(NodeId, f64)>,
+    /// The input method's composition: the field it is in.
+    composing: Option<(Target, NodeId)>,
     /// The developer tools panel (see `devtools.rs`).
     devtools: devtools::DevTools,
     /// Remote debugging connections (Chrome DevTools Protocol).
@@ -750,6 +758,7 @@ impl Browser {
             shown_tabs: Vec::new(),
             local: Vec::new(),
             last_click: None,
+            composing: None,
             devtools: Default::default(),
             cdp: Default::default(),
             local_storage: HashMap::new(),
@@ -2290,6 +2299,9 @@ impl Browser {
             repeat: init.repeat,
             delta: (init.delta.0 as f64, init.delta.1 as f64),
             touch: init.touch,
+            data: init.data,
+            composing: init.composing,
+            input_type: init.input_type.to_string(),
         };
         let mut prevented = false;
         let mut n = Some(node);
@@ -2578,15 +2590,84 @@ impl Browser {
                 if let Some((t, n)) = self.focused()
                     && self.doc(t).is_text_input(n)
                 {
-                    self.doc_mut(t).input(n).insert(&text);
+                    let composing = self.composing.take().is_some();
+                    let field = self.doc_mut(t).input(n);
+                    field.set_preedit("", None);
+                    field.insert(&text);
                     self.caret_epoch = now;
                     self.dirty = true;
                     if t == Target::Page {
-                        self.dispatch(n, "input", EventInit::default(), host);
+                        let input_type = if composing { "insertCompositionText" } else { "insertText" };
+                        let init = EventInit { data: text.clone(), composing, input_type, ..Default::default() };
+                        self.dispatch(n, "input", init, host);
+                        if composing {
+                            let init = EventInit { data: text, ..Default::default() };
+                            self.dispatch(n, "compositionend", init, host);
+                        }
                     }
                 }
             }
+            Event::Preedit(text, cursor) => self.preedit(text, cursor, host),
         }
+    }
+
+    /// An input method's composition (preedit) in the focused text field:
+    /// shown in the field, with composition events for the page. An empty
+    /// text ends it (a commit follows as [`Event::Text`], or not when it
+    /// was cancelled).
+    fn preedit(&mut self, text: String, cursor: Option<(usize, usize)>, host: &mut dyn Host) {
+        let Some((t, n)) = self.focused().filter(|&(t, n)| self.doc(t).is_text_input(n)) else {
+            return;
+        };
+        // The cursor as a char index within the text.
+        let at = cursor.map(|(_, end)| text.get(..end).map_or(0, |s| s.chars().count()));
+        self.doc_mut(t).input(n).set_preedit(&text, at);
+        self.dirty = true;
+        if t != Target::Page {
+            self.composing = (!text.is_empty()).then_some((t, n));
+            return;
+        }
+        if self.composing.is_none() && !text.is_empty() {
+            self.composing = Some((t, n));
+            self.dispatch(n, "compositionstart", EventInit::default(), host);
+        }
+        if self.composing.is_some() && !text.is_empty() {
+            let init = EventInit { data: text, composing: true, ..Default::default() };
+            self.dispatch(n, "compositionupdate", init, host);
+        }
+    }
+
+    /// A composition that ended without a commit (cancelled): its
+    /// `compositionend`, at the next frame (a commit comes before that).
+    fn composition_cancelled(&mut self, host: &mut dyn Host) {
+        let Some((t, n)) = self.composing else { return };
+        let ended = self.doc(t).dom.get(n).is_none()
+            || self.focused() != Some((t, n))
+            || !self.doc_mut(t).input(n).has_preedit();
+        if ended {
+            self.composing = None;
+            if self.doc(t).dom.get(n).is_some() {
+                self.doc_mut(t).input(n).set_preedit("", None);
+            }
+            if t == Target::Page && self.doc(t).dom.get(n).is_some() {
+                self.dispatch(n, "compositionend", EventInit::default(), host);
+            }
+        }
+    }
+
+    /// The caret of the focused text field in window coordinates, for the
+    /// input method's candidate window; `None` without a text field.
+    pub fn ime_area(&self) -> Option<RectF> {
+        let (t, n) = self.focused().filter(|&(t, n)| self.doc(t).is_text_input(n))?;
+        let r = self.doc(t).content_box(n)?;
+        let (ox, oy) = match t {
+            Target::Page => {
+                let vp = self.viewport_rect();
+                (vp.x, vp.y)
+            }
+            Target::Chrome => (0.0, 0.0),
+        };
+        Some(RectF { x: ox + r.x, y: oy + r.y, w: r.w.max(1.0), h: r.h.max(1.0) })
     }
 
     fn mouse_move(&mut self, x: f32, y: f32, host: &mut dyn Host) {
@@ -4034,6 +4115,9 @@ impl Browser {
     /// Draws the whole browser and returns the result.
     pub fn render(&mut self, now: f64, host: &mut dyn Host) -> &Canvas {
         self.now = now;
+        // (not in update_layout: input events run that too, and a commit
+        // follows the preedit's end in the same batch of events)
+        self.composition_cancelled(host);
         // Frame timings for the developer tools' Performance panel.
         #[cfg(not(target_arch = "wasm32"))]
         let started = std::time::Instant::now();
@@ -7760,5 +7844,74 @@ mod tests {
         assert!(logs.contains("put done"), "{logs}");
         assert!(logs.contains("denied failed"), "{logs}");
         assert!(logs.contains("Method DELETE is not allowed"), "{logs}");
+    }
+
+    // ----- input methods (IME) ----------------------------------------------
+
+    #[test]
+    fn input_method_composition() {
+        let mut h = NetHost::default();
+        let mut b = Browser::new(1000, 700, 1.0);
+        net_page(
+            &mut b,
+            &mut h,
+            "https://ime.test/",
+            "<input id=f><script>\
+             const f = document.getElementById('f');\
+             for (const t of ['compositionstart', 'compositionupdate', 'compositionend']) f.addEventListener(t, (e) => console.log(t, JSON.stringify(e.data), e instanceof CompositionEvent));\
+             f.addEventListener('input', (e) => console.log('input', e.inputType, JSON.stringify(e.data), e.isComposing, f.value));</script>",
+        );
+        let f = page_el(&b, "f");
+        let r = b.tabs[b.active].doc.content_box(f).unwrap();
+        let vp = b.viewport_rect();
+        let (x, y) = ((vp.x + r.x + 5.0) as i32, (vp.y + r.y + 5.0) as i32);
+        b.event(Event::MouseDown { x, y, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x, y, button: 0 }, 0.0, &mut h);
+        b.render(0.0, &mut h);
+        let area = b.ime_area().expect("a focused field has an IME area");
+        assert!(area.x >= vp.x && area.y >= vp.y, "{area:?}");
+        b.event(Event::Text("a".into()), 0.0, &mut h);
+        // Zhuyin: ㄋㄧˇ composes, then 你 is committed (winit clears the
+        // preedit right before the commit).
+        b.event(Event::Preedit("ㄋ".into(), Some((3, 3))), 0.0, &mut h);
+        b.event(Event::Preedit("ㄋㄧˇ".into(), Some((8, 8))), 0.0, &mut h);
+        {
+            let field = b.tabs[b.active].doc.input(f);
+            assert_eq!(field.display_text(), "aㄋㄧˇ", "shown in the field");
+            assert_eq!(field.text(), "a", "not the value yet");
+            assert_eq!(field.preedit_range(), Some((1, 4)));
+        }
+        b.event(Event::Preedit(String::new(), None), 0.0, &mut h);
+        b.event(Event::Text("你".into()), 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.input_value(f), "a你");
+        // A cancelled composition ends at the next frame, without text.
+        b.event(Event::Preedit("ㄏ".into(), None), 0.0, &mut h);
+        b.event(Event::Preedit(String::new(), None), 0.0, &mut h);
+        b.render(0.0, &mut h);
+        assert_eq!(b.tabs[b.active].doc.input_value(f), "a你");
+        let logs = h.logs.join("\n");
+        let want = [
+            "input insertText \"a\" false a",
+            "compositionstart \"\" true",
+            "compositionupdate \"ㄋ\" true",
+            "compositionupdate \"ㄋㄧˇ\" true",
+            "input insertCompositionText \"你\" true a你",
+            "compositionend \"你\" true",
+            "compositionstart \"\" true",
+            "compositionupdate \"ㄏ\" true",
+            "compositionend \"\" true",
+        ];
+        assert_eq!(logs, want.join("\n"));
+        // The address bar composes too.
+        let a = b.chrome_el("address").unwrap();
+        let r = b.chrome.content_box(a).unwrap();
+        b.event(Event::MouseDown { x: r.x as i32 + 5, y: r.y as i32 + 5, button: 0 }, 0.0, &mut h);
+        b.event(Event::MouseUp { x: r.x as i32 + 5, y: r.y as i32 + 5, button: 0 }, 0.0, &mut h);
+        b.chrome.set_input_value(a, "");
+        b.event(Event::Preedit("ㄓ".into(), None), 0.0, &mut h);
+        b.event(Event::Preedit(String::new(), None), 0.0, &mut h);
+        b.event(Event::Text("中".into()), 0.0, &mut h);
+        assert_eq!(b.chrome.input_value(a), "中");
     }
 }

@@ -182,6 +182,12 @@ pub struct EventInfo {
     /// separated list of `id,x,y,target`; for pointer and mouse events from
     /// a finger `"touch <id> <primary 0|1>"`; empty otherwise.
     pub touch: String,
+    /// `data` of input and composition events.
+    pub data: String,
+    /// `isComposing` of input and keyboard events.
+    pub composing: bool,
+    /// `inputType` of input events (`insertText`, …).
+    pub input_type: String,
 }
 
 struct State {
@@ -1681,10 +1687,13 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         "rb",
         "event_string",
         |mut c: C, which: i32, p: i32, cap: i32| -> Result<i32, Error> {
-            // which: 0 type, 1 key, 2 touch data.
+            // which: 0 type, 1 key, 2 touch data, 3 data (input and
+            // composition events), 4 inputType.
             let v = c.data().event.as_ref().map(|e| match which {
                 0 => e.kind.clone(),
                 2 => e.touch.clone(),
+                3 => e.data.clone(),
+                4 => e.input_type.clone(),
                 _ => e.key.clone(),
             });
             match v {
@@ -1694,8 +1703,10 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         },
     )?;
     l.func_wrap("rb", "event_int", |c: C, which: i32| -> i32 {
-        // which: 0 target, 1 current target, 2 key code, 3 modifiers, 4 button, 5 repeat.
+        // which: 0 target, 1 current target, 2 key code, 3 modifiers, 4 button, 5 repeat,
+        // 6 isComposing.
         c.data().event.as_ref().map_or(-1, |e| match which {
+            6 => e.composing as i32,
             0 => e.target as i32,
             1 => e.current as i32,
             2 => e.key_code,

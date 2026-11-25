@@ -605,6 +605,7 @@
     if (/^(focus|blur)/.test(type)) return eventInterfaces.FocusEvent;
     if (type === 'wheel') return eventInterfaces.WheelEvent;
     if (type === 'input' || type === 'beforeinput') return eventInterfaces.InputEvent;
+    if (type.startsWith('composition')) return eventInterfaces.CompositionEvent;
     if (type === 'submit') return eventInterfaces.SubmitEvent;
     return Event;
   }
@@ -629,7 +630,16 @@
       clientY: rb.eventPos(1),
       button: rb.eventInt(4),
     });
-    if (e instanceof eventInterfaces.KeyboardEvent) e.repeat = rb.eventInt(5) === 1;
+    if (e instanceof eventInterfaces.KeyboardEvent) {
+      e.repeat = rb.eventInt(5) === 1;
+      e.isComposing = rb.eventInt(6) === 1;
+    }
+    if (e instanceof eventInterfaces.InputEvent) {
+      e.inputType = rb.eventString(4) || '';
+      e.data = e.inputType ? rb.eventString(3) : null;
+      e.isComposing = rb.eventInt(6) === 1;
+    }
+    if (e instanceof eventInterfaces.CompositionEvent) e.data = rb.eventString(3) || '';
     const touch = rb.eventString(2) || '';
     if (e instanceof eventInterfaces.TouchEvent) {
       // "<touches>|<changed>", each "id,x,y,target;…" (Touch Events)

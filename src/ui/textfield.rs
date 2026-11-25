@@ -28,6 +28,10 @@ pub struct TextField {
     /// Vertical scroll in logical pixels (multi-line only).
     scroll_y: f32,
     multiline: bool,
+    /// An input method's composition, shown at the caret (not part of
+    /// the value yet), and the cursor in it (a char index).
+    preedit: Vec<char>,
+    preedit_cursor: usize,
 }
 
 impl TextField {
@@ -123,6 +127,36 @@ impl TextField {
     }
     pub fn text(&self) -> String {
         self.chars.iter().collect()
+    }
+
+    /// Shows an input method's composition `text` at the caret, with its
+    /// cursor at char `cursor` (the end when `None`); empty: none.
+    pub fn set_preedit(&mut self, text: &str, cursor: Option<usize>) {
+        self.preedit = text.chars().collect();
+        self.preedit_cursor = cursor.unwrap_or(self.preedit.len()).min(self.preedit.len());
+    }
+
+    pub fn has_preedit(&self) -> bool {
+        !self.preedit.is_empty()
+    }
+
+    /// The text as shown: with the composition at the caret.
+    pub fn display_text(&self) -> String {
+        if self.preedit.is_empty() {
+            return self.text();
+        }
+        let at = self.caret.min(self.chars.len());
+        self.chars[..at].iter().chain(&self.preedit).chain(&self.chars[at..]).collect()
+    }
+
+    /// The caret in [`TextField::display_text`].
+    pub fn display_caret(&self) -> usize {
+        self.caret + self.preedit_cursor
+    }
+
+    /// The composition's char range in [`TextField::display_text`].
+    pub fn preedit_range(&self) -> Option<(usize, usize)> {
+        (!self.preedit.is_empty()).then(|| (self.caret, self.caret + self.preedit.len()))
     }
 
     pub fn set_text(&mut self, text: &str) {

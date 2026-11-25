@@ -80,8 +80,13 @@ pub enum Event {
         key: i32,
         mods: Modifiers,
     },
-    /// Typed text (already composed, without control characters).
+    /// Typed text (already composed, without control characters); while
+    /// an input method composes, its committed text.
     Text(String),
+    /// An input method's composition in progress (IME preedit): the text
+    /// and the selection in it (byte offsets), or an empty text when the
+    /// composition ends.
+    Preedit(String, Option<(usize, usize)>),
     /// A finger on a touch screen; `id` stays the same from start to end.
     Touch {
         id: u64,

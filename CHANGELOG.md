@@ -8,6 +8,7 @@
 - **Web Storage** kept by the browser: `localStorage` per origin, saved with the profile (5 MB quota, `QuotaExceededError`); `sessionStorage` per tab, surviving reloads and navigation; items as properties.
 - **Profile**: the window keeps cookies and local storage in the user's data folder (`--user-data-dir DIR` to choose); screenshots and `--headless` keep nothing unless given one.
 - **CORS** for cross-origin `fetch`/`XMLHttpRequest` (they were refused): `Origin`, preflights, the `Access-Control-Allow-*` checks, exposed headers only, credentials modes, `no-cors` opaque responses, checks after cross-origin redirects.
+- **Input methods (IME)**: compositions (Zhuyin, Pinyin, Cangjie, Japanese, Korean…) show underlined in text fields and the address bar, the candidate window sits at the field, and pages get `compositionstart`/`compositionupdate`/`compositionend` and `input` events with `data`, `inputType` and `isComposing` (through winit's IME events; input methods are on only while a text field has the focus).
 - **Observers**: `MutationObserver` records what scripts change (`childList`, `attributes`, `characterData`, `subtree`, filters, old values); `IntersectionObserver` (`root`, `rootMargin`, `threshold`) and `ResizeObserver` follow the layout.
 - **Remote debugging** over the Chrome DevTools Protocol: `--remote-debugging-port N` (127.0.0.1 only) and `--headless`; Browser, Target (flattened sessions), Page, Runtime, DOM, CSS, Network, Input, Overlay and Log. New dependency: serde_json (MIT OR Apache-2.0).
 
