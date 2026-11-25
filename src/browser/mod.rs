@@ -1928,6 +1928,7 @@ impl Browser {
             return (false, false);
         };
         let out = script.take_output();
+        self.record_call(i, si);
         for msg in &out.logs {
             self.console_message(i, msg, host);
         }
@@ -2814,7 +2815,7 @@ impl Browser {
                 while let Some(id) = n {
                     if let Some(cmd) = dom.attr(id, "data-dt") {
                         let cmd = cmd.to_string();
-                        return self.devtools_command(&cmd);
+                        return self.devtools_command(&cmd, host);
                     }
                     let tab = dom
                         .attr(id, "data-tab")
@@ -3461,7 +3462,7 @@ impl Browser {
             if !self.devtools.open {
                 self.open_devtools("elements");
             }
-            return self.devtools_command("inspect");
+            return self.devtools_command("inspect", host);
         }
         if self.devtools.open && self.devtools_key(code) {
             return;
@@ -3668,6 +3669,7 @@ impl Browser {
         if self.dirty {
             self.sync_chrome(host);
         }
+        self.devtools_tick(host);
         self.sync_devtools();
         let (w, h) = self.logical_size();
         self.chrome.set_viewport(w, h);
@@ -3867,7 +3869,12 @@ impl Browser {
     /// Draws the whole browser and returns the result.
     pub fn render(&mut self, now: f64, host: &mut dyn Host) -> &Canvas {
         self.now = now;
+        // Frame timings for the developer tools' Performance panel.
+        #[cfg(not(target_arch = "wasm32"))]
+        let started = std::time::Instant::now();
         self.update_layout(host);
+        #[cfg(not(target_arch = "wasm32"))]
+        let updated = std::time::Instant::now();
         // A new document (or tab) under a pointer that has not moved: hover
         // it as if the pointer moved, so the status bubble and :hover
         // follow the page shown.
@@ -3899,6 +3906,12 @@ impl Browser {
                 .paint(&mut self.canvas, (vp.x, vp.y), scale, &self.fonts);
         }
         self.paint_devtools_overlay();
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1000.0;
+            let done = std::time::Instant::now();
+            self.record_frame(ms(started, updated), ms(updated, done));
+        }
         // The status bubble and the context menu are part of the chrome but
         // sit above the page.
         // (repainted exactly: around them the chrome would paint its
@@ -6977,7 +6990,7 @@ mod tests {
         assert_eq!(doc.dom.attr(card, "style"), None);
         let text = doc.dom.children(card)[0];
         // (a lone text child shares its element's row: select it directly)
-        b.devtools_command(&format!("select:{text}"));
+        b.devtools_command(&format!("select:{text}"), &mut h);
         b.render(0.0, &mut h);
         let r = chrome_rect(&b, "dt-edit");
         click_at(&mut b, &mut h, r);
@@ -7079,5 +7092,121 @@ mod tests {
         assert!(detail.contains("{\"ok\":true}"), "the response: {detail}");
         click_dt(&mut b, &mut h, "clear");
         assert_eq!(chrome_text(&b, "dt-requests"), "NameStatusTypeSizeTime");
+    }
+
+    #[test]
+    fn devtools_sources_lists_scripts_and_styles() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<style>p { color: red }</style><script src=app.js></script><script>var inline = 1;</script>",
+        );
+        let js = h.fetched.iter().find(|f| f.1.ends_with("app.js")).unwrap().0;
+        b.fetch_done(js, Ok(b"// app\nvar app = 2;\n".to_vec()), &mut h);
+        b.open_devtools("sources");
+        b.render(0.0, &mut h);
+        let files = chrome_text(&b, "dt-files");
+        assert_eq!(files, "HTML dt.testJS app.jsCSS (inline style 1)JS (inline script 1)", "{files}");
+        assert!(chrome_text(&b, "dt-code").contains("<style>p { color: red }</style>"));
+        click_dt(&mut b, &mut h, &format!("src:net:{js}"));
+        let code = chrome_text(&b, "dt-code");
+        assert!(code.starts_with("1\n2\n// app\nvar app = 2;"), "line numbers and text: {code:?}");
+        let style = b.tabs[b.active].doc.dom.find_tag(crate::dom::Dom::ROOT, "style").unwrap();
+        click_dt(&mut b, &mut h, &format!("src:node:{style}"));
+        assert!(chrome_text(&b, "dt-code").contains("p { color: red }"));
+    }
+
+    #[test]
+    fn devtools_application_shows_and_edits_storage() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<script>localStorage.setItem('theme', 'dark'); sessionStorage.setItem('tab', '3'); \
+             document.cookie = 'sid=a b'; URL.createObjectURL(new Blob(['hi'], { type: 'text/plain' }));</script>",
+        );
+        b.open_devtools("application");
+        b.render(0.0, &mut h);
+        let store = chrome_text(&b, "dt-store");
+        for want in ["Local storage✕themedark", "Session storage✕tab3", "Cookies✕sida b", "text/plain 2 B"] {
+            assert!(store.contains(want), "{want} in {store}");
+        }
+        click_dt(&mut b, &mut h, "del:local:theme");
+        let r = chrome_rect(&b, "dt-app-edit");
+        click_at(&mut b, &mut h, r);
+        type_text(&mut b, &mut h, "mode=新");
+        press(&mut b, &mut h, key::ENTER, Modifiers::default());
+        b.render(0.0, &mut h);
+        let store = chrome_text(&b, "dt-store");
+        assert!(store.contains("Local storage✕mode新Session"), "{store}");
+        click_dt(&mut b, &mut h, "clear");
+        let store = chrome_text(&b, "dt-store");
+        assert!(store.contains("Local storage(empty)Session storage(empty)Cookies(empty)"), "{store}");
+    }
+
+    #[test]
+    fn devtools_performance_counts_script_calls() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<button id=go onclick='let x = 0; for (let i = 0; i < 1000; i++) x += i'>go</button>\
+             <script>setTimeout(() => {}, 5);</script>",
+        );
+        b.render(10.0, &mut h);
+        click_page(&mut b, &mut h, "go");
+        b.open_devtools("performance");
+        b.render(20.0, &mut h);
+        let perf = chrome_text(&b, "dt-perf");
+        assert!(perf.contains("timer1"), "{perf}");
+        assert!(perf.contains("event1"), "{perf}");
+        assert!(perf.contains("event click"), "the slowest calls: {perf}");
+        assert!(perf.contains("Frames (last"), "{perf}");
+        let calls = &b.tabs[b.active].dev.calls;
+        let click = calls.iter().find(|c| c.stats.label == "event click").unwrap();
+        assert!(click.stats.fuel > 1000, "the loop's instructions are counted");
+    }
+
+    #[test]
+    fn devtools_styles_turn_declarations_off_and_edit_them() {
+        let (mut b, mut h) = browser();
+        load(
+            &mut b,
+            &mut h,
+            "https://dt.test/",
+            "<style>p { color: rgb(255, 0, 0); margin: 0 }</style><p id=p style='font-size: 30px; padding: 2px'>x</p>",
+        );
+        // Tall enough for the whole Styles pane.
+        b.resize(1000, 1600, 1.0);
+        b.devtools.height = 1200.0;
+        b.inspect_selector("#p");
+        b.render(0.0, &mut h);
+        let p = page_el(&b, "p");
+        let color = |b: &mut Browser| b.tabs[b.active].doc.computed_value(p, "color").unwrap();
+        assert_eq!(color(&mut b), "rgb(255, 0, 0)");
+        let side = chrome_text(&b, "dt-side-content");
+        assert!(side.contains("☑ color: rgb(255, 0, 0);"), "{side}");
+        // Turning the rule's color off: the inherited color shows.
+        let rule = b.tabs[b.active].doc.matched_rules(p).into_iter().find(|r| &*r.selector == "p").unwrap();
+        click_dt(&mut b, &mut h, &format!("decl:{}:0", rule.decls_id));
+        assert_eq!(color(&mut b), "rgb(0, 0, 0)");
+        assert!(chrome_text(&b, "dt-side-content").contains("☐ color: rgb(255, 0, 0);"));
+        click_dt(&mut b, &mut h, &format!("decl:{}:0", rule.decls_id));
+        assert_eq!(color(&mut b), "rgb(255, 0, 0)");
+        // element.style: off, back on, and a new property.
+        click_dt(&mut b, &mut h, "inline:0");
+        assert_eq!(b.tabs[b.active].doc.dom.attr(p, "style"), Some("padding: 2px"));
+        assert!(chrome_text(&b, "dt-side-content").contains("☐ font-size: 30px;"));
+        click_dt(&mut b, &mut h, "inline:1");
+        assert_eq!(b.tabs[b.active].doc.dom.attr(p, "style"), Some("padding: 2px; font-size: 30px"));
+        b.devtools_edit("background-color: blue;");
+        assert_eq!(
+            b.tabs[b.active].doc.dom.attr(p, "style"),
+            Some("padding: 2px; font-size: 30px; background-color: blue")
+        );
     }
 }

@@ -114,6 +114,9 @@ pub struct Document {
     requested_fonts: std::collections::HashSet<String>,
     /// The cascade index for the current sheets and viewport.
     cascade: Option<(Vec<*const Sheet>, MediaEnv, Rc<Cascade>)>,
+    /// Style rule declarations turned off in the developer tools (see
+    /// [`Cascade::disabled`]).
+    disabled_decls: std::collections::HashSet<(usize, usize)>,
     styles: Vec<Option<Style>>,
     /// `::before` / `::after` / `::marker` styles.
     pub pseudo: HashMap<(NodeId, PseudoElement), Style>,
@@ -179,6 +182,7 @@ impl Document {
             requested_imports: Default::default(),
             requested_fonts: Default::default(),
             cascade: None,
+            disabled_decls: Default::default(),
             styles: Vec::new(),
             pseudo: HashMap::new(),
             generated: Vec::new(),
@@ -726,6 +730,23 @@ impl Document {
         ))
     }
 
+    /// Turns declaration `index` of style rule block `decls_id` (see
+    /// [`crate::css::MatchedRule`]) off or back on; returns whether it is on.
+    pub fn toggle_declaration(&mut self, decls_id: usize, index: usize) -> bool {
+        let key = (decls_id, index);
+        if !self.disabled_decls.remove(&key) {
+            self.disabled_decls.insert(key);
+        }
+        self.cascade = None;
+        self.needs_style = true;
+        !self.disabled_decls.contains(&key)
+    }
+
+    /// Whether a style rule declaration is turned off.
+    pub fn declaration_disabled(&self, decls_id: usize, index: usize) -> bool {
+        self.disabled_decls.contains(&(decls_id, index))
+    }
+
     /// The style rules that apply to element `n`, the winning ones first
     /// (the developer tools' Styles pane).
     pub fn matched_rules(&self, n: NodeId) -> Vec<crate::css::MatchedRule> {
@@ -771,7 +792,9 @@ impl Document {
             let cascade = match &self.cascade {
                 Some((k, e, c)) if *k == keys && *e == env => c.clone(),
                 _ => {
-                    let c = Rc::new(Cascade::with_quirks(&sheets, &env, self.dom.quirks));
+                    let mut c = Cascade::with_quirks(&sheets, &env, self.dom.quirks);
+                    c.disabled = self.disabled_decls.clone();
+                    let c = Rc::new(c);
                     self.cascade = Some((keys, env, c.clone()));
                     c
                 }

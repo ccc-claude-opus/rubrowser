@@ -234,12 +234,17 @@ pub struct Cascade {
     pub has_container_rules: bool,
     /// `@keyframes` by name (the last definition wins).
     pub keyframes: HashMap<String, Rc<[animation::Keyframe]>>,
+    /// Declarations turned off in the developer tools: (the rule's
+    /// declaration block, [`MatchedRule::decls_id`], index).
+    pub disabled: std::collections::HashSet<(usize, usize)>,
 }
 
 /// A style rule that applies to an element (for the developer tools).
 pub struct MatchedRule {
     pub selector: Rc<str>,
     pub decls: Rc<[Decl]>,
+    /// Identifies the declaration block (for turning declarations off).
+    pub decls_id: usize,
     /// Whether it comes from the browser's own (user agent) style sheet.
     pub user_agent: bool,
 }
@@ -265,6 +270,7 @@ impl Cascade {
             .map(|r| MatchedRule {
                 selector: r.selector.text.clone(),
                 decls: r.decls.clone(),
+                decls_id: Rc::as_ptr(&r.decls) as *const Decl as usize,
                 user_agent: r.origin == 0,
             })
             .collect()
@@ -287,6 +293,7 @@ impl Cascade {
             within: Vec::new(),
             has_container_rules: false,
             keyframes: HashMap::new(),
+            disabled: Default::default(),
         };
         let ua = ua_sheet();
         c.add(&ua.rules, 0, env, "");
@@ -931,7 +938,11 @@ fn cascade_element(
         {
             continue;
         }
-        for d in r.decls.iter() {
+        let block = Rc::as_ptr(&r.decls) as *const Decl as usize;
+        for (k, d) in r.decls.iter().enumerate() {
+            if !cascade.disabled.is_empty() && cascade.disabled.contains(&(block, k)) {
+                continue;
+            }
             decls.push(Matched {
                 rank: rank(
                     d.important,

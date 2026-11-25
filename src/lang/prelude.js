@@ -3646,6 +3646,24 @@
       cookieJar = [...rest, pair.trim()].join('; ');
     },
   });
+  // The developer tools' Application panel: a snapshot of storage and
+  // cookies (lines of tab-separated, percent-encoded fields), and edits.
+  global.__rb_devtools_storage = function () {
+    const lines = [];
+    const enc = encodeURIComponent;
+    for (const [area, s] of [['local', global.localStorage], ['session', global.sessionStorage]]) {
+      for (let i = 0; i < s.length; i++) lines.push([area, enc(s.key(i)), enc(s.getItem(s.key(i)))].join('\t'));
+    }
+    for (const c of cookieJar.split('; ')) {
+      if (!c) continue;
+      const at = c.indexOf('=');
+      lines.push(['cookie', enc(at < 0 ? '' : c.slice(0, at)), enc(at < 0 ? c : c.slice(at + 1))].join('\t'));
+    }
+    rb.log('\u0001devtools-storage ' + lines.join('\n'));
+  };
+  global.__rb_devtools_cookie_delete = function (name) {
+    cookieJar = cookieJar.split('; ').filter((c) => c && c.split('=')[0] !== name).join('; ');
+  };
   // The event handler attributes of Window (HTML §8.1.8.2): pages test
   // `'onwheel' in window` and the like to choose the events they listen to.
   for (const name of ['load', 'domcontentloaded', 'keydown', 'keyup', 'keypress', 'click', 'dblclick', 'contextmenu', 'message', 'hashchange',

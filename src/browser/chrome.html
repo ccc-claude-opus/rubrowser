@@ -250,6 +250,9 @@
   #devtools.elements #dt-elements { display: flex; }
   #devtools.console #dt-console { display: flex; flex-direction: column; }
   #devtools.network #dt-network { display: flex; }
+  #devtools.sources #dt-sources { display: flex; }
+  #devtools.application #dt-application { display: flex; flex-direction: column; }
+  #devtools.performance #dt-performance { display: flex; }
   #devtools.console #dt-filters { display: flex; }
   #dt-filters { display: none; gap: 2px; }
 
@@ -336,6 +339,36 @@
   .dt-req .sz { width: 64px; flex-shrink: 0; text-align: right; }
   .dt-req .tm { width: 56px; flex-shrink: 0; text-align: right; }
   .dt-body { white-space: pre-wrap; padding: 4px; background: #2b2d31; }
+  .dt-chk { display: inline-block; width: 14px; color: #9aa0a6; }
+  .dt-off { color: #7c7f86; text-decoration: line-through; }
+
+  #dt-files { width: 240px; flex-shrink: 0; overflow: auto; border-right: 1px solid #3c3f45; }
+  .dt-file { padding: 2px 8px; line-height: 18px; white-space: nowrap; overflow: hidden; }
+  .dt-file:hover { background: #2f3238; }
+  .dt-file.sel { background: #394457; }
+  .dt-kind { display: inline-block; width: 34px; color: #9aa0a6; font-size: 10px; }
+  .dt-kind.script { color: #f2d28e; }
+  .dt-kind.stylesheet { color: #8ab4f8; }
+  #dt-code { display: flex; flex: 1; min-width: 0; overflow: auto; }
+  #dt-code pre { margin: 0; padding: 4px 8px; line-height: 16px; font-size: 12px; }
+  .dt-ln { color: #6e7175; text-align: right; border-right: 1px solid #3c3f45; flex-shrink: 0; }
+  .dt-code-text { flex: 1; }
+
+  #dt-store { flex: 1; min-height: 0; overflow: auto; padding: 0 8px 6px; }
+  .dt-app-bar { padding-top: 6px; }
+  .dt-app-bar button { display: inline-flex; width: auto; height: 22px; padding: 0 10px; font-size: 12px; background: #35373c; border-radius: 4px; }
+  .dt-kvrow { display: flex; gap: 10px; line-height: 18px; white-space: nowrap; }
+  .dt-kvrow:hover { background: #2f3238; }
+  .dt-x { width: 14px; flex-shrink: 0; color: #9aa0a6; text-align: center; }
+  .dt-x:hover { color: #f28b82; }
+  .dt-kvrow .dt-an { width: 30%; flex-shrink: 0; overflow: hidden; }
+  .dt-v { flex: 1; min-width: 0; overflow: hidden; }
+
+  #dt-perf { flex: 1; min-width: 0; overflow: auto; padding: 0 8px 6px; }
+  .dt-bars { display: flex; align-items: flex-end; gap: 1px; height: 64px; padding: 2px 0; border-bottom: 1px solid #3c3f45; }
+  .dt-bar { display: flex; flex-direction: column; justify-content: flex-end; width: 5px; }
+  .dt-bar .u { background: #8ab4f8; }
+  .dt-bar .p { background: #81c995; }
 </style>
 </head>
 <body>
@@ -358,6 +391,9 @@
       <button id="dt-tab-elements" data-dt="panel:elements">Elements</button>
       <button id="dt-tab-console" data-dt="panel:console">Console</button>
       <button id="dt-tab-network" data-dt="panel:network">Network</button>
+      <button id="dt-tab-sources" data-dt="panel:sources">Sources</button>
+      <button id="dt-tab-application" data-dt="panel:application">Application</button>
+      <button id="dt-tab-performance" data-dt="panel:performance">Performance</button>
       <span id="dt-filters"><button id="dt-f-all" data-dt="filter:all">All</button><button id="dt-f-warn" data-dt="filter:warn">Warnings</button><button id="dt-f-error" data-dt="filter:error">Errors</button></span>
       <span class="fill"></span>
       <button id="dt-clear" data-dt="clear" title="Clear">&#x2298;</button>
@@ -377,6 +413,17 @@
     <div id="dt-network" class="dt-panel">
       <div id="dt-requests"></div>
       <div id="dt-detail"></div>
+    </div>
+    <div id="dt-sources" class="dt-panel">
+      <div id="dt-files"></div>
+      <div id="dt-code"></div>
+    </div>
+    <div id="dt-application" class="dt-panel">
+      <div id="dt-store"></div>
+      <input id="dt-app-edit" class="dt-input" placeholder="key=value: set localStorage (session key=value: sessionStorage)">
+    </div>
+    <div id="dt-performance" class="dt-panel">
+      <div id="dt-perf"></div>
     </div>
   </div>
   <div id="osk" hidden></div>

@@ -9,13 +9,19 @@
 //!   errors, failed requests) and a line that runs JavaScript in the page.
 //! - **Network**: every request of the page with its status, type, size,
 //!   time, headers, request body and response.
+//! - **Sources**: the page's documents, scripts and style sheets (external
+//!   and inline) with line numbers.
+//! - **Application**: `localStorage`, `sessionStorage`, cookies (all kept
+//!   by the JavaScript runtime) and `blob:` URLs, with edits.
+//! - **Performance**: what each script call cost (instructions and time)
+//!   and how long frames took to update and paint.
 //!
 //! The panel is part of the chrome document (`chrome.html`): this module
 //! rewrites its contents from the browser's state, so it keeps working
 //! when the page's scripts do not. Console and network logs are kept per
 //! tab, from the start of each navigation.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use super::{Browser, JS_MIME, Request, ResponseInfo, Target, escape, js_string};
 use crate::dom::{Dom, NodeData, NodeId};
@@ -38,6 +44,15 @@ const TREE_REFRESH_MS: f64 = 300.0;
 /// prelude.js).
 const RESULT: &str = "\u{1}devtools-result ";
 const RESULT_ERROR: &str = "\u{1}devtools-error ";
+/// Message marker of a storage snapshot (`__rb_devtools_storage`).
+const STORAGE: &str = "\u{1}devtools-storage ";
+/// Bytes of a script, style sheet or document kept for Sources.
+const MAX_SOURCE: usize = 4 << 20;
+/// Lines shown of one source.
+const MAX_LINES: usize = 5000;
+/// Script calls and frames kept for Performance.
+const MAX_CALLS: usize = 500;
+const MAX_FRAMES: usize = 120;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Panel {
@@ -45,6 +60,9 @@ pub enum Panel {
     Elements,
     Console,
     Network,
+    Sources,
+    Application,
+    Performance,
 }
 
 impl Panel {
@@ -53,6 +71,9 @@ impl Panel {
             "elements" => Some(Panel::Elements),
             "console" => Some(Panel::Console),
             "network" => Some(Panel::Network),
+            "sources" => Some(Panel::Sources),
+            "application" => Some(Panel::Application),
+            "performance" => Some(Panel::Performance),
             _ => None,
         }
     }
@@ -62,6 +83,9 @@ impl Panel {
             Panel::Elements => "elements",
             Panel::Console => "console",
             Panel::Network => "network",
+            Panel::Sources => "sources",
+            Panel::Application => "application",
+            Panel::Performance => "performance",
         }
     }
 }
@@ -114,11 +138,34 @@ pub struct NetEntry {
     pub body: Vec<u8>,
 }
 
+/// A loaded script, style sheet or document, for Sources.
+pub struct SourceFile {
+    /// The request that loaded it.
+    pub id: u32,
+    pub url: String,
+    pub kind: &'static str,
+    pub text: String,
+}
+
+/// One call into a page script, for Performance.
+pub struct CallRecord {
+    /// Its slot among the tab's scripts.
+    pub script: usize,
+    pub stats: crate::script::CallStats,
+}
+
 /// The developer tools' state of one tab.
 #[derive(Default)]
 pub struct TabDev {
     pub console: Vec<ConsoleEntry>,
     pub network: Vec<NetEntry>,
+    pub sources: Vec<SourceFile>,
+    pub calls: VecDeque<CallRecord>,
+    /// The last storage snapshot: (area, key, value), area `local`,
+    /// `session` or `cookie`; `None` until taken.
+    pub storage: Option<Vec<(String, String, String)>>,
+    /// `element.style` declarations turned off: (element, name, value).
+    pub disabled_inline: Vec<(NodeId, String, String)>,
     /// Expanded elements of the DOM tree.
     pub expanded: HashSet<NodeId>,
     pub selected: Option<NodeId>,
@@ -153,6 +200,12 @@ pub struct DevTools {
     /// Console input history, and the entry being edited.
     history: Vec<String>,
     history_at: usize,
+    /// The source shown in Sources (`net:ID` or `node:ID`).
+    pub source: Option<String>,
+    /// (update, paint) milliseconds of recent frames.
+    pub frames: VecDeque<(f64, f64)>,
+    /// Take a storage snapshot at the next chance.
+    want_storage: bool,
 }
 
 impl Default for DevTools {
@@ -173,6 +226,9 @@ impl Default for DevTools {
             reveal: false,
             history: Vec::new(),
             history_at: 0,
+            source: None,
+            frames: VecDeque::new(),
+            want_storage: false,
         }
     }
 }
@@ -271,6 +327,8 @@ impl Browser {
             tab.dev.page = tab.page;
             tab.dev.selected = None;
             tab.dev.expanded = default_expanded(&tab.doc.dom);
+            tab.dev.storage = None;
+            tab.dev.disabled_inline.clear();
         }
         &mut tab.dev
     }
@@ -280,6 +338,19 @@ impl Browser {
     /// A message from tab `i`'s scripts (or about them): to the platform's
     /// log and the tab's console.
     pub(super) fn console_message(&mut self, i: usize, msg: &str, host: &mut dyn Host) {
+        if let Some(snapshot) = msg.strip_prefix(STORAGE) {
+            let dec = |s: &str| String::from_utf8_lossy(&crate::net::url::percent_decode(s)).into_owned();
+            let rows = snapshot
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split('\t');
+                    Some((f.next()?.to_string(), dec(f.next()?), dec(f.next()?)))
+                })
+                .collect();
+            self.tabs[i].dev.storage = Some(rows);
+            self.devtools.dirty = true;
+            return;
+        }
         let (level, text) = if let Some(r) = msg.strip_prefix(RESULT) {
             (Level::Result, r)
         } else if let Some(r) = msg.strip_prefix(RESULT_ERROR) {
@@ -396,6 +467,9 @@ impl Browser {
             // A new page: its log starts here (as in other browsers).
             dev.network.clear();
             dev.console.clear();
+            dev.sources.clear();
+            dev.calls.clear();
+            self.devtools.source = None;
             self.devtools.request = None;
         }
         dev.network.push(NetEntry {
@@ -440,6 +514,16 @@ impl Browser {
             return;
         };
         e.end = Some(now);
+        if let Ok(body) = result
+            && matches!(e.kind, "script" | "stylesheet" | "document")
+        {
+            let text = String::from_utf8_lossy(&body[..body.len().min(MAX_SOURCE)]).into_owned();
+            let (url, kind) = (e.url.clone(), e.kind);
+            self.tabs[i].dev.sources.push(SourceFile { id, url, kind, text });
+        }
+        let Some(e) = self.tabs[i].dev.network.iter_mut().rev().find(|e| e.id == id) else {
+            return;
+        };
         match result {
             Ok(body) => {
                 e.status = Some(info.map_or(200, |r| r.status));
@@ -456,10 +540,111 @@ impl Browser {
         }
     }
 
+    // ----- application, performance -------------------------------------------
+
+    /// Runs `code` (storage edits) in the page, then takes a new snapshot.
+    fn storage_script(&mut self, code: &str, host: &mut dyn Host) {
+        let i = self.active;
+        if self.tabs[i].runtimes.contains_key(JS_MIME) {
+            self.run_source(i, JS_MIME, code, "devtools", host);
+        }
+        self.devtools.want_storage = true;
+        self.devtools.dirty = true;
+        self.dirty = true;
+    }
+
+    /// Work that needs the host: a storage snapshot asked for.
+    pub(super) fn devtools_tick(&mut self, host: &mut dyn Host) {
+        if !self.devtools.open {
+            return;
+        }
+        self.tab_dev(self.active);
+        let d = &self.devtools;
+        let want = d.open
+            && d.panel == Panel::Application
+            && (d.want_storage || self.tabs[self.active].dev.storage.is_none());
+        if !want {
+            return;
+        }
+        self.devtools.want_storage = false;
+        let i = self.active;
+        // Storage lives in the JavaScript runtime: none, nothing stored.
+        if self.tabs[i].runtimes.contains_key(JS_MIME) {
+            self.run_source(i, JS_MIME, "__rb_devtools_storage()", "devtools", host);
+        }
+        let dev = &mut self.tabs[i].dev;
+        if dev.storage.is_none() {
+            dev.storage = Some(Vec::new());
+        }
+        self.devtools.dirty = true;
+    }
+
+    /// Records the cost of the call script `si` of tab `i` just made.
+    pub(super) fn record_call(&mut self, i: usize, si: usize) {
+        let Some(Some(script)) = self.tabs[i].scripts.get_mut(si) else {
+            return;
+        };
+        let Some(stats) = script.take_call() else {
+            return;
+        };
+        // The panel's own snapshots are not the page's work.
+        if stats.label == "devtools" {
+            return;
+        }
+        let calls = &mut self.tabs[i].dev.calls;
+        calls.push_back(CallRecord { script: si, stats });
+        if calls.len() > MAX_CALLS {
+            calls.pop_front();
+        }
+        if i == self.active && self.devtools.panel == Panel::Performance {
+            self.devtools.dirty = true;
+        }
+    }
+
+    /// Records how long a frame took to update (style, layout, scripts'
+    /// timers) and to paint.
+    pub(super) fn record_frame(&mut self, update_ms: f64, paint_ms: f64) {
+        let f = &mut self.devtools.frames;
+        f.push_back((update_ms, paint_ms));
+        if f.len() > MAX_FRAMES {
+            f.pop_front();
+        }
+        // Redrawing the panel makes another frame: only on request.
+    }
+
+    /// Turns `element.style` declaration `k` of the selected element off
+    /// (`k` < the declarations it has) or a turned-off one back on.
+    fn toggle_inline(&mut self, k: usize) {
+        let Some(n) = self.tabs[self.active].dev.selected else {
+            return;
+        };
+        let tab = &mut self.tabs[self.active];
+        let style = tab.doc.dom.attr(n, "style").unwrap_or("").to_string();
+        let decls = declarations(&style);
+        let new_style = if let Some((name, value, important)) = decls.get(k) {
+            let value = if *important { format!("{value} !important") } else { value.clone() };
+            tab.dev.disabled_inline.push((n, name.clone(), value));
+            crate::script::set_style_property(&style, name, "")
+        } else {
+            let off: Vec<usize> = (0..tab.dev.disabled_inline.len())
+                .filter(|&j| tab.dev.disabled_inline[j].0 == n)
+                .collect();
+            let Some(&j) = off.get(k - decls.len()) else {
+                return;
+            };
+            let (_, name, value) = tab.dev.disabled_inline.remove(j);
+            crate::script::set_style_property(&style, &name, &value)
+        };
+        if let Some(e) = tab.doc.dom_mut().element_mut(n) {
+            e.set_attr("style", &new_style);
+        }
+        tab.doc.dom_changed();
+    }
+
     // ----- commands and input --------------------------------------------------
 
     /// A click on a `data-dt` control of the panel.
-    pub(super) fn devtools_command(&mut self, cmd: &str) {
+    pub(super) fn devtools_command(&mut self, cmd: &str, host: &mut dyn Host) {
         let (verb, arg) = cmd.split_once(':').unwrap_or((cmd, ""));
         let id = arg.parse::<usize>().ok();
         self.tab_dev(self.active);
@@ -470,6 +655,7 @@ impl Browser {
                     d.panel = p;
                     d.stick = true;
                     d.reveal = true;
+                    d.want_storage |= p == Panel::Application;
                 }
             }
             "close" => return self.close_devtools(),
@@ -485,7 +671,16 @@ impl Browser {
                         dev.network.clear();
                         d.request = None;
                     }
-                    Panel::Elements => {}
+                    Panel::Performance => {
+                        dev.calls.clear();
+                        d.frames.clear();
+                    }
+                    Panel::Application => {
+                        let code = "localStorage.clear(); sessionStorage.clear(); \
+                                    for (const c of document.cookie.split('; ')) __rb_devtools_cookie_delete(c.split('=')[0]);";
+                        return self.storage_script(code, host);
+                    }
+                    Panel::Elements | Panel::Sources => {}
                 }
             }
             "filter" => {
@@ -513,6 +708,31 @@ impl Browser {
                 let r = arg.parse::<u32>().ok();
                 d.request = if d.request == r { None } else { r };
             }
+            "src" => d.source = Some(arg.to_string()),
+            "refresh" => d.want_storage = true,
+            "del" => {
+                // del:AREA:KEY (the key percent-encoded)
+                let (area, key) = arg.split_once(':').unwrap_or((arg, ""));
+                let key = js_string(&String::from_utf8_lossy(&crate::net::url::percent_decode(key)));
+                let code = match area {
+                    "local" => format!("localStorage.removeItem({key})"),
+                    "session" => format!("sessionStorage.removeItem({key})"),
+                    _ => format!("__rb_devtools_cookie_delete({key})"),
+                };
+                return self.storage_script(&code, host);
+            }
+            "decl" => {
+                // decl:BLOCK:INDEX, a declaration of a style rule
+                let (block, index) = arg.split_once(':').unwrap_or((arg, ""));
+                if let (Ok(b), Ok(k)) = (block.parse(), index.parse()) {
+                    self.tabs[self.active].doc.toggle_declaration(b, k);
+                }
+            }
+            "inline" => {
+                if let Some(k) = id {
+                    self.toggle_inline(k);
+                }
+            }
             _ => {}
         }
         self.devtools.dirty = true;
@@ -525,6 +745,20 @@ impl Browser {
             let src = self.chrome.input_value(n);
             self.chrome.set_input_value(n, "");
             self.devtools_eval(&src, host);
+            return true;
+        }
+        if Some(n) == self.chrome_el("dt-app-edit") {
+            let text = self.chrome.input_value(n);
+            self.chrome.set_input_value(n, "");
+            // `key=value` sets localStorage; `session key=value` sessionStorage.
+            let (area, rest) = match text.trim().strip_prefix("session ") {
+                Some(r) => ("sessionStorage", r),
+                None => ("localStorage", text.trim()),
+            };
+            if let Some((k, v)) = rest.split_once('=') {
+                let code = format!("{area}.setItem({}, {})", js_string(k.trim()), js_string(v.trim()));
+                self.storage_script(&code, host);
+            }
             return true;
         }
         if Some(n) == self.chrome_el("dt-edit") {
@@ -543,8 +777,19 @@ impl Browser {
             return;
         };
         let doc = &mut self.tabs[self.active].doc;
+        let colon = text.find(':');
+        let equals = text.find('=');
         if doc.dom.text(n).is_some() {
             doc.dom_mut().set_text(n, text);
+        } else if let Some(c) = colon.filter(|&c| equals.is_none_or(|e| c < e)) {
+            // `prop: value` sets an `element.style` property.
+            let (prop, value) = (text[..c].trim().to_ascii_lowercase(), text[c + 1..].trim());
+            let value = value.trim_end_matches(';').trim();
+            let style = doc.dom.attr(n, "style").unwrap_or("").to_string();
+            let style = crate::script::set_style_property(&style, &prop, value);
+            if let Some(e) = doc.dom_mut().element_mut(n) {
+                e.set_attr("style", &style);
+            }
         } else if let Some(name) = text.trim().strip_prefix('-') {
             if let Some(e) = doc.dom_mut().element_mut(n) {
                 e.remove_attr(name.trim());
@@ -695,7 +940,9 @@ impl Browser {
         let tree_stale = panel == Panel::Elements
             && d.built.2 != key.2
             && (!same_doc || self.now - d.built_at >= TREE_REFRESH_MS);
-        if !d.dirty && same_doc && !tree_stale {
+        // Performance follows new frames about once a second.
+        let perf_stale = panel == Panel::Performance && self.now - d.built_at >= 1000.0;
+        if !d.dirty && same_doc && !tree_stale && !perf_stale {
             return;
         }
         self.devtools.dirty = false;
@@ -706,7 +953,209 @@ impl Browser {
             Panel::Elements => self.build_elements(),
             Panel::Console => self.build_console(),
             Panel::Network => self.build_network(),
+            Panel::Sources => self.build_sources(),
+            Panel::Application => self.build_application(),
+            Panel::Performance => self.build_performance(),
         }
+    }
+
+    /// The page's sources: (key, label, kind, text). Loaded files first,
+    /// then inline scripts and style sheets.
+    fn source_list(&self) -> Vec<(String, String, &'static str, String)> {
+        let tab = &self.tabs[self.active];
+        let mut out: Vec<(String, String, &'static str, String)> = tab
+            .dev
+            .sources
+            .iter()
+            .map(|f| (format!("net:{}", f.id), short_name(&f.url), f.kind, f.text.clone()))
+            .collect();
+        let dom = &tab.doc.dom;
+        let (mut scripts, mut styles) = (0, 0);
+        for n in dom.descendants(Dom::ROOT) {
+            let (kind, count) = match dom.tag(n) {
+                Some("script") if dom.attr(n, "src").is_none() => ("script", &mut scripts),
+                Some("style") => ("stylesheet", &mut styles),
+                _ => continue,
+            };
+            *count += 1;
+            let label = format!("(inline {} {})", if kind == "script" { "script" } else { "style" }, count);
+            out.push((format!("node:{n}"), label, kind, dom.text_content(n)));
+        }
+        out
+    }
+
+    fn build_sources(&mut self) {
+        let list = self.source_list();
+        let current = self
+            .devtools
+            .source
+            .clone()
+            .filter(|k| list.iter().any(|s| &s.0 == k))
+            .or_else(|| list.first().map(|s| s.0.clone()));
+        let mut files = String::new();
+        for (key, label, kind, _) in &list {
+            files.push_str(&format!(
+                "<div class=\"dt-file{}\" data-dt=\"src:{key}\"><span class=\"dt-kind {kind}\">{}</span> {}</div>",
+                if Some(key) == current.as_ref() { " sel" } else { "" },
+                match *kind {
+                    "script" => "JS",
+                    "stylesheet" => "CSS",
+                    _ => "HTML",
+                },
+                escape(label)
+            ));
+        }
+        if list.is_empty() {
+            files.push_str("<div class=\"dt-h\">No sources</div>");
+        }
+        let code = match list.iter().find(|s| Some(&s.0) == current.as_ref()) {
+            Some((_, _, _, text)) => {
+                let lines: Vec<&str> = text.lines().collect();
+                let shown = lines.len().min(MAX_LINES);
+                let numbers: String = (1..=shown).map(|i| format!("{i}\n")).collect();
+                let mut body = lines[..shown].join("\n");
+                if lines.len() > shown {
+                    body.push_str(&format!("\n… {} more lines", lines.len() - shown));
+                }
+                format!(
+                    "<pre class=\"dt-ln\">{numbers}</pre><pre class=\"dt-code-text\">{}</pre>",
+                    escape(&body)
+                )
+            }
+            None => String::new(),
+        };
+        self.set_html("dt-files", &files);
+        self.set_html("dt-code", &code);
+    }
+
+    fn build_application(&mut self) {
+        let tab = &self.tabs[self.active];
+        let enc = |s: &str| {
+            s.bytes()
+                .map(|b| match b {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' => (b as char).to_string(),
+                    b => format!("%{b:02X}"),
+                })
+                .collect::<String>()
+        };
+        let mut html = String::from(
+            "<div class=\"dt-app-bar\"><button data-dt=\"refresh\">Refresh</button></div>",
+        );
+        let rows = tab.dev.storage.clone().unwrap_or_default();
+        for (area, title) in [("local", "Local storage"), ("session", "Session storage"), ("cookie", "Cookies")] {
+            html.push_str(&format!("<div class=\"dt-h\">{title}</div>"));
+            let mut any = false;
+            for (a, k, v) in rows.iter().filter(|r| r.0 == area) {
+                any = true;
+                html.push_str(&format!(
+                    "<div class=\"dt-kvrow\"><span class=\"dt-x\" data-dt=\"del:{a}:{}\" title=\"Delete\">✕</span>\
+                     <span class=\"dt-an\">{}</span><span class=\"dt-v\">{}</span></div>",
+                    enc(k),
+                    escape(k),
+                    escape(&one_line(v, 300))
+                ));
+            }
+            if !any {
+                html.push_str("<div class=\"dt-kv dt-src\">(empty)</div>");
+            }
+        }
+        html.push_str("<div class=\"dt-h\">Blob URLs</div>");
+        let mut blobs: Vec<_> = tab.doc.blobs.iter().collect();
+        blobs.sort_by(|a, b| a.0.cmp(b.0));
+        for (url, f) in &blobs {
+            html.push_str(&format!(
+                "<div class=\"dt-kvrow\"><span class=\"dt-an\">{}</span><span class=\"dt-v\">{} {}</span></div>",
+                escape(url),
+                escape(if f.mime.is_empty() { "(no type)" } else { &f.mime }),
+                size_text(f.bytes.len())
+            ));
+        }
+        if blobs.is_empty() {
+            html.push_str("<div class=\"dt-kv dt-src\">(none)</div>");
+        }
+        self.set_html("dt-store", &html);
+    }
+
+    fn build_performance(&mut self) {
+        let tab = &self.tabs[self.active];
+        let frames = &self.devtools.frames;
+        let mut html = String::new();
+        // Frames: one bar per frame (update below, paint on top).
+        let (n, mut sum_u, mut sum_p, mut max) = (frames.len(), 0.0, 0.0, 0.0f64);
+        for &(u, p) in frames {
+            sum_u += u;
+            sum_p += p;
+            max = max.max(u + p);
+        }
+        html.push_str(&format!(
+            "<div class=\"dt-h\">Frames (last {n})</div><div class=\"dt-kv\">update {} ms average, paint {} ms average, slowest {} ms</div>",
+            round(if n > 0 { sum_u / n as f64 } else { 0.0 }),
+            round(if n > 0 { sum_p / n as f64 } else { 0.0 }),
+            round(max)
+        ));
+        let scale = if max > 0.0 { 60.0 / max.max(16.7) } else { 0.0 };
+        html.push_str("<div class=\"dt-bars\">");
+        for &(u, p) in frames {
+            html.push_str(&format!(
+                "<span class=\"dt-bar\"><span class=\"p\" style=\"height:{}px\"></span><span class=\"u\" style=\"height:{}px\"></span></span>",
+                (p * scale).round(),
+                (u * scale).round()
+            ));
+        }
+        html.push_str("</div>");
+        // Script calls: totals by kind, then the slowest and the latest.
+        let calls = &tab.dev.calls;
+        let fuel: u64 = calls.iter().map(|c| c.stats.fuel).sum();
+        let ms: f64 = calls.iter().map(|c| c.stats.ms).sum();
+        html.push_str(&format!(
+            "<div class=\"dt-h\">Script calls ({})</div><div class=\"dt-kv\">{} ms, {} instructions</div>",
+            calls.len(),
+            round(ms),
+            count_text(fuel)
+        ));
+        let mut by_kind: Vec<(String, usize, f64, u64)> = Vec::new();
+        for c in calls {
+            let kind = c.stats.label.split(' ').next().unwrap_or("").to_string();
+            let kind = if matches!(kind.as_str(), "event" | "timer" | "fetch" | "websocket" | "start") {
+                kind
+            } else {
+                "script".into()
+            };
+            match by_kind.iter_mut().find(|k| k.0 == kind) {
+                Some(k) => {
+                    k.1 += 1;
+                    k.2 += c.stats.ms;
+                    k.3 += c.stats.fuel;
+                }
+                None => by_kind.push((kind, 1, c.stats.ms, c.stats.fuel)),
+            }
+        }
+        by_kind.sort_by(|a, b| b.2.total_cmp(&a.2));
+        let row = |cols: [String; 4], head: bool| {
+            format!(
+                "<div class=\"dt-req{}\"><span class=\"name\">{}</span><span class=\"ty\">{}</span><span class=\"tm\">{}</span><span class=\"sz\">{}</span></div>",
+                if head { " head" } else { "" },
+                escape(&cols[0]),
+                cols[1],
+                cols[2],
+                cols[3]
+            )
+        };
+        html.push_str(&row(["Kind".into(), "Calls".into(), "Time".into(), "Instr.".into()], true));
+        for (kind, count, ms, fuel) in &by_kind {
+            html.push_str(&row([kind.clone(), count.to_string(), format!("{} ms", round(*ms)), count_text(*fuel)], false));
+        }
+        let mut slow: Vec<&CallRecord> = calls.iter().collect();
+        slow.sort_by(|a, b| b.stats.ms.total_cmp(&a.stats.ms));
+        html.push_str("<div class=\"dt-h\">Slowest calls</div>");
+        html.push_str(&row(["Call".into(), "Script".into(), "Time".into(), "Instr.".into()], true));
+        for c in slow.iter().take(15) {
+            html.push_str(&row(
+                [c.stats.label.clone(), format!("#{}", c.script), format!("{} ms", round(c.stats.ms)), count_text(c.stats.fuel)],
+                false,
+            ));
+        }
+        self.set_html("dt-perf", &html);
     }
 
     /// Marks the active tab, filter and inspect button.
@@ -721,6 +1170,9 @@ impl Browser {
             ("dt-tab-elements", d.panel == Panel::Elements),
             ("dt-tab-console", d.panel == Panel::Console),
             ("dt-tab-network", d.panel == Panel::Network),
+            ("dt-tab-sources", d.panel == Panel::Sources),
+            ("dt-tab-application", d.panel == Panel::Application),
+            ("dt-tab-performance", d.panel == Panel::Performance),
             ("dt-inspect", d.inspecting),
             ("dt-f-all", filter == "all"),
             ("dt-f-warn", filter == "warn"),
@@ -829,14 +1281,38 @@ impl Browser {
         }
         // Styles: the inline style, then the matching rules.
         out.push_str("<div class=\"dt-h\">Styles</div>");
-        if let Some(style) = el.attr("style").filter(|s| !s.trim().is_empty()) {
-            out.push_str(&rule_html("element.style", "", &declarations(style)));
+        // Each declaration has a box that turns it off and on.
+        let mut inline: Vec<DeclRow> = declarations(el.attr("style").unwrap_or(""))
+            .into_iter()
+            .map(|(name, value, important)| DeclRow { name, value, important, on: true, toggle: None })
+            .collect();
+        let off = self.tabs[self.active].dev.disabled_inline.iter().filter(|(e, ..)| *e == n);
+        inline.extend(off.map(|(_, name, value)| DeclRow {
+            name: name.clone(),
+            value: value.clone(),
+            important: false,
+            on: false,
+            toggle: None,
+        }));
+        for (k, row) in inline.iter_mut().enumerate() {
+            row.toggle = Some(format!("inline:{k}"));
+        }
+        let doc = &mut self.tabs[self.active].doc;
+        if !inline.is_empty() {
+            out.push_str(&rule_html("element.style", "", &inline));
         }
         for r in doc.matched_rules(n) {
-            let decls: Vec<(String, String, bool)> = r
+            let decls: Vec<DeclRow> = r
                 .decls
                 .iter()
-                .map(|d| (d.name.clone(), d.value.clone(), d.important))
+                .enumerate()
+                .map(|(k, d)| DeclRow {
+                    name: d.name.clone(),
+                    value: d.value.clone(),
+                    important: d.important,
+                    on: !doc.declaration_disabled(r.decls_id, k),
+                    toggle: (!r.user_agent).then(|| format!("decl:{}:{k}", r.decls_id)),
+                })
                 .collect();
             let source = if r.user_agent { "user agent" } else { "" };
             out.push_str(&rule_html(&r.selector, source, &decls));
@@ -1061,6 +1537,16 @@ fn round(v: impl Into<f64>) -> String {
     }
 }
 
+/// A large count shortened: 12.3M.
+fn count_text(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        _ => format!("{:.2}G", n as f64 / 1e9),
+    }
+}
+
 fn size_text(n: usize) -> String {
     if n < 1024 {
         format!("{n} B")
@@ -1110,18 +1596,37 @@ fn declarations(style: &str) -> Vec<(String, String, bool)> {
         .collect()
 }
 
-fn rule_html(selector: &str, source: &str, decls: &[(String, String, bool)]) -> String {
+/// A declaration in the Styles pane.
+struct DeclRow {
+    name: String,
+    value: String,
+    important: bool,
+    /// Turned on (not crossed out).
+    on: bool,
+    /// The `data-dt` command of its box (none: it cannot be turned off).
+    toggle: Option<String>,
+}
+
+fn rule_html(selector: &str, source: &str, decls: &[DeclRow]) -> String {
     let mut out = format!(
         "<div class=\"dt-rule dt-kv\"><span class=\"dt-sel\">{}</span> <span class=\"dt-src\">{}</span>{{\n",
         escape(selector),
         if source.is_empty() { String::new() } else { format!("({source}) ") }
     );
-    for (name, value, important) in decls {
+    for d in decls {
+        let check = match &d.toggle {
+            Some(cmd) => format!(
+                "<span class=\"dt-chk\" data-dt=\"{cmd}\">{}</span>",
+                if d.on { "☑" } else { "☐" }
+            ),
+            None => " ".into(),
+        };
         out.push_str(&format!(
-            "  <span class=\"dt-an\">{}</span>: {}{};\n",
-            escape(name),
-            escape(value),
-            if *important { " !important" } else { "" }
+            "{check} <span class=\"{}\"><span class=\"dt-an\">{}</span>: {}{};</span>\n",
+            if d.on { "" } else { "dt-off" },
+            escape(&d.name),
+            escape(&d.value),
+            if d.important { " !important" } else { "" }
         ));
     }
     out.push_str("}</div>");

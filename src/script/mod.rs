@@ -189,8 +189,21 @@ struct State {
     memory: Option<Memory>,
 }
 
+/// What one call into a script cost (for the developer tools).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CallStats {
+    /// `event click`, `timer`, the evaluated script's name, …
+    pub label: String,
+    /// Wasm instructions run (fuel).
+    pub fuel: u64,
+    /// Wall time in milliseconds (0 where there is no clock).
+    pub ms: f64,
+}
+
 /// A loaded script module.
 pub struct Script {
+    /// The last call's cost, until taken.
+    last_call: Option<CallStats>,
     store: Store<State>,
     event_fn: Option<TypedFunc<i32, ()>>,
     timer_fn: Option<TypedFunc<i32, ()>>,
@@ -253,6 +266,7 @@ impl Script {
         #[cfg(not(feature = "native"))]
         let instantiate = |store: &mut Store<State>| linker.instantiate_and_start(store, &module);
         let mut script = Script {
+            last_call: None,
             store,
             event_fn: None,
             timer_fn: None,
@@ -265,7 +279,7 @@ impl Script {
             budget: None,
             _not_send: std::marker::PhantomData,
         };
-        script.with_doc(doc, now, |s| {
+        script.with_doc(doc, now, "start", |s| {
             let instance = instantiate(&mut s.store).map_err(describe)?;
             s.event_fn = instance.get_typed_func(&mut s.store, "rb_event").ok();
             s.timer_fn = instance.get_typed_func(&mut s.store, "rb_timer").ok();
@@ -289,8 +303,11 @@ impl Script {
         &mut self,
         doc: &mut Document,
         now: f64,
+        label: &str,
         f: impl FnOnce(&mut Self) -> Result<R, String>,
     ) -> Result<R, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let started = std::time::Instant::now();
         let s = self.store.data_mut();
         s.now = now;
         std::mem::swap(&mut s.doc, doc);
@@ -307,14 +324,28 @@ impl Script {
             Ok(()) => f(self),
             Err(e) => Err(e.to_string()),
         };
+        let left = self.store.get_fuel().unwrap_or(0);
         if let Some(b) = &mut self.budget {
-            let left = self.store.get_fuel().unwrap_or(0);
             // Grace fuel used past the budget is not charged.
             let used = (fuel + extra).saturating_sub(left).min(fuel);
             *b = b.saturating_sub(used);
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        let ms = started.elapsed().as_secs_f64() * 1000.0;
+        #[cfg(target_arch = "wasm32")]
+        let ms = 0.0;
+        self.last_call = Some(CallStats {
+            label: label.to_string(),
+            fuel: (fuel + extra).saturating_sub(left),
+            ms,
+        });
         std::mem::swap(&mut self.store.data_mut().doc, doc);
         r
+    }
+
+    /// The cost of the last call, once.
+    pub fn take_call(&mut self) -> Option<CallStats> {
+        self.last_call.take()
     }
 
     /// Sets the fuel each call may use.
@@ -354,7 +385,8 @@ impl Script {
             return Ok(());
         };
         self.store.data_mut().event = Some(event.clone());
-        let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, id));
+        let label = format!("event {}", event.kind);
+        let r = self.with_doc(doc, now, &label, |s| call(&mut s.store, &f, id));
         self.store.data_mut().event = None;
         r
     }
@@ -376,7 +408,7 @@ impl Script {
         let (Some(alloc), Some(eval)) = (self.alloc_fn.clone(), self.eval_fn.clone()) else {
             return Err("not a language runtime".into());
         };
-        self.with_doc(doc, now, |s| {
+        self.with_doc(doc, now, name, |s| {
             let put = |s: &mut Script, text: &str| -> Result<i32, String> {
                 let ptr = call(&mut s.store, &alloc, text.len() as i32)?;
                 let memory = s
@@ -402,7 +434,7 @@ impl Script {
         let Some(f) = self.timer_fn.clone() else {
             return Ok(());
         };
-        self.with_doc(doc, now, |s| call(&mut s.store, &f, id))
+        self.with_doc(doc, now, "timer", |s| call(&mut s.store, &f, id))
     }
 
     /// Delivers the response to HTTP request `id`: `status` (0 when the
@@ -422,7 +454,7 @@ impl Script {
             return Ok(());
         };
         self.store.data_mut().response = Some((id, body, headers.to_string()));
-        let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, (id, status)));
+        let r = self.with_doc(doc, now, "fetch response", |s| call(&mut s.store, &f, (id, status)));
         self.store.data_mut().response = None;
         r
     }
@@ -443,7 +475,7 @@ impl Script {
             return Ok(());
         };
         self.store.data_mut().response = Some((id, data, info.to_string()));
-        let r = self.with_doc(doc, now, |s| call(&mut s.store, &f, (id, kind)));
+        let r = self.with_doc(doc, now, "websocket", |s| call(&mut s.store, &f, (id, kind)));
         self.store.data_mut().response = None;
         r
     }
@@ -726,7 +758,7 @@ fn select(doc: &Document, selector: &str) -> Option<Vec<NodeId>> {
 }
 
 /// Sets (or with an empty value removes) one property in a `style` attribute.
-fn set_style_property(style: &str, prop: &str, value: &str) -> String {
+pub(crate) fn set_style_property(style: &str, prop: &str, value: &str) -> String {
     let mut out: Vec<String> = css::syntax::parse_declarations(style, None)
         .into_iter()
         .filter(|d| !d.name.eq_ignore_ascii_case(prop))
