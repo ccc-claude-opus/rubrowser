@@ -3429,6 +3429,7 @@ dependencies = [
  "resvg",
  "rfd",
  "rustybuzz",
+ "serde_json",
  "softbuffer",
  "taffy",
  "tungstenite",

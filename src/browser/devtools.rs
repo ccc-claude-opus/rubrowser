@@ -52,6 +52,7 @@ const MAX_SOURCE: usize = 4 << 20;
 const MAX_LINES: usize = 5000;
 /// Script calls and frames kept for Performance.
 const MAX_CALLS: usize = 500;
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 const MAX_FRAMES: usize = 120;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -206,6 +207,9 @@ pub struct DevTools {
     pub frames: VecDeque<(f64, f64)>,
     /// Take a storage snapshot at the next chance.
     want_storage: bool,
+    /// `hover` was set by a remote debugger (`Overlay.highlightNode`): drawn
+    /// even with the panel closed.
+    pub remote_highlight: bool,
 }
 
 impl Default for DevTools {
@@ -229,6 +233,7 @@ impl Default for DevTools {
             source: None,
             frames: VecDeque::new(),
             want_storage: false,
+            remote_highlight: false,
         }
     }
 }
@@ -338,6 +343,9 @@ impl Browser {
     /// A message from tab `i`'s scripts (or about them): to the platform's
     /// log and the tab's console.
     pub(super) fn console_message(&mut self, i: usize, msg: &str, host: &mut dyn Host) {
+        if let Some(r) = msg.strip_prefix(super::cdp::CDP_RESULT) {
+            return self.cdp_eval_result(r);
+        }
         if let Some(snapshot) = msg.strip_prefix(STORAGE) {
             let dec = |s: &str| String::from_utf8_lossy(&crate::net::url::percent_decode(s)).into_owned();
             let rows = snapshot
@@ -367,6 +375,7 @@ impl Browser {
                 (Level::Log, msg)
             }
         };
+        self.cdp_console(i, level, text, host);
         self.console_push(i, level, text);
     }
 
@@ -462,6 +471,7 @@ impl Browser {
             .unwrap_or("GET")
             .to_string();
         let now = host.wall_clock().unwrap_or(self.now);
+        self.cdp_request(id, url, &method, kind, request.map(|r| &r.body[..]), host);
         let dev = &mut self.tabs[i].dev;
         if navigation {
             // A new page: its log starts here (as in other browsers).
@@ -535,6 +545,14 @@ impl Browser {
             }
             Err(err) => e.error = Some(err.clone()),
         }
+        let (url, kind) = (e.url.clone(), e.kind);
+        let status = info.map_or(200, |r| r.status);
+        let headers = info.map(|r| r.headers.clone()).unwrap_or_default();
+        let ended = match result {
+            Ok(body) => Ok((status, &headers[..], body.len())),
+            Err(err) => Err(err.as_str()),
+        };
+        self.cdp_response(id, &url, kind, ended, host);
         if i == self.active {
             self.devtools.dirty = true;
         }
@@ -603,6 +621,7 @@ impl Browser {
 
     /// Records how long a frame took to update (style, layout, scripts'
     /// timers) and to paint.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(super) fn record_frame(&mut self, update_ms: f64, paint_ms: f64) {
         let f = &mut self.devtools.frames;
         f.push_back((update_ms, paint_ms));
@@ -1420,7 +1439,7 @@ impl Browser {
     /// Outlines the inspected element on the page: its margin, border,
     /// padding and content boxes in the usual colors.
     pub(super) fn paint_devtools_overlay(&mut self) {
-        if !self.devtools.open {
+        if !self.devtools.open && !self.devtools.remote_highlight {
             return;
         }
         let tab = &self.tabs[self.active];
@@ -1495,7 +1514,7 @@ impl Browser {
 }
 
 /// Computed properties listed for the selected element.
-const COMPUTED: &[&str] = &[
+pub(super) const COMPUTED: &[&str] = &[
     "display",
     "position",
     "top",

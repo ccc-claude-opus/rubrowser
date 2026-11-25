@@ -1,6 +1,6 @@
 # 開發人員工具
 
-rubrowser 的開發人員工具有六個面板：Elements、Console、Network、Sources、Application 與 Performance，可檢查頁面 DOM 與樣式、執行 JavaScript、查看網路請求、閱讀原始碼、管理儲存資料，並找出慢的腳本與畫面。
+rubrowser 的開發人員工具有六個面板（F12），另外可以用 Chrome DevTools Protocol 從外部程式遠端除錯（第 8 節）。面板：Elements、Console、Network、Sources、Application 與 Performance，可檢查頁面 DOM 與樣式、執行 JavaScript、查看網路請求、閱讀原始碼、管理儲存資料，並找出慢的腳本與畫面。
 
 ## 1. 開啟與操作
 
@@ -145,7 +145,62 @@ Network 面板記錄頁面的每個請求，包括文件、樣式表、腳本與
 
 紀錄保留最近 500 次呼叫，換頁時重新開始；面板開著時約每秒更新一次。開發人員工具自己的 storage 快照不計入。
 
-## 8. 截圖與測試
+## 8. 遠端除錯（Chrome DevTools Protocol）
+
+rubrowser 可以用 [Chrome DevTools Protocol](https://chromedevtools.github.io/devtools-protocol/)（CDP）讓外部工具檢查與操控頁面，例如自動化測試、`chrome-remote-interface` 或自己寫的腳本。
+
+```bash
+rubrowser --remote-debugging-port 9222 https://example.com/          # 有視窗
+rubrowser --headless --remote-debugging-port 9222 https://example.com/  # 沒有視窗
+```
+
+- 只聽 `127.0.0.1`；`Host` 標頭不是 `localhost`、`127.0.0.1` 或 `[::1]` 的請求一律拒絕（403），防止網頁經由 DNS rebinding 連進來（與 Chrome 相同）。
+- 啟動時在 stderr 印出 `DevTools listening on ws://127.0.0.1:PORT/devtools/browser/rubrowser`；埠號給 `0` 時由系統挑一個空的。
+- `--headless` 沒有視窗，一直執行到客戶端送出 `Browser.close` 或程序被結束；計時器、網路與頁面事件照常進行。
+
+```mermaid
+flowchart LR
+  T["自動化工具"] -->|"HTTP /json"| S["cdp_server.rs<br/>127.0.0.1"]
+  T <-->|"WebSocket"| S
+  S -->|"Incoming"| B["browser/cdp.rs"]
+  B -->|"回覆與事件"| S
+  B --> P["分頁：DOM、腳本、網路"]
+```
+
+### HTTP 端點
+
+| 路徑 | 回應 |
+|---|---|
+| `/json/version` | 瀏覽器名稱、協定版本、browser 連線的 `webSocketDebuggerUrl` |
+| `/json`、`/json/list` | 每個分頁一個 target（`id`、`title`、`url`、`webSocketDebuggerUrl`） |
+| `/json/new?URL` | 開新分頁 |
+| `/json/activate/ID`、`/json/close/ID` | 切換到、關閉分頁 |
+
+WebSocket 路徑：`/devtools/page/ID` 直接連到一個分頁；`/devtools/browser/rubrowser` 連到整個瀏覽器，用 `Target.attachToTarget`（`flatten: true`）取得 `sessionId` 後，訊息帶上它就送到那個分頁。
+
+### 支援的方法
+
+| Domain | 方法與事件 |
+|---|---|
+| Browser | `getVersion`、`close` |
+| Target | `getTargets`、`createTarget`、`closeTarget`、`activateTarget`、`attachToTarget`、`detachFromTarget`、`setDiscoverTargets`；事件 `targetCreated`、`targetDestroyed`、`targetInfoChanged`、`attachedToTarget` |
+| Page | `navigate`、`reload`、`getFrameTree`、`getNavigationHistory`、`getLayoutMetrics`、`captureScreenshot`（PNG，頁面區域）、`bringToFront`；事件 `frameNavigated`、`domContentEventFired`、`loadEventFired`、`lifecycleEvent`（`init`、`DOMContentLoaded`、`load`）、`frameStoppedLoading` |
+| Runtime | `evaluate`、`callFunctionOn`（支援 `awaitPromise`；結果以值傳回）；事件 `executionContextCreated`、`executionContextsCleared`、`consoleAPICalled`、`exceptionThrown` |
+| DOM | `getDocument`、`querySelector`、`querySelectorAll`、`describeNode`、`requestChildNodes`、`getOuterHTML`、`getAttributes`、`setAttributeValue`、`removeAttribute`、`setNodeValue`、`getBoxModel`、`focus`、`scrollIntoViewIfNeeded`；事件 `setChildNodes`、`documentUpdated` |
+| CSS | `getComputedStyleForNode`、`getMatchedStylesForNode`、`getInlineStylesForNode` |
+| Network | `getResponseBody`；事件 `requestWillBeSent`、`responseReceived`、`loadingFinished`、`loadingFailed` |
+| Input | `dispatchMouseEvent`（按下、放開、移動、滾輪）、`dispatchKeyEvent`、`insertText` |
+| Overlay | `highlightNode`（在頁面上標出盒子模型）、`hideHighlight` |
+| Log | 事件 `entryAdded` |
+
+- `X.enable` 開始送出該 domain 的事件，`X.disable` 停止；另外有幾個只是調整設定的方法（例如 `Page.setLifecycleEventsEnabled`、`Network.setCacheDisabled`、`Target.setAutoAttach`）接受但不做事。其他方法回傳錯誤 `-32601`。
+- DOM 的 `nodeId` 就是 rubrowser 節點編號加 1，同一份文件中不會變。
+- 不支援 remote object（`objectId`）：`Runtime.evaluate` 的結果直接帶值（可轉成 JSON 時），`callFunctionOn` 只接受以值傳遞的參數。
+- `load` 在頁面的腳本執行完後送出（rubrowser 的 `load` 事件時機），不等圖片載入完成。
+
+相依套件：[serde_json](https://github.com/serde-rs/json)（MIT 或 Apache-2.0）處理 JSON；WebSocket 伺服器用原本就有的 [tungstenite](https://github.com/snapview/tungstenite-rs)（MIT 或 Apache-2.0）。
+
+## 9. 截圖與測試
 
 開發人員工具可透過命令列指定面板：
 
@@ -172,9 +227,18 @@ RUBROWSER_INPUT="console document.title" rubrowser --screenshot out.png --devtoo
 cargo test devtools
 ```
 
-`src/browser/mod.rs` 中共有 9 項測試，涵蓋開啟／關閉／調整大小、Console、Elements、選取元素模式與右鍵選單、Network、Sources、Application、Performance，以及 Styles 的宣告開關與編輯。
+`src/browser/mod.rs` 中有 9 項開發人員工具的測試，涵蓋開啟／關閉／調整大小、Console、Elements、選取元素模式與右鍵選單、Network、Sources、Application、Performance，以及 Styles 的宣告開關與編輯；另有 2 項 CDP 測試（`cargo test cdp`）。
 
-## 9. 尚未支援
+遠端除錯的端對端測試（只用 Python 標準函式庫，內含一個小型 WebSocket 客戶端）：
 
-- Chrome DevTools Protocol（下一階段）
-- 在 Sources 中設定中斷點、逐步執行（boa 沒有除錯 API）
+```bash
+cargo build && scripts/cdp-test.py
+```
+
+它啟動本機 HTTP 伺服器與 `rubrowser --headless --remote-debugging-port 0`，檢查 `/json` 端點與 `Host` 檢查、導覽與載入事件、主控台事件、`Runtime.evaluate`（含 promise 與例外）、`callFunctionOn`、網路事件與回應內容、DOM 查詢與修改、計算後樣式與套用的規則、用 `Input` 點按鈕與輸入文字、截圖、flatten session、開關分頁，最後用 `Browser.close` 結束。
+
+## 10. 尚未支援
+
+- 在 Sources 中設定中斷點、逐步執行，以及 CDP 的 `Debugger` domain（JavaScript 引擎 boa 沒有除錯 API）
+- CDP 的 remote object（`objectId`、`Runtime.getProperties`）、`Fetch`（攔截請求）、`Emulation`
+- Chrome 自己的 DevTools 前端（它需要的 domain 比這裡多得多）

@@ -1,6 +1,8 @@
 //! Platform layers: put the browser's canvas on screen and feed it input.
 
 #[cfg(feature = "native")]
+pub mod cdp_server;
+#[cfg(feature = "native")]
 pub mod native;
 #[cfg(feature = "native")]
 mod ws;

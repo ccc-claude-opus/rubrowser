@@ -30,10 +30,27 @@ const MAX_BODY: u64 = 32 << 20;
 /// whether web pages may run scripts.
 /// `installer`: an app installer's URL (see [`Browser::set_installer`]);
 /// `keyboard`: when the on-screen keyboard comes up.
-pub fn run(url: Option<String>, javascript: bool, installer: Option<String>, keyboard: KeyboardMode) -> Result<(), Box<dyn Error>> {
+/// `debug_port`: serve the Chrome DevTools Protocol there.
+pub fn run(
+    url: Option<String>,
+    javascript: bool,
+    installer: Option<String>,
+    keyboard: KeyboardMode,
+    debug_port: Option<u16>,
+) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::<Fetched>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    let debugger = match debug_port {
+        Some(port) => {
+            let proxy = std::sync::Mutex::new(proxy.clone());
+            Some(start_debugging(port, move |f| {
+                let _ = proxy.lock().unwrap_or_else(|e| e.into_inner()).send_event(f);
+            })?)
+        }
+        None => None,
+    };
     let mut app = App {
+        debugger,
         state: None,
         url,
         javascript,
@@ -47,10 +64,12 @@ pub fn run(url: Option<String>, javascript: bool, installer: Option<String>, key
 }
 
 /// A finished fetch, sent from a loader thread to the event loop (or, with
-/// `ws`, what happened on WebSocket connection `id`).
+/// `ws`, what happened on WebSocket connection `id`; with `cdp`, a remote
+/// debugging request).
 struct Fetched {
     id: u32,
     ws: Option<WsEvent>,
+    cdp: Option<super::cdp_server::Incoming>,
     result: Result<Vec<u8>, String>,
     /// The URL after redirects, if it changed.
     final_url: Option<String>,
@@ -64,6 +83,7 @@ impl Fetched {
             Ok(l) => Fetched {
                 id,
                 ws: None,
+                cdp: None,
                 result: Ok(l.body),
                 final_url: l.final_url,
                 info: l.info,
@@ -71,6 +91,7 @@ impl Fetched {
             Err(e) => Fetched {
                 id,
                 ws: None,
+                cdp: None,
                 result: Err(e),
                 final_url: None,
                 info: None,
@@ -79,11 +100,28 @@ impl Fetched {
     }
 
     fn ws(id: u32, event: WsEvent) -> Fetched {
-        Fetched { id, ws: Some(event), result: Ok(Vec::new()), final_url: None, info: None }
+        Fetched { id, ws: Some(event), cdp: None, result: Ok(Vec::new()), final_url: None, info: None }
+    }
+
+    fn cdp(incoming: super::cdp_server::Incoming) -> Fetched {
+        Fetched { id: 0, ws: None, cdp: Some(incoming), result: Ok(Vec::new()), final_url: None, info: None }
     }
 
     /// Hands the fetch to `browser`.
     fn deliver(self, browser: &mut Browser, host: &mut dyn Host) {
+        if let Some(incoming) = self.cdp {
+            use super::cdp_server::Incoming;
+            return match incoming {
+                Incoming::Http { path, reply } => {
+                    let _ = reply.send(browser.cdp_http(&path, browser_port(), host));
+                }
+                Incoming::Open { conn, path, ok } => {
+                    let _ = ok.send(browser.cdp_open(conn, &path));
+                }
+                Incoming::Message { conn, text } => browser.cdp_message(conn, &text, host),
+                Incoming::Closed { conn } => browser.cdp_close(conn),
+            };
+        }
         if let Some(event) = self.ws {
             return browser.ws_event(self.id, event, host);
         }
@@ -97,6 +135,34 @@ impl Fetched {
     }
 }
 
+/// The remote debugging port in use (for the URLs `/json` lists).
+static DEBUG_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+fn browser_port() -> u16 {
+    DEBUG_PORT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Starts the remote debugging server on `port`, delivering through `wake`.
+fn start_debugging(
+    port: u16,
+    wake: impl Fn(Fetched) + Send + Sync + 'static,
+) -> Result<super::cdp_server::Server, Box<dyn Error>> {
+    let server = super::cdp_server::start(port, move |i| wake(Fetched::cdp(i)))?;
+    DEBUG_PORT.store(server.port, std::sync::atomic::Ordering::Relaxed);
+    // The line tools look for (Chrome prints the same).
+    eprintln!("\nDevTools listening on ws://127.0.0.1:{}/devtools/browser/rubrowser", server.port);
+    Ok(server)
+}
+
+/// Sends the browser's protocol replies and events.
+fn flush_debugging(browser: &mut Browser, server: &Option<super::cdp_server::Server>) {
+    if let Some(s) = server {
+        for (conn, text) in browser.take_cdp_output() {
+            s.send(conn, text);
+        }
+    }
+}
+
 /// A loaded resource.
 pub struct Loaded {
     pub body: Vec<u8>,
@@ -107,6 +173,8 @@ pub struct Loaded {
 }
 
 struct App {
+    /// The remote debugging server.
+    debugger: Option<super::cdp_server::Server>,
     state: Option<State>,
     url: Option<String>,
     javascript: bool,
@@ -565,6 +633,114 @@ fn http(url: &str, request: Option<&HttpRequest>) -> Result<Loaded, String> {
     }
 }
 
+/// The host without a window (screenshots, `--headless`).
+struct Headless {
+    tx: std::sync::mpsc::Sender<Fetched>,
+    pending: usize,
+    sockets: Sockets,
+}
+impl Host for Headless {
+    fn fetch(&mut self, id: u32, url: &str) {
+        self.fetch_with(id, url, &HttpRequest::default());
+    }
+    fn ws_open(&mut self, id: u32, url: &str, protocols: &[String], origin: &str) {
+        let tx = self.tx.clone();
+        let socket = super::ws::open(url, protocols, origin, &user_agent(), move |e| {
+            let _ = tx.send(Fetched::ws(id, e));
+        });
+        self.sockets.insert(id, socket);
+    }
+    fn ws_send(&mut self, id: u32, data: &[u8], text: bool) {
+        ws_send(&self.sockets, id, data, text);
+    }
+    fn ws_close(&mut self, id: u32, code: u16, reason: &str) {
+        ws_close(&mut self.sockets, id, code, reason);
+    }
+    fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
+        self.pending += 1;
+        let tx = self.tx.clone();
+        let url = url.to_string();
+        let request = (*request != HttpRequest::default()).then(|| request.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(Fetched::new(id, load_full(&url, request.as_ref())));
+        });
+    }
+    // No window: file inputs stay empty (the default `pick_files`).
+    fn save_download(&mut self, name: &str, bytes: &[u8]) -> Result<String, String> {
+        save_download(name, bytes)
+    }
+    fn clipboard_get(&mut self) -> Option<String> {
+        None
+    }
+    fn clipboard_set(&mut self, text: &str) {
+        eprintln!("[clipboard] {text}");
+    }
+    fn set_cursor(&mut self, _: Cursor) {}
+    fn set_title(&mut self, _: &str) {}
+    fn log(&mut self, message: &str) {
+        eprintln!("[console] {message}");
+    }
+    fn wall_clock(&mut self) -> Option<f64> {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(t.as_secs_f64() * 1000.0)
+    }
+}
+
+/// Runs the browser without a window, serving the Chrome DevTools
+/// Protocol on `port` (0: any free port) until a client sends
+/// `Browser.close` or the process is stopped.
+pub fn headless(url: Option<String>, port: u16, shot: &Shot) -> Result<(), Box<dyn Error>> {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel();
+    let wake = std::sync::Mutex::new(tx.clone());
+    let server = Some(start_debugging(port, move |f| {
+        let _ = wake.lock().unwrap_or_else(|e| e.into_inner()).send(f);
+    })?);
+    let mut host = Headless { tx, pending: 0, sockets: Sockets::new() };
+    let (pw, ph) = (
+        (shot.width as f32 * shot.scale) as usize,
+        (shot.height as f32 * shot.scale) as usize,
+    );
+    let mut browser = Browser::with_fonts(pw, ph, shot.scale, Fonts::with_system_fonts());
+    browser.set_javascript(shot.javascript);
+    browser.set_installer(shot.installer.clone());
+    browser.set_keyboard_mode(shot.keyboard);
+    let start = Instant::now();
+    let now = |s: &Instant| s.elapsed().as_secs_f64() * 1000.0;
+    if let Some(u) = url {
+        browser.navigate(&url::from_input(&u), &mut host);
+    }
+    loop {
+        let t = now(&start);
+        browser.render(t, &mut host);
+        flush_debugging(&mut browser, &server);
+        if browser.cdp_wants_close() {
+            return Ok(());
+        }
+        // Sleep until the next timer or frame, or something arrives.
+        let wait = browser
+            .next_wakeup(t)
+            .map_or(1000.0, |at| (at - t).clamp(1.0, 1000.0));
+        match rx.recv_timeout(Duration::from_secs_f64(wait / 1000.0)) {
+            Ok(first) => {
+                let mut next = Some(first);
+                while let Some(f) = next {
+                    if f.cdp.is_none() {
+                        host.pending = host.pending.saturating_sub(1);
+                    }
+                    f.deliver(&mut browser, &mut host);
+                    flush_debugging(&mut browser, &server);
+                    next = rx.try_recv().ok();
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
 /// Options for [`screenshot`].
 pub struct Shot {
     pub width: u32,
@@ -587,59 +763,6 @@ pub struct Shot {
 /// rendered window (chrome and page) to the PNG file `out`.
 pub fn screenshot(url: &str, out: &str, shot: &Shot) -> Result<(), Box<dyn Error>> {
     use std::sync::mpsc;
-    struct Headless {
-        tx: mpsc::Sender<Fetched>,
-        pending: usize,
-        sockets: Sockets,
-    }
-    impl Host for Headless {
-        fn fetch(&mut self, id: u32, url: &str) {
-            self.fetch_with(id, url, &HttpRequest::default());
-        }
-        fn ws_open(&mut self, id: u32, url: &str, protocols: &[String], origin: &str) {
-            let tx = self.tx.clone();
-            let socket = super::ws::open(url, protocols, origin, &user_agent(), move |e| {
-                let _ = tx.send(Fetched::ws(id, e));
-            });
-            self.sockets.insert(id, socket);
-        }
-        fn ws_send(&mut self, id: u32, data: &[u8], text: bool) {
-            ws_send(&self.sockets, id, data, text);
-        }
-        fn ws_close(&mut self, id: u32, code: u16, reason: &str) {
-            ws_close(&mut self.sockets, id, code, reason);
-        }
-        fn fetch_with(&mut self, id: u32, url: &str, request: &HttpRequest) {
-            self.pending += 1;
-            let tx = self.tx.clone();
-            let url = url.to_string();
-            let request = (*request != HttpRequest::default()).then(|| request.clone());
-            std::thread::spawn(move || {
-                let _ = tx.send(Fetched::new(id, load_full(&url, request.as_ref())));
-            });
-        }
-        // No window: file inputs stay empty (the default `pick_files`).
-        fn save_download(&mut self, name: &str, bytes: &[u8]) -> Result<String, String> {
-            save_download(name, bytes)
-        }
-        fn clipboard_get(&mut self) -> Option<String> {
-            None
-        }
-        fn clipboard_set(&mut self, text: &str) {
-            eprintln!("[clipboard] {text}");
-        }
-        fn set_cursor(&mut self, _: Cursor) {}
-        fn set_title(&mut self, _: &str) {}
-        fn log(&mut self, message: &str) {
-            eprintln!("[console] {message}");
-        }
-        fn wall_clock(&mut self) -> Option<f64> {
-            let t = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?;
-            Some(t.as_secs_f64() * 1000.0)
-        }
-    }
     let (tx, rx) = mpsc::channel();
     let mut host = Headless { tx, pending: 0, sockets: Sockets::new() };
     let (pw, ph) = (
@@ -878,6 +1001,7 @@ impl ApplicationHandler<Fetched> for App {
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, f: Fetched) {
         if let Some(s) = self.state.as_mut() {
             f.deliver(&mut s.browser, &mut s.host);
+            flush_debugging(&mut s.browser, &self.debugger);
             s.window.request_redraw();
         }
     }
@@ -890,6 +1014,12 @@ impl ApplicationHandler<Fetched> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = self.now();
+        if let Some(s) = self.state.as_mut() {
+            flush_debugging(&mut s.browser, &self.debugger);
+            if s.browser.cdp_wants_close() {
+                return event_loop.exit();
+            }
+        }
         let Some(s) = self.state.as_ref() else {
             return;
         };

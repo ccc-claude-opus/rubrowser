@@ -5,6 +5,7 @@
 //! `data-action` attribute run browser commands, and the tab strip and
 //! address bar are kept in sync by editing the chrome DOM.
 
+mod cdp;
 mod devtools;
 mod osk;
 mod touch;
@@ -667,6 +668,8 @@ pub struct Browser {
     last_click: Option<(NodeId, f64)>,
     /// The developer tools panel (see `devtools.rs`).
     devtools: devtools::DevTools,
+    /// Remote debugging connections (Chrome DevTools Protocol).
+    cdp: cdp::Cdp,
     /// The last page mouse press (point and time), for double-clicking a word.
     last_down: Option<(f32, f32, f64)>,
     /// Where the pointer was when page mouse events last went out.
@@ -723,6 +726,7 @@ impl Browser {
             local: Vec::new(),
             last_click: None,
             devtools: Default::default(),
+            cdp: Default::default(),
             last_down: None,
             last_move: (-1.0, -1.0),
             key_repeat: false,
@@ -1118,6 +1122,7 @@ impl Browser {
                 }),
             }
         }
+        self.cdp_navigated(i, host);
         self.tabs[i].queuing = false;
         self.run_scripts(i, host);
         self.dirty = true;
@@ -1139,6 +1144,7 @@ impl Browser {
                         rt.set_budget(None);
                     }
                     self.fire_load(i, host);
+                    self.cdp_loaded(i, host);
                 }
                 return;
             }
@@ -7208,5 +7214,95 @@ mod tests {
             b.tabs[b.active].doc.dom.attr(p, "style"),
             Some("padding: 2px; font-size: 30px; background-color: blue")
         );
+    }
+
+    // ----- remote debugging (Chrome DevTools Protocol) ---------------------
+
+    /// Sends `msg` on connection `conn`; returns everything sent back.
+    fn cdp(b: &mut Browser, h: &mut TestHost, conn: u32, msg: &str) -> Vec<serde_json::Value> {
+        b.cdp_message(conn, msg, h);
+        b.render(0.0, h);
+        b.take_cdp_output()
+            .into_iter()
+            .map(|(_, t)| serde_json::from_str(&t).unwrap())
+            .collect()
+    }
+
+    fn reply(out: &[serde_json::Value], id: i64) -> serde_json::Value {
+        out.iter().find(|m| m["id"] == id).cloned().unwrap_or_else(|| panic!("no reply {id} in {out:?}"))
+    }
+
+    #[test]
+    fn cdp_targets_and_discovery() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://cdp.test/", "<title>T</title><p>x</p>");
+        let (status, list) = b.cdp_http("/json/list", 9222, &mut h);
+        assert_eq!(status, 200);
+        let list: serde_json::Value = serde_json::from_str(&list).unwrap();
+        assert_eq!(list[0]["url"], "https://cdp.test/");
+        assert_eq!(list[0]["title"], "T");
+        let ws = list[0]["webSocketDebuggerUrl"].as_str().unwrap().to_string();
+        assert!(ws.starts_with("ws://127.0.0.1:9222/devtools/page/"), "{ws}");
+        assert_eq!(b.cdp_http("/json/nothing", 9222, &mut h).0, 404);
+        let path = ws.trim_start_matches("ws://127.0.0.1:9222");
+        assert!(b.cdp_open(1, path));
+        assert!(!b.cdp_open(2, "/devtools/page/FFFF"));
+        assert!(b.cdp_open(3, "/devtools/browser/rubrowser"));
+        let out = cdp(&mut b, &mut h, 3, r#"{"id":1,"method":"Target.getTargets"}"#);
+        assert_eq!(reply(&out, 1)["result"]["targetInfos"][0]["attached"], true);
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":2,"method":"Nope.nothing"}"#);
+        assert_eq!(reply(&out, 2)["error"]["code"], -32601);
+        let out = cdp(&mut b, &mut h, 1, "not json");
+        assert_eq!(out[0]["error"]["code"], -32700);
+        let out = cdp(&mut b, &mut h, 3, r#"{"id":4,"method":"Browser.close"}"#);
+        assert!(reply(&out, 4)["result"].is_object());
+        assert!(b.cdp_wants_close());
+    }
+
+    #[test]
+    fn cdp_page_runtime_dom_and_events() {
+        let (mut b, mut h) = browser();
+        load(&mut b, &mut h, "https://cdp.test/", "<p id=a class=x>hi</p>");
+        let tab = b.tabs[b.active].id;
+        assert!(b.cdp_open(1, &format!("/devtools/page/{tab:032X}")));
+        for (k, d) in ["Page", "Runtime", "Network", "DOM"].iter().enumerate() {
+            let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":{k},"method":"{d}.enable"}}"#));
+            assert!(reply(&out, k as i64)["result"].is_object());
+        }
+        // Runtime.evaluate answers once the page's runtime has run it.
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":10,"method":"Runtime.evaluate","params":{"expression":"document.getElementById('a').textContent + 1"}}"#);
+        assert_eq!(reply(&out, 10)["result"]["result"]["value"], "hi1");
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":11,"method":"Runtime.evaluate","params":{"expression":"({a: [1, 2]})","returnByValue":true}}"#);
+        assert_eq!(reply(&out, 11)["result"]["result"]["value"]["a"][1], 2);
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":12,"method":"Runtime.evaluate","params":{"expression":"console.warn('w'); throw new TypeError('t')"}}"#);
+        assert!(out.iter().any(|m| m["method"] == "Runtime.consoleAPICalled" && m["params"]["type"] == "warning"));
+        assert_eq!(reply(&out, 12)["result"]["exceptionDetails"]["exception"]["subtype"], "error");
+        // DOM.
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":20,"method":"DOM.getDocument","params":{"depth":-1}}"#);
+        let root = reply(&out, 20)["result"]["root"]["nodeId"].as_u64().unwrap();
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":21,"method":"DOM.querySelector","params":{{"nodeId":{root},"selector":".x"}}}}"#));
+        let p = reply(&out, 21)["result"]["nodeId"].as_u64().unwrap();
+        assert_eq!(p as usize, page_el(&b, "a") + 1);
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":22,"method":"DOM.getOuterHTML","params":{{"nodeId":{p}}}}}"#));
+        assert_eq!(reply(&out, 22)["result"]["outerHTML"], "<p id=\"a\" class=\"x\">hi</p>");
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":23,"method":"DOM.getBoxModel","params":{{"nodeId":{p}}}}}"#));
+        assert_eq!(reply(&out, 23)["result"]["model"]["content"].as_array().unwrap().len(), 8);
+        // Navigation: events for the new document.
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":30,"method":"Page.navigate","params":{"url":"/next"}}"#);
+        assert!(reply(&out, 30)["result"]["frameId"].is_string());
+        assert!(out.iter().any(|m| m["method"] == "Network.requestWillBeSent" && m["params"]["request"]["url"] == "https://cdp.test/next"));
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(b"<script>console.log('next')</script>".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let events: Vec<serde_json::Value> = b.take_cdp_output().into_iter().map(|(_, t)| serde_json::from_str(&t).unwrap()).collect();
+        let methods: Vec<&str> = events.iter().filter_map(|m| m["method"].as_str()).collect();
+        for want in ["Network.loadingFinished", "Page.frameNavigated", "Runtime.executionContextCreated", "Runtime.consoleAPICalled", "Page.loadEventFired"] {
+            assert!(methods.contains(&want), "{want} in {methods:?}");
+        }
+        let at = |m: &str| methods.iter().position(|x| *x == m).unwrap();
+        assert!(at("Page.frameNavigated") < at("Page.loadEventFired"));
+        // Screenshots are PNG.
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":40,"method":"Page.captureScreenshot"}"#);
+        assert!(reply(&out, 40)["result"]["data"].as_str().unwrap().starts_with("iVBORw0KGgo"));
     }
 }

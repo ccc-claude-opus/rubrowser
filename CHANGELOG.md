@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Developer tools** (F12, Cmd+Opt+I, Ctrl+Shift+I), docked below the page: Elements (DOM tree, box model outline on the page, attributes, matching rules with declarations that can be turned off, computed values, edits, picking an element), Console (levels, uncaught errors, a JavaScript line with history), Network (requests with headers and bodies), Sources, Application (localStorage, sessionStorage, cookies, `blob:` URLs) and Performance (script call time and instructions, frame times). `--devtools PANEL[:SELECTOR]` for screenshots.
+- **Remote debugging** over the Chrome DevTools Protocol: `--remote-debugging-port N` (127.0.0.1 only) and `--headless`; Browser, Target (flattened sessions), Page, Runtime, DOM, CSS, Network, Input, Overlay and Log. New dependency: serde_json (MIT OR Apache-2.0).
+
 ## 0.3.0
 
 - **Touch and an on-screen keyboard**: Touch Events and Pointer Events with `pointerType: "touch"`, compatibility mouse events, `touch-action`; a tap clicks, a drag scrolls with momentum, a long press opens the context menu. An on-screen keyboard (`--keyboard auto|always|never`) for text fields the user touched, with layouts for `type`/`inputmode` and an Enter key labelled from `enterkeyhint`.

@@ -1,15 +1,21 @@
 use std::time::Duration;
 
-const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [--keyboard auto|always|never] [URL]
+const USAGE: &str = "usage: rubrowser [--no-js] [--installer URL] [--keyboard auto|always|never] [--remote-debugging-port N] [URL]
+       rubrowser --headless --remote-debugging-port N [--width N] [--height N] [--no-js] [URL]
        rubrowser --screenshot FILE.png [--width N] [--height N] [--scale F] [--timeout SECS] [--no-js] [--installer URL] [--keyboard MODE] [--devtools PANEL] URL
   --installer URL  an app installer (ruwebos's): pages declaring <link rel=\"ruwebos-app\"> get an Install button
   --keyboard MODE  the on-screen keyboard for text fields: auto (after a touch; default), always, never
-  --devtools PANEL open the developer tools at elements, console or network (elements:SELECTOR selects an element)";
+  --devtools PANEL open the developer tools at elements, console, network, sources, application or performance
+                   (elements:SELECTOR selects an element)
+  --remote-debugging-port N  serve the Chrome DevTools Protocol on 127.0.0.1:N (0: any free port)
+  --headless       no window (with --remote-debugging-port)";
 
 fn main() {
     let mut args = std::env::args().skip(1);
     let mut url = None;
     let mut shot_file = None;
+    let mut debug_port: Option<u16> = None;
+    let mut headless = false;
     let mut shot = rubrowser::platform::native::Shot {
         width: 1280,
         height: 900,
@@ -38,6 +44,14 @@ fn main() {
             }
             "--no-js" => shot.javascript = false,
             "--devtools" => shot.devtools = Some(value("--devtools")),
+            "--headless" => headless = true,
+            "--remote-debugging-port" => {
+                let v = value("--remote-debugging-port");
+                debug_port = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("rubrowser: --remote-debugging-port needs a port number\n{USAGE}");
+                    std::process::exit(2);
+                }));
+            }
             "--installer" => shot.installer = Some(value("--installer")),
             "--keyboard" => {
                 let v = value("--keyboard");
@@ -61,7 +75,14 @@ fn main() {
                 std::process::exit(2);
             }
         },
-        None => rubrowser::platform::native::run(url, shot.javascript, shot.installer, shot.keyboard),
+        None if headless => match debug_port {
+            Some(port) => rubrowser::platform::native::headless(url, port, &shot),
+            None => {
+                eprintln!("rubrowser: --headless needs --remote-debugging-port\n{USAGE}");
+                std::process::exit(2);
+            }
+        },
+        None => rubrowser::platform::native::run(url, shot.javascript, shot.installer, shot.keyboard, debug_port),
     };
     if let Err(e) = result {
         eprintln!("rubrowser: {e}");

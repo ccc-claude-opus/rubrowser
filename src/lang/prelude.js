@@ -812,6 +812,49 @@
     }
     return format([v]);
   }
+  // Remote debugging (Chrome DevTools Protocol): Runtime.evaluate and
+  // Runtime.callFunctionOn. The result goes back as a RemoteObject (with
+  // its value when it has a JSON form) after the promise settles.
+  function remoteObject(v) {
+    const t = typeof v;
+    if (v === undefined) return { type: 'undefined' };
+    if (v === null) return { type: 'object', subtype: 'null', value: null };
+    if (t === 'number') {
+      if (!Number.isFinite(v) || Object.is(v, -0)) return { type: 'number', unserializableValue: Object.is(v, -0) ? '-0' : String(v), description: String(v) };
+      return { type: 'number', value: v, description: String(v) };
+    }
+    if (t === 'string' || t === 'boolean') return { type: t, value: v };
+    if (t === 'bigint') return { type: 'bigint', unserializableValue: v + 'n', description: v + 'n' };
+    if (t === 'symbol') return { type: 'symbol', description: v.toString() };
+    if (t === 'function') return { type: 'function', className: 'Function', description: String(v).slice(0, 200) };
+    const o = { type: 'object', className: (v.constructor && v.constructor.name) || 'Object', description: inspectValue(v) };
+    if (Array.isArray(v)) o.subtype = 'array';
+    else if (v instanceof Node) o.subtype = 'node';
+    else if (v instanceof Error) { o.subtype = 'error'; o.description = v.name + ': ' + v.message + (v.stack ? '\n' + v.stack : ''); }
+    else if (v instanceof Promise) o.subtype = 'promise';
+    else if (v instanceof Date) o.subtype = 'date';
+    else if (v instanceof RegExp) o.subtype = 'regexp';
+    if (!o.subtype || o.subtype === 'array' || o.subtype === 'date') {
+      try { const j = JSON.stringify(v); if (j !== undefined) o.value = JSON.parse(j); } catch (_) {}
+    }
+    return o;
+  }
+  global.__rb_cdp_eval = function (key, src, awaitPromise, args) {
+    const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+    const fail = (e) => send({
+      result: remoteObject(e),
+      exceptionDetails: { exceptionId: 1, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: remoteObject(e) },
+    });
+    let v;
+    try {
+      v = args ? (0, eval)('(' + src + ')').apply(null, args) : (0, eval)(src);
+    } catch (e) {
+      fail(e);
+      return;
+    }
+    if (awaitPromise && v && typeof v.then === 'function') v.then((r) => send({ result: remoteObject(r) }), fail);
+    else send({ result: remoteObject(v) });
+  };
   global.__rb_devtools_eval = function (src) {
     let v;
     try {
