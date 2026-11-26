@@ -107,6 +107,8 @@ cargo rustc --profile runtime --target wasm32-unknown-unknown --no-default-featu
 
 同一套協定與 `prelude.js` 也可以跑在 [rujse](https://github.com/ccc-claude-opus/rujse) 上（`src/lang/js_rujse.rs`，feature `js-runtime-rujse`，example `js_runtime_rujse`）。`scripts/build.sh` 會一併建置成 `src/browser/runtimes/js-rujse.wasm`；建置需要 rujse 的原始碼在 `../rujse`（path 依賴）。
 
+`prelude.js` 預先編成 rujse 的 bytecode cache（`src/lang/prelude.rjbc`，由 `scripts/build.sh` 用 rujse 的命令列工具產生並提交），每頁直接載入、不再 parse 與編譯；cache 和目前的 `prelude.js` 不一致時改為直接編譯（測試 `prelude_cache_is_up_to_date` 會提醒重建）。
+
 瀏覽器以 feature `rujse` 建置時改用 `js-rujse.wasm`：
 
 ```bash

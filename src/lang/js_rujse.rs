@@ -20,6 +20,10 @@ type JsResult<T> = Result<T, Throw>;
 type Native = fn(&mut Vm, Value, &[Value], Value) -> JsResult<Value>;
 
 const PRELUDE: &str = include_str!("prelude.js");
+/// `prelude.js` compiled ahead of time by `scripts/build.sh` (rujse's
+/// bytecode cache): each page skips parsing and compiling it. Used only
+/// when it was made from this very prelude by this rujse version.
+const PRELUDE_CACHE: &[u8] = include_bytes!("prelude.rjbc");
 
 thread_local! {
     static VM: RefCell<Option<Box<Vm>>> = const { RefCell::new(None) };
@@ -738,7 +742,16 @@ pub fn init() {
     }
     NATIVES.with(|n| *n.borrow_mut() = list.into_iter().map(|(_, _, f)| f).collect());
     vm.global_prop("__rb", Value::object(rb));
-    if let Err(e) = vm.eval_script(PRELUDE, "prelude.js") {
+    let prelude = if Vm::cache_source(PRELUDE_CACHE) == Some(PRELUDE) {
+        vm.load_cached(PRELUDE_CACHE)
+    } else {
+        None
+    };
+    let r = match prelude {
+        Some(code) => vm.run_script_code(code),
+        None => vm.eval_script(PRELUDE, "prelude.js"),
+    };
+    if let Err(e) = r {
         let msg = match e {
             Throw::Value(v) => vm.error_to_string(v),
             Throw::Terminate => "terminated".into(),

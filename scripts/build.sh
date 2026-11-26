@@ -24,7 +24,10 @@ cargo rustc --profile runtime --target wasm32-unknown-unknown \
 cp target/wasm32-unknown-unknown/runtime/examples/js_runtime.wasm src/browser/runtimes/js.wasm
 
 #    The same environment on the rujse engine (../rujse), which the browser
-#    uses when built with the `rujse` feature.
+#    uses when built with the `rujse` feature. prelude.js goes in compiled
+#    (rujse's bytecode cache), made by the rujse command-line tool.
+(cd ../rujse && cargo build --release --bin rujse)
+../rujse/target/release/rujse --cache-out src/lang/prelude.rjbc src/lang/prelude.js prelude.js
 cargo rustc --profile runtime --target wasm32-unknown-unknown \
   --no-default-features --features js-runtime-rujse --example js_runtime_rujse \
   -- -C link-arg=-zstack-size=16777216

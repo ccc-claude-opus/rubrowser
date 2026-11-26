@@ -5145,6 +5145,20 @@ mod tests {
     }
 
     #[test]
+    fn prelude_cache_is_up_to_date() {
+        // js-rujse.wasm runs prelude.rjbc (prelude.js compiled ahead of
+        // time), which carries the source it was made from; a stale one is
+        // ignored at run time but costs every page a compile. Run
+        // scripts/build.sh after changing prelude.js.
+        let prelude = include_bytes!("../lang/prelude.js");
+        let cache = include_bytes!("../lang/prelude.rjbc");
+        assert!(
+            cache.windows(prelude.len()).any(|w| w == prelude),
+            "src/lang/prelude.rjbc is stale: run scripts/build.sh"
+        );
+    }
+
+    #[test]
     fn javascript_runs_in_the_wasm_runtime() {
         let mut h = LogHost::default();
         let mut b = Browser::new(1000, 700, 1.0);
