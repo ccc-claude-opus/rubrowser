@@ -111,6 +111,11 @@ imports! {
     // Whether the browser asked the running call to stop (it ran too
     // long): runtimes then end it at their next safe point.
     fn interrupted() -> i32;
+    // The JavaScript debugger (rujse runtime): send a protocol message;
+    // wait for the next command while paused (-1: resume); resumed.
+    fn debug_send(p: *const u8, n: usize);
+    fn debug_wait(p: *mut u8, cap: usize) -> i32;
+    fn debug_resumed();
     fn node_type(h: i32) -> i32;
     fn tag_name(h: i32, p: *mut u8, cap: usize) -> i32;
     fn relative(h: i32, which: i32) -> i32;

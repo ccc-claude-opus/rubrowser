@@ -869,12 +869,12 @@
   }
   // Runtime.getProperties: descriptors as stored (getters are not run).
   global.__rb_cdp_props = function (key, objectId, ownProperties, accessorPropertiesOnly) {
-    const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+    const r = cdpProps(objectId, ownProperties, accessorPropertiesOnly);
+    rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+  };
+  function cdpProps(objectId, ownProperties, accessorPropertiesOnly) {
     const entry = cdpObjects.get(objectId);
-    if (!entry) {
-      send({ error: 'Could not find object with given id' });
-      return;
-    }
+    if (!entry) return { error: 'Could not find object with given id' };
     const result = [];
     const seen = new Set();
     let o = entry.v;
@@ -911,7 +911,104 @@
         if (name !== '[[Prototype]]') internalProperties.push({ name, value: remoteObject(value) });
       }
     }
-    send({ result, internalProperties });
+    return { result, internalProperties };
+  }
+
+  // ----- the debugger (rujse runtime: rb.debug*) -----------------------------
+  // Positions: CDP counts lines and columns from 0, rujse from 1.
+  let debugFrames = [];
+  global.__rb_debug_enable = function () {
+    if (rb.debugEnable) rb.debugEnable();
+  };
+  global.__rb_debug_disable = function () {
+    if (rb.debugDisable) rb.debugDisable();
+  };
+  global.__rb_debug_bp = function (key, url, line, col, cond) {
+    const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+    if (!rb.debugSetBreakpoint) return send({ error: 'The JavaScript debugger needs the rujse runtime' });
+    const r = rb.debugSetBreakpoint(url, line + 1, col === null ? null : col + 1, cond);
+    if (!r) return send({ error: 'Debugger is not enabled' });
+    send({
+      breakpointId: String(r[0]),
+      locations: r[1].map(([s, l, c]) => ({ scriptId: String(s), lineNumber: l - 1, columnNumber: c - 1 })),
+    });
+  };
+  global.__rb_debug_call = function (key, what, arg) {
+    const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+    if (!rb.debugCall) return send({ error: 'The JavaScript debugger needs the rujse runtime' });
+    const v = rb.debugCall(what, arg);
+    if (what === 'Debugger.getScriptSource') send(v === null ? { error: 'No script with given id' } : { scriptSource: v });
+    else send({});
+  };
+  global.__rb_debug_paused = function (reason, data, frames, hit) {
+    debugFrames = frames;
+    cdpGroup = 'backtrace';
+    const callFrames = frames.map((f, i) => ({
+      callFrameId: String(i),
+      functionName: f.functionName,
+      location: { scriptId: String(f.scriptId), lineNumber: Math.max(f.line - 1, 0), columnNumber: Math.max(f.column - 1, 0) },
+      url: f.url,
+      scopeChain: f.scopes.map((s) => ({ type: s.type, object: remoteObject(s.object) })),
+      this: remoteObject(f.this),
+    }));
+    const params = { callFrames, reason };
+    if (data !== undefined) params.data = remoteObject(data);
+    if (hit !== undefined) params.hitBreakpoints = [String(hit)];
+    rb.debugSend(JSON.stringify({ method: 'Debugger.paused', params }));
+  };
+  // A command while paused; returns how to resume ('' keeps waiting).
+  global.__rb_debug_command = function (text) {
+    let m;
+    try { m = JSON.parse(text); } catch (_) { return ''; }
+    const p = m.params || {};
+    const reply = (result) => rb.debugSend(JSON.stringify({ id: m.id, result }));
+    const error = (message) => rb.debugSend(JSON.stringify({ id: m.id, error: { code: -32000, message } }));
+    const resume = (how) => {
+      reply({});
+      rb.debugSend(JSON.stringify({ method: 'Debugger.resumed', params: {} }));
+      debugFrames = [];
+      return how;
+    };
+    switch (m.method) {
+      case 'Debugger.resume': return resume('resume');
+      case 'Debugger.stepOver': return resume('stepOver');
+      case 'Debugger.stepInto': return resume('stepInto');
+      case 'Debugger.stepOut': return resume('stepOut');
+      case 'Debugger.evaluateOnCallFrame':
+      case 'Runtime.evaluate': {
+        const out = (v) => (p.returnByValue ? remoteValue(v) : remoteObject(v));
+        try {
+          const v = m.method === 'Runtime.evaluate' ? (0, eval)(p.expression) : rb.debugEval(Number(p.callFrameId), p.expression);
+          reply({ result: out(v) });
+        } catch (e) {
+          reply({ result: out(e), exceptionDetails: { exceptionId: 1, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: out(e) } });
+        }
+        return '';
+      }
+      case 'Runtime.getProperties': {
+        const r = cdpProps(p.objectId, p.ownProperties, p.accessorPropertiesOnly);
+        if (r.error) error(r.error);
+        else reply(r);
+        return '';
+      }
+      case 'Runtime.releaseObject': __rb_cdp_release(p.objectId, ''); reply({}); return '';
+      case 'Runtime.releaseObjectGroup': __rb_cdp_release(null, p.objectGroup); reply({}); return '';
+      case 'Debugger.getScriptSource': {
+        const v = rb.debugCall('Debugger.getScriptSource', p.scriptId);
+        if (v === null) error('No script with given id');
+        else reply({ scriptSource: v });
+        return '';
+      }
+      case 'Debugger.setBreakpointByUrl': {
+        const r = rb.debugSetBreakpoint(p.url, p.lineNumber + 1, p.columnNumber === undefined ? null : p.columnNumber + 1, p.condition || '');
+        reply({ breakpointId: String(r[0]), locations: r[1].map(([s, l, c]) => ({ scriptId: String(s), lineNumber: l - 1, columnNumber: c - 1 })) });
+        return '';
+      }
+      case 'Debugger.removeBreakpoint': rb.debugCall('Debugger.removeBreakpoint', p.breakpointId); reply({}); return '';
+      default:
+        error('The page is paused in the debugger: ' + m.method + ' is not available until it resumes');
+        return '';
+    }
   };
   global.__rb_cdp_release = function (objectId, group) {
     if (objectId) cdpObjects.delete(objectId);

@@ -745,10 +745,22 @@ fn setup_vm() -> Box<Vm> {
         let k = vm.key(name);
         vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
     }
-    // DevTools (Runtime.getProperties): engine state scripts cannot see.
-    let f = vm.native_fn("internal", 1, internal_fn);
-    let k = vm.key("internal");
-    vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
+    // DevTools: engine state scripts cannot see (Runtime.getProperties)
+    // and the debugger (see prelude.js, __rb_debug_*).
+    let devtools: [(&str, u32, Native); 7] = [
+        ("internal", 1, internal_fn),
+        ("debugEnable", 0, debug_enable_fn),
+        ("debugDisable", 0, debug_disable_fn),
+        ("debugSetBreakpoint", 4, debug_set_breakpoint_fn),
+        ("debugCall", 2, debug_call_fn),
+        ("debugEval", 2, debug_eval_fn),
+        ("debugSend", 1, debug_send_fn),
+    ];
+    for (name, argc, f) in devtools {
+        let f = vm.native_fn(name, argc, f);
+        let k = vm.key(name);
+        vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
+    }
     NATIVES.with(|n| *n.borrow_mut() = list.iter().map(|(_, _, f)| *f).collect());
     NAMES.with(|n| *n.borrow_mut() = list.iter().map(|(name, _, _)| *name).collect());
     vm.global_prop("__rb", Value::object(rb));
@@ -765,6 +777,224 @@ fn internal_fn(vm: &mut Vm, _: Value, args: &[Value], _: Value) -> JsResult<Valu
         out.push(Value::object(vm.new_array(vec![n, v])));
     }
     Ok(Value::object(vm.new_array(out)))
+}
+
+// ----- the debugger -----------------------------------------------------------
+
+thread_local! {
+    /// Frames on the VM stack when it paused: the debugger's own calls
+    /// into JS run above them.
+    static PAUSED_DEPTH: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Pauses for CDP: reports through prelude.js (`__rb_debug_paused`), then
+/// handles commands (`__rb_debug_command`) until one resumes.
+struct CdpDebugger;
+
+fn json_str(s: &str) -> String {
+    let mut o = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+fn send(text: &str) {
+    unsafe { ffi::debug_send(text.as_ptr(), text.len()) };
+}
+
+fn call_js(vm: &mut Vm, name: &str, args: &[Value]) -> Option<Value> {
+    let k = vm.key(name);
+    let g = vm.global;
+    let f = vm.get(g, k).ok().filter(|f| vm.is_callable(*f))?;
+    vm.call(f, Value::UNDEFINED, args).ok()
+}
+
+/// The call stack as JS objects for prelude.js: function name, script,
+/// 1-based position, `this` and the scope chain (variables copied into
+/// objects; `with` and global scopes are their objects).
+fn frames_value(vm: &mut Vm) -> Value {
+    let frames = vm.debug_frames();
+    let mut out = Vec::new();
+    for (i, f) in frames.iter().enumerate() {
+        let o = vm.new_object();
+        let put = |vm: &mut Vm, k: &str, v: Value| {
+            let key = vm.key(k);
+            vm.define_data(o, key, v, rujse::object::attr::DEFAULT);
+        };
+        let v = vm.new_string(&f.function_name);
+        put(vm, "functionName", v);
+        let v = vm.new_string(&f.url);
+        put(vm, "url", v);
+        put(vm, "scriptId", Value::from(f.script_id as f64));
+        put(vm, "line", Value::from(f.line as f64));
+        put(vm, "column", Value::from(f.column as f64));
+        put(vm, "this", f.this);
+        let mut scopes = Vec::new();
+        for s in vm.debug_scopes(i) {
+            let so = vm.new_object();
+            let kind = match s.kind {
+                rujse::debug::ScopeType::Local => "local",
+                rujse::debug::ScopeType::Closure => "closure",
+                rujse::debug::ScopeType::With => "with",
+                rujse::debug::ScopeType::Global => "global",
+            };
+            let object = match s.object {
+                Some(obj) => obj,
+                None => {
+                    let vars = vm.new_object();
+                    for (n, v) in &s.variables {
+                        if let Some(v) = v {
+                            let k = vm.key(n);
+                            vm.define_data(vars, k, *v, rujse::object::attr::DEFAULT);
+                        }
+                    }
+                    Value::object(vars)
+                }
+            };
+            let kt = vm.key("type");
+            let tv = vm.new_string(kind);
+            vm.define_data(so, kt, tv, rujse::object::attr::DEFAULT);
+            let ko = vm.key("object");
+            vm.define_data(so, ko, object, rujse::object::attr::DEFAULT);
+            scopes.push(Value::object(so));
+        }
+        let sv = Value::object(vm.new_array(scopes));
+        put(vm, "scopes", sv);
+        out.push(Value::object(o));
+    }
+    Value::object(vm.new_array(out))
+}
+
+impl rujse::debug::DebugHandler for CdpDebugger {
+    fn paused(&mut self, vm: &mut Vm, reason: &rujse::debug::PauseReason) -> rujse::debug::Resume {
+        use rujse::debug::{PauseReason, Resume};
+        PAUSED_DEPTH.with(|d| d.set(vm.frames.len()));
+        let (why, data, hit) = match reason {
+            PauseReason::Breakpoint(id) => ("other", Value::UNDEFINED, Value::from(*id as f64)),
+            PauseReason::Exception(v) => ("exception", *v, Value::UNDEFINED),
+            PauseReason::DebuggerStatement => ("debugCommand", Value::UNDEFINED, Value::UNDEFINED),
+            PauseReason::Step | PauseReason::Request => ("other", Value::UNDEFINED, Value::UNDEFINED),
+        };
+        let frames = frames_value(vm);
+        let w = vm.new_string(why);
+        call_js(vm, "__rb_debug_paused", &[w, data, frames, hit]);
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = unsafe { ffi::debug_wait(buf.as_mut_ptr(), buf.len()) };
+            if n < 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&buf[..(n as usize).min(buf.len())]).into_owned();
+            let t = vm.new_string(&text);
+            let action = call_js(vm, "__rb_debug_command", &[t]).map(|v| vm.display(v)).unwrap_or_default();
+            let resume = match action.as_str() {
+                "resume" => Resume::Continue,
+                "stepOver" => Resume::StepOver,
+                "stepInto" => Resume::StepInto,
+                "stepOut" => Resume::StepOut,
+                _ => continue,
+            };
+            unsafe { ffi::debug_resumed() };
+            return resume;
+        }
+        unsafe { ffi::debug_resumed() };
+        rujse::debug::Resume::Continue
+    }
+
+    fn script_parsed(&mut self, _vm: &mut Vm, s: &rujse::debug::ScriptInfo) {
+        let lines = s.source.lines().count();
+        send(&format!(
+            r#"{{"method":"Debugger.scriptParsed","params":{{"scriptId":"{}","url":{},"startLine":0,"startColumn":0,"endLine":{lines},"endColumn":0,"executionContextId":1,"hash":""}}}}"#,
+            s.id,
+            json_str(&s.url)
+        ));
+    }
+}
+
+fn debug_enable_fn(vm: &mut Vm, _: Value, _: &[Value], _: Value) -> JsResult<Value> {
+    if vm.debugger.is_none() {
+        vm.enable_debugger(Box::new(CdpDebugger));
+    }
+    Ok(Value::UNDEFINED)
+}
+
+fn debug_disable_fn(vm: &mut Vm, _: Value, _: &[Value], _: Value) -> JsResult<Value> {
+    vm.disable_debugger();
+    Ok(Value::UNDEFINED)
+}
+
+/// (url, line, column or null, condition) → [id, [[scriptId, line, column], …]]
+/// (1-based positions).
+fn debug_set_breakpoint_fn(vm: &mut Vm, _: Value, a: &[Value], _: Value) -> JsResult<Value> {
+    let url = text(a, 0, vm)?;
+    let line = int(a, 1, vm)? as u32;
+    let col = if arg(a, 2).is_nullish() { None } else { Some(int(a, 2, vm)? as u32) };
+    let cond = text(a, 3, vm)?;
+    let cond = if cond.is_empty() { None } else { Some(cond) };
+    let Some(id) = vm.set_breakpoint(&url, line, col, cond.as_deref()) else { return Ok(Value::NULL) };
+    let mut locs = Vec::new();
+    for (s, l, c) in vm.breakpoint_locations(id) {
+        let item = vec![Value::from(s as f64), Value::from(l as f64), Value::from(c as f64)];
+        locs.push(Value::object(vm.new_array(item)));
+    }
+    let locs = Value::object(vm.new_array(locs));
+    Ok(Value::object(vm.new_array(vec![Value::from(id as f64), locs])))
+}
+
+/// (what, argument): removeBreakpoint, setPauseOnExceptions,
+/// getScriptSource, pause.
+fn debug_call_fn(vm: &mut Vm, _: Value, a: &[Value], _: Value) -> JsResult<Value> {
+    let what = text(a, 0, vm)?;
+    let x = text(a, 1, vm)?;
+    Ok(match what.as_str() {
+        "Debugger.removeBreakpoint" => {
+            if let Ok(id) = x.parse() {
+                vm.remove_breakpoint(id);
+            }
+            Value::UNDEFINED
+        }
+        "Debugger.setPauseOnExceptions" => {
+            use rujse::debug::PauseOnExceptions as P;
+            vm.set_pause_on_exceptions(match x.as_str() {
+                "all" => P::All,
+                "uncaught" => P::Uncaught,
+                _ => P::None,
+            });
+            Value::UNDEFINED
+        }
+        "Debugger.getScriptSource" => match x.parse().ok().and_then(|id| vm.debug_script_source(id)) {
+            Some(src) => vm.new_string(&src),
+            None => Value::NULL,
+        },
+        "Debugger.pause" => {
+            vm.debug_request_pause();
+            Value::UNDEFINED
+        }
+        _ => Value::UNDEFINED,
+    })
+}
+
+/// (frame index from the paused stack's top, source) → value.
+fn debug_eval_fn(vm: &mut Vm, _: Value, a: &[Value], _: Value) -> JsResult<Value> {
+    let index = int(a, 0, vm)?.max(0) as usize;
+    let src = text(a, 1, vm)?;
+    // The debugger's own frames (this call's caller) are above the paused
+    // ones.
+    let extra = vm.frames.len().saturating_sub(PAUSED_DEPTH.with(Cell::get));
+    vm.debug_evaluate(index + extra, &src)
+}
+
+fn debug_send_fn(vm: &mut Vm, _: Value, a: &[Value], _: Value) -> JsResult<Value> {
+    let t = text(a, 0, vm)?;
+    send(&t);
+    Ok(Value::UNDEFINED)
 }
 
 fn run_prelude(vm: &mut Vm) -> JsResult<Value> {

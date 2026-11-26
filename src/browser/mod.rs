@@ -598,6 +598,12 @@ struct Tab {
     dom_version: u64,
     /// Method and body for the next page load (a form POST).
     post: Option<crate::input::HttpRequest>,
+    /// The debugging connection attached to the page's JavaScript
+    /// (CDP `Debugger`), given to each runtime the tab starts.
+    debug: Option<std::sync::Arc<crate::script::debug::Link>>,
+    /// Breakpoints set through CDP (`__rb_debug_bp` arguments), set again
+    /// in each runtime the tab starts.
+    debug_breakpoints: Vec<String>,
     /// `<script>` and stylesheet `<link>` elements already handled; others
     /// were inserted by scripts.
     known: std::collections::HashSet<NodeId>,
@@ -812,6 +818,8 @@ impl Browser {
             import_map_sent: false,
             dom_version: 0,
             post: None,
+            debug: None,
+            debug_breakpoints: Vec::new(),
             runtimes: HashMap::new(),
             script_count: 0,
             consumed: 0,
@@ -1531,10 +1539,19 @@ impl Browser {
                 if !t.loaded {
                     rt.set_budget(Some(PAGE_LOAD_FUEL));
                 }
+                rt.set_debug(t.debug.clone());
                 t.scripts.push(Some(rt));
                 let si = t.scripts.len() - 1;
                 t.runtimes.insert(mime.to_string(), si);
                 self.after_script(i, si, host);
+                // A debugger is attached: on in the new runtime too.
+                if mime == JS_MIME && self.tabs[i].debug.is_some() {
+                    let mut code = String::from("typeof __rb_debug_enable === 'function' && __rb_debug_enable();");
+                    for bp in &self.tabs[i].debug_breakpoints {
+                        code.push_str(&format!("if (typeof __rb === 'object' && __rb.debugSetBreakpoint) __rb.debugSetBreakpoint({bp});"));
+                    }
+                    self.run_source(i, JS_MIME, &code, "devtools", host);
+                }
             }
             Ok(_) => host.log(&format!(
                 "{name}: not a language runtime (needs rb_alloc and rb_eval)"
@@ -4119,6 +4136,7 @@ impl Browser {
     /// Draws the whole browser and returns the result.
     pub fn render(&mut self, now: f64, host: &mut dyn Host) -> &Canvas {
         self.now = now;
+        self.cdp_debugger_flush(host);
         // (not in update_layout: input events run that too, and a commit
         // follows the preedit's end in the same batch of events)
         self.composition_cancelled(host);
@@ -7521,6 +7539,52 @@ mod tests {
         let out = cdp(&mut b, &mut h, 3, r#"{"id":4,"method":"Browser.close"}"#);
         assert!(reply(&out, 4)["result"].is_object());
         assert!(b.cdp_wants_close());
+    }
+
+    /// The JavaScript debugger: a breakpoint pauses the script inside its
+    /// call; queued commands run while paused (in a real session they come
+    /// from the debugging server's thread), then it resumes.
+    #[cfg(feature = "rujse")]
+    #[test]
+    fn cdp_debugger_pauses_at_breakpoints() {
+        let (mut b, mut h) = browser();
+        b.navigate("https://dbg.test/", &mut h);
+        let id = h.fetched.last().unwrap().0;
+        b.fetch_done(id, Ok(b"<p>x</p><script src=app.js></script>".to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let app = h.fetched.last().unwrap().0;
+        let tab = b.tabs[b.active].id;
+        assert!(b.cdp_open(7, &format!("/devtools/page/{tab:032X}")));
+        for (k, d) in ["Runtime", "Debugger"].iter().enumerate() {
+            let out = cdp(&mut b, &mut h, 7, &format!(r#"{{"id":{k},"method":"{d}.enable"}}"#));
+            assert!(reply(&out, k as i64)["result"].is_object());
+        }
+        // Line 2 of app.js (0-based 1): `const s = a + b;`.
+        let out = cdp(&mut b, &mut h, 7, r#"{"id":5,"method":"Debugger.setBreakpointByUrl","params":{"url":"https://dbg.test/app.js","lineNumber":1}}"#);
+        let bp = reply(&out, 5)["result"]["breakpointId"].as_str().unwrap().to_string();
+        let link = crate::script::debug::links().into_iter().find(|l| l.conn == 7).unwrap();
+        link.push(r#"{"id":100,"method":"Debugger.evaluateOnCallFrame","params":{"callFrameId":"0","expression":"a * 10 + b","returnByValue":true}}"#);
+        link.push(r#"{"id":101,"method":"DOM.getDocument","params":{}}"#);
+        link.push(r#"{"id":102,"method":"Debugger.resume"}"#);
+        let src = "function add(a, b) {\n  const s = a + b;\n  return s;\n}\nconsole.log('sum', add(2, 3));";
+        b.fetch_done(app, Ok(src.as_bytes().to_vec()), &mut h);
+        b.render(0.0, &mut h);
+        let out: Vec<serde_json::Value> = b.take_cdp_output().into_iter().map(|(_, t)| serde_json::from_str(&t).unwrap()).collect();
+        let parsed = out.iter().find(|m| m["method"] == "Debugger.scriptParsed" && m["params"]["url"] == "https://dbg.test/app.js");
+        assert!(parsed.is_some(), "{out:?}");
+        let paused = out.iter().find(|m| m["method"] == "Debugger.paused").unwrap_or_else(|| panic!("{out:?}"));
+        let top = &paused["params"]["callFrames"][0];
+        assert_eq!(top["functionName"], "add");
+        assert_eq!(top["location"]["lineNumber"], 1);
+        assert_eq!(paused["params"]["hitBreakpoints"][0], bp.as_str());
+        assert_eq!(top["scopeChain"][0]["type"], "local");
+        assert_eq!(reply(&out, 100)["result"]["result"]["value"], 23);
+        assert!(reply(&out, 101)["error"]["message"].as_str().unwrap().contains("paused"));
+        assert!(reply(&out, 102)["result"].is_object());
+        assert!(out.iter().any(|m| m["method"] == "Debugger.resumed"));
+        // The script went on after the pause.
+        let logged = out.iter().any(|m| m["method"] == "Runtime.consoleAPICalled" && m["params"]["args"].to_string().contains("sum 5"));
+        assert!(logged, "{out:?}");
     }
 
     #[test]

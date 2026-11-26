@@ -201,6 +201,62 @@ impl Browser {
     pub fn cdp_close(&mut self, conn: u32) {
         self.cdp.conns.remove(&conn);
         self.cdp.pending.retain(|_, p| p.0 != conn);
+        crate::script::debug::detach(conn);
+        for t in &mut self.tabs {
+            if t.debug.as_ref().is_some_and(|l| l.conn == conn) {
+                t.debug = None;
+                for s in t.scripts.iter_mut().flatten() {
+                    s.set_debug(None);
+                }
+            }
+        }
+    }
+
+    /// Debugger.disable: the runtime stops pausing.
+    fn cdp_debugger_detach(&mut self, conn: u32, host: &mut dyn Host) {
+        for i in 0..self.tabs.len() {
+            if self.tabs[i].debug.as_ref().is_some_and(|l| l.conn == conn) {
+                self.run_source(i, JS_MIME, "typeof __rb_debug_disable === 'function' && __rb_debug_disable()", "devtools", host);
+            }
+        }
+        self.cdp_close_debugger_only(conn);
+    }
+
+    fn cdp_close_debugger_only(&mut self, conn: u32) {
+        crate::script::debug::detach(conn);
+        for t in &mut self.tabs {
+            if t.debug.as_ref().is_some_and(|l| l.conn == conn) {
+                t.debug = None;
+                for s in t.scripts.iter_mut().flatten() {
+                    s.set_debug(None);
+                }
+            }
+        }
+    }
+
+    /// Runs `code(key)` in tab `i`'s runtime; its `__rb` helper answers
+    /// request `id` with the key.
+    #[allow(clippy::too_many_arguments)]
+    fn cdp_js(&mut self, i: usize, conn: u32, id: Value, session: Option<String>, host: &mut dyn Host, code: impl FnOnce(u64) -> String) {
+        self.cdp.next_key += 1;
+        let key = self.cdp.next_key;
+        self.cdp.pending.insert(key, (conn, id, session));
+        let code = code(key);
+        self.run_source(i, JS_MIME, &code, "devtools", host);
+    }
+
+    /// Messages the debugger handled outside the event loop: what paused
+    /// runtimes sent without a server (tests), and commands that arrived
+    /// just after a runtime resumed.
+    pub(super) fn cdp_debugger_flush(&mut self, host: &mut dyn Host) {
+        for l in crate::script::debug::links() {
+            for text in l.take_sent() {
+                self.cdp.out.push((l.conn, text));
+            }
+            for text in l.take_leftovers() {
+                self.cdp_message(l.conn, &text, host);
+            }
+        }
     }
 
     /// Whether a remote debugger asked the browser to quit.
@@ -553,6 +609,9 @@ impl Browser {
             {
                 c.enabled.remove(&(session.clone(), domain.to_string()));
             }
+            if method == "Debugger.disable" {
+                self.cdp_debugger_detach(conn, host);
+            }
             return Ok(Some(json!({})));
         }
         let tab = tab.ok_or_else(|| format!("'{method}' wasn't found"))?;
@@ -565,6 +624,20 @@ impl Browser {
         if name == "enable" {
             if let Some(c) = self.cdp.conns.get_mut(&conn) {
                 c.enabled.insert((session.clone(), domain.to_string()));
+            }
+            if domain == "Debugger" {
+                // Attach this connection to the page's runtime; the runtime
+                // reports scripts compiled from now on (scriptParsed).
+                let link = crate::script::debug::attach(conn, session.clone());
+                let t = &mut self.tabs[i];
+                t.debug = Some(link.clone());
+                for s in t.scripts.iter_mut().flatten() {
+                    s.set_debug(Some(link.clone()));
+                }
+                if self.javascript || self.tabs[i].doc.url.starts_with("about:") {
+                    self.run_source(i, JS_MIME, "typeof __rb_debug_enable === 'function' && __rb_debug_enable()", "devtools", host);
+                }
+                return Ok(Some(json!({ "debuggerId": "rubrowser" })));
             }
             if domain == "Runtime" {
                 let ctx = self.cdp_context(i);
@@ -672,6 +745,33 @@ impl Browser {
                 Ok(Some(json!({})))
             }
             "Runtime.getIsolateId" => Ok(Some(json!({ "id": "rubrowser" }))),
+            // ----- Debugger (the rujse runtime; the page's scripts pause
+            // inside their call, see script::debug)
+            "Debugger.setBreakpointByUrl" => {
+                let line = n("lineNumber").unwrap_or(0.0);
+                let col = n("columnNumber").map_or("null".to_string(), |c| c.to_string());
+                let cond = js_string(&s("condition"));
+                let url = js_string(&s("url"));
+                // rujse positions are 1-based.
+                let col1 = n("columnNumber").map_or("null".to_string(), |c| (c + 1.0).to_string());
+                self.tabs[i].debug_breakpoints.push(format!("{url}, {}, {col1}, {cond}", line + 1.0));
+                self.cdp_js(i, conn, id.clone(), session.clone(), host, |key| format!("__rb_debug_bp({key}, {url}, {line}, {col}, {cond})"));
+                Ok(None)
+            }
+            "Debugger.removeBreakpoint" | "Debugger.setPauseOnExceptions" | "Debugger.getScriptSource" | "Debugger.pause" => {
+                let arg = match method {
+                    "Debugger.removeBreakpoint" => js_string(&s("breakpointId")),
+                    "Debugger.setPauseOnExceptions" => js_string(&s("state")),
+                    "Debugger.getScriptSource" => js_string(&s("scriptId")),
+                    _ => "null".into(),
+                };
+                let what = js_string(method);
+                self.cdp_js(i, conn, id.clone(), session.clone(), host, |key| format!("__rb_debug_call({key}, {what}, {arg})"));
+                Ok(None)
+            }
+            // Not paused: nothing to resume or step.
+            "Debugger.resume" | "Debugger.stepOver" | "Debugger.stepInto" | "Debugger.stepOut" => Ok(Some(json!({}))),
+            "Debugger.setAsyncCallStackDepth" | "Debugger.setBlackboxPatterns" | "Debugger.setBreakpointsActive" | "Debugger.setSkipAllPauses" => Ok(Some(json!({}))),
             // ----- DOM
             "DOM.getDocument" => {
                 let depth = n("depth").map_or(2, |d| if d < 0.0 { usize::MAX } else { d as usize + 1 });

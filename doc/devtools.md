@@ -185,7 +185,8 @@ WebSocket 路徑：`/devtools/page/ID` 直接連到一個分頁；`/devtools/bro
 | Browser | `getVersion`、`close` |
 | Target | `getTargets`、`createTarget`、`closeTarget`、`activateTarget`、`attachToTarget`、`detachFromTarget`、`setDiscoverTargets`；事件 `targetCreated`、`targetDestroyed`、`targetInfoChanged`、`attachedToTarget` |
 | Page | `navigate`、`reload`、`getFrameTree`、`getNavigationHistory`、`getLayoutMetrics`、`captureScreenshot`（PNG，頁面區域）、`bringToFront`；事件 `frameNavigated`、`domContentEventFired`、`loadEventFired`、`lifecycleEvent`（`init`、`DOMContentLoaded`、`load`）、`frameStoppedLoading` |
-| Runtime | `evaluate`、`callFunctionOn`（支援 `awaitPromise`；結果以值傳回）；事件 `executionContextCreated`、`executionContextsCleared`、`consoleAPICalled`、`exceptionThrown` |
+| Runtime | `evaluate`、`callFunctionOn`（支援 `awaitPromise`、`returnByValue`、`objectGroup`；`callFunctionOn` 可指定 `objectId` 當 `this`、以 `{objectId}` 傳物件參數）、`getProperties`（`ownProperties`、`accessorPropertiesOnly`）、`releaseObject`、`releaseObjectGroup`；事件 `executionContextCreated`、`executionContextsCleared`、`consoleAPICalled`、`exceptionThrown` |
+| Debugger（rujse runtime） | `enable`、`disable`、`setBreakpointByUrl`、`removeBreakpoint`、`setPauseOnExceptions`、`getScriptSource`、`pause`；暫停時 `resume`、`stepOver`、`stepInto`、`stepOut`、`evaluateOnCallFrame`、`Runtime.evaluate`、`Runtime.getProperties`；事件 `scriptParsed`、`paused`（呼叫堆疊、每層的 scope 與 `this`）、`resumed` |
 | DOM | `getDocument`、`querySelector`、`querySelectorAll`、`describeNode`、`requestChildNodes`、`getOuterHTML`、`getAttributes`、`setAttributeValue`、`removeAttribute`、`setNodeValue`、`getBoxModel`、`focus`、`scrollIntoViewIfNeeded`；事件 `setChildNodes`、`documentUpdated` |
 | CSS | `getComputedStyleForNode`、`getMatchedStylesForNode`、`getInlineStylesForNode` |
 | Network | `getResponseBody`；事件 `requestWillBeSent`、`responseReceived`、`loadingFinished`、`loadingFailed` |
@@ -195,7 +196,8 @@ WebSocket 路徑：`/devtools/page/ID` 直接連到一個分頁；`/devtools/bro
 
 - `X.enable` 開始送出該 domain 的事件，`X.disable` 停止；另外有幾個只是調整設定的方法（例如 `Page.setLifecycleEventsEnabled`、`Network.setCacheDisabled`、`Target.setAutoAttach`）接受但不做事。其他方法回傳錯誤 `-32601`。
 - DOM 的 `nodeId` 就是 rubrowser 節點編號加 1，同一份文件中不會變。
-- 不支援 remote object（`objectId`）：`Runtime.evaluate` 的結果直接帶值（可轉成 JSON 時），`callFunctionOn` 只接受以值傳遞的參數。
+- Remote object：物件與函式的結果帶 `objectId`（在請求的 `objectGroup` 中，直到釋放），可轉成 JSON 的值也一併帶 `value`；`returnByValue` 只傳值。`getProperties` 列出屬性時不執行 getter，`[[Prototype]]` 放在 `internalProperties`；rujse runtime 另外列出 JavaScript 看不到的引擎狀態（`[[PromiseState]]`、`[[PromiseResult]]`、Map／Set 的 `[[Entries]]`、`[[FunctionLocation]]`、bound function、Proxy、generator 狀態）。
+- Debugger 需要 rujse runtime（`--features rujse`）。腳本停在中斷點時，瀏覽器的主執行緒停在那個腳本的呼叫裡，由 runtime 跑巢狀的訊息迴圈（和 Chrome 相同）：該連線的訊息直接從除錯伺服器的執行緒送到暫停中的 runtime（`script::debug`）。暫停期間只接受上表列的命令，其他命令回錯誤；恢復後送來的訊息照常處理。`enable` 之後編譯的腳本才會送出 `scriptParsed`；中斷點依 URL 設定，換頁後在新的 runtime 中重新設定。
 - `load` 在頁面的腳本執行完後送出（rubrowser 的 `load` 事件時機），不等圖片載入完成。
 
 相依套件：[serde_json](https://github.com/serde-rs/json)（MIT 或 Apache-2.0）處理 JSON；WebSocket 伺服器用原本就有的 [tungstenite](https://github.com/snapview/tungstenite-rs)（MIT 或 Apache-2.0）。
@@ -239,6 +241,7 @@ cargo build && scripts/cdp-test.py
 
 ## 10. 尚未支援
 
-- 在 Sources 中設定中斷點、逐步執行，以及 CDP 的 `Debugger` domain（JavaScript 引擎 boa 沒有除錯 API）
-- CDP 的 remote object（`objectId`、`Runtime.getProperties`）、`Fetch`（攔截請求）、`Emulation`
+- 內建開發人員工具 Sources 面板的中斷點與逐步執行（CDP 的 `Debugger` 已可用，需 rujse runtime；boa 沒有除錯 API）
+- `enable` 之前已載入的腳本的 `scriptParsed`、`Debugger.setVariableValue`、非同步呼叫堆疊
+- CDP 的 `Fetch`（攔截請求）、`Emulation`
 - Chrome 自己的 DevTools 前端（它需要的 domain 比這裡多得多）

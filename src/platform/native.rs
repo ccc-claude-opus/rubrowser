@@ -148,7 +148,18 @@ fn start_debugging(
     port: u16,
     wake: impl Fn(Fetched) + Send + Sync + 'static,
 ) -> Result<super::cdp_server::Server, Box<dyn Error>> {
-    let server = super::cdp_server::start(port, move |i| wake(Fetched::cdp(i)))?;
+    // While a page's script is paused in the debugger, the main thread is
+    // inside that script: its connection's messages go straight to it.
+    let server = super::cdp_server::start(port, move |i| {
+        if let super::cdp_server::Incoming::Message { conn, text } = &i
+            && crate::script::debug::divert(*conn, text)
+        {
+            return;
+        }
+        wake(Fetched::cdp(i))
+    })?;
+    let sender = server.clone();
+    crate::script::debug::set_sender(move |conn, text| sender.send(conn, text));
     DEBUG_PORT.store(server.port, std::sync::atomic::Ordering::Relaxed);
     // The line tools look for (Chrome prints the same).
     eprintln!("\nDevTools listening on ws://127.0.0.1:{}/devtools/browser/rubrowser", server.port);

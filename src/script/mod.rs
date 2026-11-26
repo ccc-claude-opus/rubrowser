@@ -11,6 +11,7 @@
 // wasmtime's typed functions are cloned; wasmi's are `Copy`.
 #![cfg_attr(not(feature = "native"), allow(clippy::clone_on_copy))]
 
+pub mod debug;
 mod tz;
 
 #[cfg(not(feature = "native"))]
@@ -215,6 +216,8 @@ struct State {
     response: Option<(i32, Vec<u8>, String)>,
     /// The script's exported `memory`.
     memory: Option<Memory>,
+    /// A debugging connection attached to this runtime (CDP `Debugger`).
+    debug: Option<std::sync::Arc<debug::Link>>,
 }
 
 /// What one call into a script cost (for the developer tools).
@@ -283,6 +286,7 @@ impl Script {
             next_http: 0,
             response: None,
             memory: None,
+            debug: None,
         };
         let mut store = Store::new(&engine, state);
         store.limiter(|s| &mut s.limits);
@@ -420,6 +424,11 @@ impl Script {
     }
 
     /// Whether this module is a language runtime (it can [`Script::eval`]).
+    /// Attaches (or detaches) a debugging connection.
+    pub fn set_debug(&mut self, link: Option<std::sync::Arc<debug::Link>>) {
+        self.store.data_mut().debug = link;
+    }
+
     pub fn is_runtime(&self) -> bool {
         self.alloc_fn.is_some() && self.eval_fn.is_some()
     }
@@ -1506,6 +1515,27 @@ fn linker(engine: &Engine) -> Result<Linker<State>, LinkerError> {
         },
     )?;
     l.func_wrap("rb", "now", |mut c: C| -> f64 { script_time(&mut c) })?;
+    // The JavaScript debugger: replies and events to the attached
+    // connection; the next command while paused (-1: resume); resumed.
+    l.func_wrap("rb", "debug_send", |c: C, p: i32, n: i32| -> Result<(), Error> {
+        let msg = read_text(&c, p, n, 64 << 20)?;
+        if let Some(l) = &c.data().debug {
+            l.send(&msg);
+        }
+        Ok(())
+    })?;
+    l.func_wrap("rb", "debug_wait", |mut c: C, p: i32, cap: i32| -> Result<i32, Error> {
+        let Some(l) = c.data().debug.clone() else { return Ok(-1) };
+        match l.wait() {
+            Some(m) => write_str(&mut c, p, cap, &m),
+            None => Ok(-1),
+        }
+    })?;
+    l.func_wrap("rb", "debug_resumed", |c: C| {
+        if let Some(l) = &c.data().debug {
+            l.resumed();
+        }
+    })?;
     #[cfg_attr(not(feature = "native"), allow(unused_mut))]
     l.func_wrap("rb", "interrupted", |mut c: C| -> i32 {
         #[cfg(feature = "native")]
