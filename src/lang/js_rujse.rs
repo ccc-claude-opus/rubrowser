@@ -20,10 +20,9 @@ type JsResult<T> = Result<T, Throw>;
 type Native = fn(&mut Vm, Value, &[Value], Value) -> JsResult<Value>;
 
 const PRELUDE: &str = include_str!("prelude.js");
-/// `prelude.js` compiled ahead of time by `scripts/build.sh` (rujse's
-/// bytecode cache): each page skips parsing and compiling it. Used only
-/// when it was made from this very prelude by this rujse version.
-const PRELUDE_CACHE: &[u8] = include_bytes!("prelude.rjbc");
+/// The heap after the prelude (`make_snapshot`, run by `scripts/build.sh`):
+/// a page starts from it without running the prelude at all.
+const PRELUDE_SNAPSHOT: &[u8] = include_bytes!("prelude.rjss");
 
 thread_local! {
     static VM: RefCell<Option<Box<Vm>>> = const { RefCell::new(None) };
@@ -34,6 +33,9 @@ thread_local! {
     static RUNNING: Cell<bool> = const { Cell::new(false) };
     /// The `__rb` functions, by the index stored in each native function.
     static NATIVES: RefCell<Vec<Native>> = const { RefCell::new(Vec::new()) };
+    static NAMES: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) };
+    /// `make_snapshot` is running (no browser to call).
+    static SNAPSHOTTING: Cell<bool> = const { Cell::new(false) };
     /// ES module sources the browser provided (by URL) and the import map.
     static MODULES: RefCell<UrlModules> = RefCell::new(UrlModules::default());
 }
@@ -716,6 +718,11 @@ fn run_module(url: &str, vm: &mut Vm) {
 /// Calls the `__rb` function stored at the native's index.
 fn dispatch(vm: &mut Vm, this: Value, args: &[Value], nt: Value) -> JsResult<Value> {
     let i = vm.native_data(0).as_int().unwrap_or(0) as usize;
+    if SNAPSHOTTING.with(Cell::get) {
+        // Making the snapshot: no browser. The document is node 0.
+        let name = NAMES.with(|n| n.borrow()[i]);
+        return Ok(if name == "nodeType" { Value::int(9) } else { Value::UNDEFINED });
+    }
     let f = NATIVES.with(|n| n.borrow()[i]);
     // Every call into the browser is also a point to stop a script the
     // browser interrupted.
@@ -725,14 +732,12 @@ fn dispatch(vm: &mut Vm, this: Value, args: &[Value], nt: Value) -> JsResult<Val
     f(vm, this, args, nt)
 }
 
-/// `rb_init`: creates the engine and the browser environment.
-pub fn init() {
-    // A panic ends the runtime (a trap); its message goes to the console.
-    std::panic::set_hook(Box::new(|info| log(&format!("JavaScript runtime panicked: {info}"))));
+/// The engine with the browser's natives (`__rb`), before any script:
+/// `init` and `make_snapshot` must build it identically (the snapshot
+/// refers to the natives by creation order).
+fn setup_vm() -> Box<Vm> {
     let mut vm = Vm::new();
     vm.host = Some(Box::new(Host));
-    // Math.random: seeded from the browser clock (not for cryptography).
-    vm.rng = (unsafe { ffi::wall_time() } as u64) ^ 0x9E37_79B9_7F4A_7C15 | 1;
     let rb = vm.new_object();
     let list = natives();
     for (i, (name, argc, _)) in list.iter().enumerate() {
@@ -740,25 +745,56 @@ pub fn init() {
         let k = vm.key(name);
         vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
     }
-    NATIVES.with(|n| *n.borrow_mut() = list.into_iter().map(|(_, _, f)| f).collect());
+    NATIVES.with(|n| *n.borrow_mut() = list.iter().map(|(_, _, f)| *f).collect());
+    NAMES.with(|n| *n.borrow_mut() = list.iter().map(|(name, _, _)| *name).collect());
     vm.global_prop("__rb", Value::object(rb));
-    let prelude = if Vm::cache_source(PRELUDE_CACHE) == Some(PRELUDE) {
-        vm.load_cached(PRELUDE_CACHE)
-    } else {
-        None
-    };
-    let r = match prelude {
-        Some(code) => vm.run_script_code(code),
-        None => vm.eval_script(PRELUDE, "prelude.js"),
-    };
+    vm
+}
+
+fn run_prelude(vm: &mut Vm) -> JsResult<Value> {
+    vm.eval_script(PRELUDE, "prelude.js")
+}
+
+/// `rb_init`: creates the engine and the browser environment.
+pub fn init() {
+    // A panic ends the runtime (a trap); its message goes to the console.
+    std::panic::set_hook(Box::new(|info| log(&format!("JavaScript runtime panicked: {info}"))));
+    let mut vm = setup_vm();
+    // The heap as the prelude leaves it, saved at build time: no prelude
+    // to run. Used only when made from this very prelude.
+    let restored = Vm::snapshot_source(PRELUDE_SNAPSHOT, "prelude.js") == Some(PRELUDE) && vm.restore(PRELUDE_SNAPSHOT).is_ok();
+    if !restored {
+        if let Err(e) = run_prelude(&mut vm) {
+            let msg = match e {
+                Throw::Value(v) => vm.error_to_string(v),
+                Throw::Terminate => "terminated".into(),
+            };
+            log(&format!("prelude failed: {msg}"));
+        }
+    }
+    // Math.random: seeded from the browser clock (not for cryptography);
+    // after the restore, so pages do not share a sequence.
+    vm.rng = (unsafe { ffi::wall_time() } as u64) ^ 0x9E37_79B9_7F4A_7C15 | 1;
+    VM.with(|v| *v.borrow_mut() = Some(vm));
+}
+
+/// Builds `prelude.rjss`, the heap after the prelude (scripts/build.sh runs
+/// this on the build machine). The prelude only asks the browser for the
+/// document's node type while it loads; nothing else is called.
+pub fn make_snapshot() -> Result<Vec<u8>, String> {
+    SNAPSHOTTING.with(|s| s.set(true));
+    let mut vm = setup_vm();
+    // No browser behind the host either (time, interrupts).
+    vm.host = None;
+    let r = run_prelude(&mut vm).and_then(|_| vm.run_jobs());
+    SNAPSHOTTING.with(|s| s.set(false));
     if let Err(e) = r {
-        let msg = match e {
+        return Err(match e {
             Throw::Value(v) => vm.error_to_string(v),
             Throw::Terminate => "terminated".into(),
-        };
-        log(&format!("prelude failed: {msg}"));
+        });
     }
-    VM.with(|v| *v.borrow_mut() = Some(vm));
+    vm.snapshot()
 }
 
 /// `rb_alloc`: a buffer for the browser to write source code into.

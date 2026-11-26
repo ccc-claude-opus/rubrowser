@@ -140,6 +140,11 @@ name = "js_runtime_rujse"
 crate-type = ["cdylib"]
 required-features = ["js-runtime-rujse"]
 
+# Builds the rujse runtime's prelude snapshot (scripts/build.sh).
+[[example]]
+name = "js_snapshot"
+required-features = ["js-runtime-rujse"]
+
 [package.metadata.docs.rs]
 features = ["native", "sdk"]
 

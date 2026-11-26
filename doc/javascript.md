@@ -107,7 +107,7 @@ cargo rustc --profile runtime --target wasm32-unknown-unknown --no-default-featu
 
 同一套協定與 `prelude.js` 也可以跑在 [rujse](https://github.com/ccc-claude-opus/rujse) 上（`src/lang/js_rujse.rs`，feature `js-runtime-rujse`，example `js_runtime_rujse`）。`scripts/build.sh` 會一併建置成 `src/browser/runtimes/js-rujse.wasm`；建置需要 rujse 的原始碼在 `../rujse`（path 依賴）。
 
-`prelude.js` 預先編成 rujse 的 bytecode cache（`src/lang/prelude.rjbc`，由 `scripts/build.sh` 用 rujse 的命令列工具產生並提交），每頁直接載入、不再 parse 與編譯；cache 和目前的 `prelude.js` 不一致時改為直接編譯（測試 `prelude_cache_is_up_to_date` 會提醒重建）。
+每頁不跑 `prelude.js`，而是還原它跑完後的 heap：`src/lang/prelude.rjss`（rujse 的 heap snapshot）由 `scripts/build.sh` 在建置機上產生（example `js_snapshot`，原生執行 `lang::js_rujse::make_snapshot`）並提交。snapshot 帶著它所來自的 prelude 原文，和目前的 `prelude.js` 不一致時改為直接執行 prelude（測試 `prelude_snapshot_is_up_to_date` 會提醒重建）。還原後以瀏覽器時間重新設定 `Math.random` 的種子。
 
 瀏覽器以 feature `rujse` 建置時改用 `js-rujse.wasm`：
 
@@ -120,7 +120,8 @@ cargo test --features rujse
 
 | | boa（`js.wasm`） | rujse（`js-rujse.wasm`） |
 |---|---|---|
-| 大小 | 6.7 MB | 2.4 MB |
+| 大小 | 6.7 MB | 3.1 MB（含 prelude 的 heap snapshot） |
+| 每頁 `rb_init`（wasm 指令，rujse 的 `rbinit` 量） | 482,966,226（44.6 ms） | 29,645,370（2.0 ms） |
 | 中斷 | 每次呼叫瀏覽器時檢查 `interrupted` | 另外在引擎的安全點（約每千個指令、每次呼叫與迴圈回跳）檢查，沒有呼叫的迴圈也能乾淨停下 |
 | 被中途停掉之後 | 下次呼叫時清掉工作佇列 | 同左，並以 `Vm::recover` 丟棄中斷的 frame |
 | 亂數 | getrandom custom backend | `Vm::rng` 以 `wall_time` 為種子，不需要 getrandom |

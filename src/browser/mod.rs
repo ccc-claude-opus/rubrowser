@@ -5145,16 +5145,16 @@ mod tests {
     }
 
     #[test]
-    fn prelude_cache_is_up_to_date() {
-        // js-rujse.wasm runs prelude.rjbc (prelude.js compiled ahead of
-        // time), which carries the source it was made from; a stale one is
-        // ignored at run time but costs every page a compile. Run
+    fn prelude_snapshot_is_up_to_date() {
+        // js-rujse.wasm restores prelude.rjss (the heap after prelude.js),
+        // which carries the prelude it was made from; a stale one is
+        // ignored at run time but costs every page the whole prelude. Run
         // scripts/build.sh after changing prelude.js.
         let prelude = include_bytes!("../lang/prelude.js");
-        let cache = include_bytes!("../lang/prelude.rjbc");
+        let snapshot = include_bytes!("../lang/prelude.rjss");
         assert!(
-            cache.windows(prelude.len()).any(|w| w == prelude),
-            "src/lang/prelude.rjbc is stale: run scripts/build.sh"
+            snapshot.windows(prelude.len()).any(|w| w == prelude),
+            "src/lang/prelude.rjss is stale: run scripts/build.sh"
         );
     }
 
