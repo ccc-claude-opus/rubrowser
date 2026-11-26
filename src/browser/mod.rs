@@ -7541,6 +7541,28 @@ mod tests {
         let out = cdp(&mut b, &mut h, 1, r#"{"id":12,"method":"Runtime.evaluate","params":{"expression":"console.warn('w'); throw new TypeError('t')"}}"#);
         assert!(out.iter().any(|m| m["method"] == "Runtime.consoleAPICalled" && m["params"]["type"] == "warning"));
         assert_eq!(reply(&out, 12)["result"]["exceptionDetails"]["exception"]["subtype"], "error");
+        // Remote objects: properties (getters not run), calls on them, release.
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":13,"method":"Runtime.evaluate","params":{"expression":"({ n: 1, get g() { throw 1 }, list: [1, 2], p: Promise.resolve(5), m: new Map([[1, 2]]) })","objectGroup":"console"}}"#);
+        let oid = reply(&out, 13)["result"]["result"]["objectId"].as_str().unwrap().to_string();
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":14,"method":"Runtime.getProperties","params":{{"objectId":"{oid}","ownProperties":true}}}}"#));
+        let props = reply(&out, 14)["result"]["result"].as_array().unwrap().clone();
+        let names: Vec<&str> = props.iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["n", "g", "list", "p", "m"]);
+        assert_eq!(props[0]["value"]["value"], 1);
+        assert_eq!(props[1]["get"]["type"], "function");
+        let promise = props[3]["value"]["objectId"].as_str().unwrap().to_string();
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":15,"method":"Runtime.getProperties","params":{{"objectId":"{promise}","ownProperties":true}}}}"#));
+        let internal = reply(&out, 15)["result"]["internalProperties"].as_array().unwrap().clone();
+        assert_eq!(internal[0]["name"], "[[Prototype]]");
+        // rujse also shows the engine's state.
+        #[cfg(feature = "rujse")]
+        assert!(internal.iter().any(|p| p["name"] == "[[PromiseState]]" && p["value"]["value"] == "fulfilled"), "{internal:?}");
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":16,"method":"Runtime.callFunctionOn","params":{{"objectId":"{oid}","functionDeclaration":"function (k) {{ return this.n + this.list.length + k; }}","arguments":[{{"value":10}}],"returnByValue":true}}}}"#));
+        assert_eq!(reply(&out, 16)["result"]["result"]["value"], 13);
+        let out = cdp(&mut b, &mut h, 1, r#"{"id":17,"method":"Runtime.releaseObjectGroup","params":{"objectGroup":"console"}}"#);
+        assert!(reply(&out, 17)["result"].is_object());
+        let out = cdp(&mut b, &mut h, 1, &format!(r#"{{"id":18,"method":"Runtime.getProperties","params":{{"objectId":"{oid}"}}}}"#));
+        assert!(reply(&out, 18)["error"]["message"].is_string());
         // DOM.
         let out = cdp(&mut b, &mut h, 1, r#"{"id":20,"method":"DOM.getDocument","params":{"depth":-1}}"#);
         let root = reply(&out, 20)["result"]["root"]["nodeId"].as_u64().unwrap();

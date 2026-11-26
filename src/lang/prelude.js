@@ -828,7 +828,22 @@
   // Remote debugging (Chrome DevTools Protocol): Runtime.evaluate and
   // Runtime.callFunctionOn. The result goes back as a RemoteObject (with
   // its value when it has a JSON form) after the promise settles.
+  // CDP remote objects: objects handed to the front end get an id until it
+  // releases them (by id or by group).
+  const cdpObjects = new Map();
+  let cdpNextId = 0;
+  let cdpGroup = '';
+  function cdpObjectId(v) {
+    const id = 'rb-obj-' + (++cdpNextId);
+    cdpObjects.set(id, { v, group: cdpGroup });
+    return id;
+  }
   function remoteObject(v) {
+    const r = remoteValue(v);
+    if ((typeof v === 'object' && v !== null) || typeof v === 'function') r.objectId = cdpObjectId(v);
+    return r;
+  }
+  function remoteValue(v) {
     const t = typeof v;
     if (v === undefined) return { type: 'undefined' };
     if (v === null) return { type: 'object', subtype: 'null', value: null };
@@ -852,21 +867,83 @@
     }
     return o;
   }
-  global.__rb_cdp_eval = function (key, src, awaitPromise, args) {
+  // Runtime.getProperties: descriptors as stored (getters are not run).
+  global.__rb_cdp_props = function (key, objectId, ownProperties, accessorPropertiesOnly) {
+    const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
+    const entry = cdpObjects.get(objectId);
+    if (!entry) {
+      send({ error: 'Could not find object with given id' });
+      return;
+    }
+    const result = [];
+    const seen = new Set();
+    let o = entry.v;
+    let own = true;
+    while (o !== null && o !== undefined) {
+      for (const k of Reflect.ownKeys(o)) {
+        if (seen.has(k)) continue;
+        seen.add(k);
+        const d = Object.getOwnPropertyDescriptor(o, k);
+        if (!d) continue;
+        const accessor = 'get' in d || 'set' in d;
+        if (accessorPropertiesOnly && !accessor) continue;
+        const p = { name: typeof k === 'symbol' ? k.toString() : k, configurable: d.configurable, enumerable: d.enumerable, isOwn: own };
+        if (typeof k === 'symbol') p.symbol = remoteObject(k);
+        if (accessor) {
+          p.get = d.get ? remoteObject(d.get) : { type: 'undefined' };
+          p.set = d.set ? remoteObject(d.set) : { type: 'undefined' };
+        } else {
+          p.value = remoteObject(d.value);
+          p.writable = d.writable;
+        }
+        result.push(p);
+      }
+      if (ownProperties) break;
+      o = Object.getPrototypeOf(o);
+      own = false;
+    }
+    const internalProperties = [];
+    const proto = Object.getPrototypeOf(entry.v);
+    internalProperties.push({ name: '[[Prototype]]', value: remoteObject(proto) });
+    // Engine state scripts cannot see (rujse: promise state, Map entries, …).
+    if (rb.internal) {
+      for (const [name, value] of rb.internal(entry.v)) {
+        if (name !== '[[Prototype]]') internalProperties.push({ name, value: remoteObject(value) });
+      }
+    }
+    send({ result, internalProperties });
+  };
+  global.__rb_cdp_release = function (objectId, group) {
+    if (objectId) cdpObjects.delete(objectId);
+    else for (const [id, e] of cdpObjects) if (e.group === group) cdpObjects.delete(id);
+  };
+  global.__rb_cdp_eval = function (key, src, awaitPromise, args, objectId, group, byValue) {
+    cdpGroup = group || '';
+    // returnByValue: the value only, no object id to release.
+    const out = (v) => (byValue ? remoteValue(v) : remoteObject(v));
     const send = (r) => rb.log('\u0001devtools-cdp ' + key + ' ' + JSON.stringify(r));
     const fail = (e) => send({
-      result: remoteObject(e),
-      exceptionDetails: { exceptionId: 1, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: remoteObject(e) },
+      result: out(e),
+      exceptionDetails: { exceptionId: 1, text: 'Uncaught', lineNumber: 0, columnNumber: 0, exception: out(e) },
     });
     let v;
     try {
-      v = args ? (0, eval)('(' + src + ')').apply(null, args) : (0, eval)(src);
+      if (args) {
+        // callFunctionOn: `this` is the object with objectId, arguments
+        // are values or other objects ({objectId}).
+        const self = objectId ? cdpObjects.get(objectId) : undefined;
+        if (objectId && !self) throw new Error('Could not find object with given id');
+        const vals = args.map((a) => (a && typeof a === 'object' && 'objectId' in a ? (cdpObjects.get(a.objectId) || {}).v : a));
+        v = (0, eval)('(' + src + ')').apply(self ? self.v : undefined, vals);
+      } else {
+        v = (0, eval)(src);
+      }
     } catch (e) {
       fail(e);
       return;
     }
-    if (awaitPromise && v && typeof v.then === 'function') v.then((r) => send({ result: remoteObject(r) }), fail);
-    else send({ result: remoteObject(v) });
+    if (awaitPromise && v && typeof v.then === 'function') v.then((r) => send({ result: out(r) }), fail);
+    else send({ result: out(v) });
   };
   global.__rb_devtools_eval = function (src) {
     let v;

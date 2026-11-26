@@ -408,7 +408,12 @@ impl Browser {
             return;
         };
         let value: Value = serde_json::from_str(json).unwrap_or_else(|_| json!({ "result": { "type": "undefined" } }));
-        self.cdp_reply(conn, id, session, Ok(value));
+        // The page answers {error} for an unknown object id.
+        let r = match value.get("error").and_then(Value::as_str) {
+            Some(e) => Err(e.to_string()),
+            None => Ok(value),
+        };
+        self.cdp_reply(conn, id, session, r);
     }
 
     fn cdp_context(&self, i: usize) -> Value {
@@ -617,28 +622,54 @@ impl Browser {
                     return Err("JavaScript is turned off".into());
                 }
                 let wait = p.get("awaitPromise").and_then(Value::as_bool).unwrap_or(false);
+                let by_value = p.get("returnByValue").and_then(Value::as_bool).unwrap_or(false);
+                let group = js_string(&s("objectGroup"));
                 let code = if method == "Runtime.evaluate" {
-                    format!("__rb_cdp_eval({{key}}, {}, {wait}, null)", js_string(&s("expression")))
+                    format!("__rb_cdp_eval({{key}}, {}, {wait}, null, null, {group}, {by_value})", js_string(&s("expression")))
                 } else {
-                    if p.get("objectId").is_some() {
-                        return Err("Remote object ids are not supported: use returnByValue".into());
-                    }
                     let args: Vec<Value> = p.get("arguments").and_then(Value::as_array).cloned().unwrap_or_default();
                     let args: Vec<String> = args
                         .iter()
-                        .map(|a| match (a.get("value"), a.get("unserializableValue").and_then(Value::as_str)) {
-                            (_, Some(u)) => u.to_string(),
-                            (Some(v), _) => v.to_string(),
+                        .map(|a| match (a.get("value"), a.get("unserializableValue").and_then(Value::as_str), a.get("objectId").and_then(Value::as_str)) {
+                            (_, _, Some(o)) => format!("{{objectId: {}}}", js_string(o)),
+                            (_, Some(u), _) => u.to_string(),
+                            (Some(v), _, _) => v.to_string(),
                             _ => "undefined".into(),
                         })
                         .collect();
-                    format!("__rb_cdp_eval({{key}}, {}, {wait}, [{}])", js_string(&s("functionDeclaration")), args.join(","))
+                    let this = p.get("objectId").and_then(Value::as_str).map_or("null".into(), js_string);
+                    format!("__rb_cdp_eval({{key}}, {}, {wait}, [{}], {this}, {group}, {by_value})", js_string(&s("functionDeclaration")), args.join(","))
                 };
                 self.cdp.next_key += 1;
                 let key = self.cdp.next_key;
                 self.cdp.pending.insert(key, (conn, id.clone(), session));
                 self.run_source(i, JS_MIME, &code.replace("{key}", &key.to_string()), "devtools", host);
                 Ok(None)
+            }
+            "Runtime.getProperties" => {
+                let web = !self.tabs[i].doc.url.starts_with("about:");
+                if web && !self.javascript {
+                    return Err("JavaScript is turned off".into());
+                }
+                let own = p.get("ownProperties").and_then(Value::as_bool).unwrap_or(false);
+                let accessors = p.get("accessorPropertiesOnly").and_then(Value::as_bool).unwrap_or(false);
+                self.cdp.next_key += 1;
+                let key = self.cdp.next_key;
+                self.cdp.pending.insert(key, (conn, id.clone(), session));
+                let code = format!("__rb_cdp_props({key}, {}, {own}, {accessors})", js_string(&s("objectId")));
+                self.run_source(i, JS_MIME, &code, "devtools", host);
+                Ok(None)
+            }
+            "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => {
+                let code = if method == "Runtime.releaseObject" {
+                    format!("__rb_cdp_release({}, '')", js_string(&s("objectId")))
+                } else {
+                    format!("__rb_cdp_release(null, {})", js_string(&s("objectGroup")))
+                };
+                if self.javascript || self.tabs[i].doc.url.starts_with("about:") {
+                    self.run_source(i, JS_MIME, &code, "devtools", host);
+                }
+                Ok(Some(json!({})))
             }
             "Runtime.getIsolateId" => Ok(Some(json!({ "id": "rubrowser" }))),
             // ----- DOM

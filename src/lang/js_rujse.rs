@@ -745,10 +745,26 @@ fn setup_vm() -> Box<Vm> {
         let k = vm.key(name);
         vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
     }
+    // DevTools (Runtime.getProperties): engine state scripts cannot see.
+    let f = vm.native_fn("internal", 1, internal_fn);
+    let k = vm.key("internal");
+    vm.define_data(rb, k, Value::object(f), rujse::object::attr::HIDDEN);
     NATIVES.with(|n| *n.borrow_mut() = list.iter().map(|(_, _, f)| *f).collect());
     NAMES.with(|n| *n.borrow_mut() = list.iter().map(|(name, _, _)| *name).collect());
     vm.global_prop("__rb", Value::object(rb));
     vm
+}
+
+/// `__rb.internal(v)`: [[name, value], …] from rujse's inspector
+/// (`[[PromiseState]]`, `[[Entries]]`, `[[FunctionLocation]]`, …).
+fn internal_fn(vm: &mut Vm, _: Value, args: &[Value], _: Value) -> JsResult<Value> {
+    let props = vm.internal_properties(arg(args, 0));
+    let mut out = Vec::new();
+    for (name, v) in props {
+        let n = vm.new_string(name);
+        out.push(Value::object(vm.new_array(vec![n, v])));
+    }
+    Ok(Value::object(vm.new_array(out)))
 }
 
 fn run_prelude(vm: &mut Vm) -> JsResult<Value> {
