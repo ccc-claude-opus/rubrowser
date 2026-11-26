@@ -23,6 +23,13 @@ cargo rustc --profile runtime --target wasm32-unknown-unknown \
   -- -C link-arg=-zstack-size=16777216
 cp target/wasm32-unknown-unknown/runtime/examples/js_runtime.wasm src/browser/runtimes/js.wasm
 
+#    The same environment on the rujse engine (../rujse), which the browser
+#    uses when built with the `rujse` feature.
+cargo rustc --profile runtime --target wasm32-unknown-unknown \
+  --no-default-features --features js-runtime-rujse --example js_runtime_rujse \
+  -- -C link-arg=-zstack-size=16777216
+cp target/wasm32-unknown-unknown/runtime/examples/js_runtime_rujse.wasm src/browser/runtimes/js-rujse.wasm
+
 # 3. The browser itself as wasm, for the canvas version.
 cargo rustc --lib --release --target wasm32-unknown-unknown \
   --no-default-features --features web --crate-type cdylib

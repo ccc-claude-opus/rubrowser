@@ -496,7 +496,11 @@ fn parse_import_map(json: &str, base: &str) -> Vec<(String, String)> {
 }
 
 /// The JavaScript runtime module (boa compiled to wasm).
+#[cfg(not(feature = "rujse"))]
 const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js.wasm");
+/// The JavaScript runtime module (rujse compiled to wasm).
+#[cfg(feature = "rujse")]
+const JS_RUNTIME: &[u8] = include_bytes!("runtimes/js-rujse.wasm");
 
 /// Time between video frames while media plays (ms).
 const MEDIA_FRAME_MS: f64 = 1000.0 / 60.0;

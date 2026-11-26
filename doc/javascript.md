@@ -103,6 +103,28 @@ cargo rustc --profile runtime --target wasm32-unknown-unknown --no-default-featu
 
 測試 `embedded_js_runtime_is_up_to_date` 會檢查 `js.wasm` 是否包含目前的 `prelude.js`，忘了重建時會失敗。
 
+### rujse runtime（`js-rujse.wasm`）
+
+同一套協定與 `prelude.js` 也可以跑在 [rujse](https://github.com/ccc-claude-opus/rujse) 上（`src/lang/js_rujse.rs`，feature `js-runtime-rujse`，example `js_runtime_rujse`）。`scripts/build.sh` 會一併建置成 `src/browser/runtimes/js-rujse.wasm`；建置需要 rujse 的原始碼在 `../rujse`（path 依賴）。
+
+瀏覽器以 feature `rujse` 建置時改用 `js-rujse.wasm`：
+
+```bash
+cargo run --release --features rujse
+cargo test --features rujse
+```
+
+和 boa 版的差別：
+
+| | boa（`js.wasm`） | rujse（`js-rujse.wasm`） |
+|---|---|---|
+| 大小 | 6.7 MB | 2.4 MB |
+| 中斷 | 每次呼叫瀏覽器時檢查 `interrupted` | 另外在引擎的安全點（約每千個指令、每次呼叫與迴圈回跳）檢查，沒有呼叫的迴圈也能乾淨停下 |
+| 被中途停掉之後 | 下次呼叫時清掉工作佇列 | 同左，並以 `Vm::recover` 丟棄中斷的 frame |
+| 亂數 | getrandom custom backend | `Vm::rng` 以 `wall_time` 為種子，不需要 getrandom |
+
+效能比較見 rujse 的 `doc/bench.md`（wasm 指令數，與 Performance 面板同單位）。
+
 ## 5. 加入其他語言
 
 任何能編成 wasm、並實作 [abi.md](abi.md) 中 runtime 協定（`rb_alloc`、`rb_eval`）的直譯器，都能用同樣的方式加入，例如把 RustPython 編成 `python.wasm` 來支援 `<script type="text/python">`。

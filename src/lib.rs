@@ -21,7 +21,7 @@ pub mod dom;
 pub mod gfx;
 #[cfg(feature = "core")]
 pub mod input;
-#[cfg(feature = "js-runtime")]
+#[cfg(any(feature = "js-runtime", feature = "js-runtime-rujse"))]
 pub mod lang;
 #[cfg(feature = "core")]
 pub mod layout;

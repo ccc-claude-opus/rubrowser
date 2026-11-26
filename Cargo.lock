@@ -3431,6 +3431,7 @@ dependencies = [
  "memmap2",
  "resvg",
  "rfd",
+ "rujse",
  "rustybuzz",
  "serde_json",
  "softbuffer",
@@ -3443,6 +3444,10 @@ dependencies = [
  "winit",
  "wuff",
 ]
+
+[[package]]
+name = "rujse"
+version = "0.1.0"
 
 [[package]]
 name = "rustc-demangle"
